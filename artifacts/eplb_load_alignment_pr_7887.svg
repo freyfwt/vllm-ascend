@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <filter id="cardShadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#1f2937" flood-opacity="0.13"/>
+    </filter>
+    <marker id="arrowRed" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#d44a30"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#167f60"/>
+    </marker>
+    <style>
+      .bg { fill: #f6f7f9; }
+      .card { fill: #ffffff; stroke: #dde2e8; stroke-width: 2; rx: 26; filter: url(#cardShadow); }
+      .title { font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 48px; font-weight: 800; fill: #1f2937; }
+      .subtitle { font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 24px; fill: #5b6573; }
+      .section { font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 34px; font-weight: 800; }
+      .label { font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 22px; font-weight: 700; fill: #334155; }
+      .small { font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 20px; fill: #475569; }
+      .tiny { font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 17px; fill: #596579; }
+      .code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 20px; fill: #26323f; }
+      .codeSmall { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 17px; fill: #26323f; }
+      .impact { font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 21px; font-weight: 700; fill: #334155; }
+      .cellText { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 16px; font-weight: 700; }
+      .axisText { font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 16px; font-weight: 700; fill: #475569; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1920" height="1080"/>
+
+  <text x="96" y="88" class="title">EPLB 负载聚合维度错位修复</text>
+  <text x="96" y="126" class="subtitle">PR #7887：让 EPLB 看到与 expert placement 对齐的 [layer, rank, expert] 负载数据</text>
+
+  <rect x="74" y="164" width="858" height="820" class="card"/>
+  <rect x="988" y="164" width="858" height="820" class="card"/>
+
+  <!-- Left panel: root cause -->
+  <text x="120" y="226" class="section" fill="#c2412d">问题根因</text>
+  <text x="120" y="266" class="subtitle">旧逻辑把 rank 维和 layer 维交叉解释</text>
+
+  <rect x="120" y="304" width="760" height="82" rx="16" fill="#fff3ef" stroke="#f2b7a8"/>
+  <text x="146" y="336" class="code">old: all_gather(local_load, dim=0)</text>
+  <text x="146" y="366" class="code">     .reshape(-1, world_size, ...)</text>
+
+  <text x="120" y="430" class="label">1. dim=0 gather 后按 rank 连续拼接</text>
+  <rect x="126" y="456" width="210" height="48" rx="10" fill="#f8c9bd" stroke="#d44a30"/>
+  <text x="158" y="487" class="cellText" fill="#8f2c20">R0 L0</text>
+  <rect x="346" y="456" width="210" height="48" rx="10" fill="#f8c9bd" stroke="#d44a30"/>
+  <text x="378" y="487" class="cellText" fill="#8f2c20">R0 L1</text>
+  <rect x="566" y="456" width="210" height="48" rx="10" fill="#f8c9bd" stroke="#d44a30"/>
+  <text x="598" y="487" class="cellText" fill="#8f2c20">R0 L2</text>
+
+  <rect x="126" y="518" width="210" height="48" rx="10" fill="#ffd9b3" stroke="#dc7a29"/>
+  <text x="158" y="549" class="cellText" fill="#8a4a12">R1 L0</text>
+  <rect x="346" y="518" width="210" height="48" rx="10" fill="#ffd9b3" stroke="#dc7a29"/>
+  <text x="378" y="549" class="cellText" fill="#8a4a12">R1 L1</text>
+  <rect x="566" y="518" width="210" height="48" rx="10" fill="#ffd9b3" stroke="#dc7a29"/>
+  <text x="598" y="549" class="cellText" fill="#8a4a12">R1 L2</text>
+
+  <path d="M500 590 C500 624 500 640 500 675" fill="none" stroke="#d44a30" stroke-width="5" marker-end="url(#arrowRed)"/>
+  <text x="120" y="642" class="label">2. reshape 不会自动恢复 rank 维</text>
+
+  <g transform="translate(125 688)">
+    <text x="18" y="-16" class="axisText">解释成 [layer, rank, ...]</text>
+    <text x="142" y="22" class="axisText">rank 0</text>
+    <text x="350" y="22" class="axisText">rank 1</text>
+    <text x="10" y="70" class="axisText">layer 0</text>
+    <text x="10" y="128" class="axisText">layer 1</text>
+    <text x="10" y="186" class="axisText">layer 2</text>
+    <rect x="112" y="38" width="180" height="46" rx="8" fill="#f8c9bd" stroke="#d44a30"/>
+    <text x="144" y="68" class="cellText" fill="#8f2c20">R0 L0</text>
+    <rect x="320" y="38" width="180" height="46" rx="8" fill="#f8c9bd" stroke="#d44a30"/>
+    <text x="352" y="68" class="cellText" fill="#8f2c20">R0 L1</text>
+    <rect x="112" y="96" width="180" height="46" rx="8" fill="#f8c9bd" stroke="#d44a30"/>
+    <text x="144" y="126" class="cellText" fill="#8f2c20">R0 L2</text>
+    <rect x="320" y="96" width="180" height="46" rx="8" fill="#ffd9b3" stroke="#dc7a29"/>
+    <text x="352" y="126" class="cellText" fill="#8a4a12">R1 L0</text>
+    <rect x="112" y="154" width="180" height="46" rx="8" fill="#ffd9b3" stroke="#dc7a29"/>
+    <text x="144" y="184" class="cellText" fill="#8a4a12">R1 L1</text>
+    <rect x="320" y="154" width="180" height="46" rx="8" fill="#ffd9b3" stroke="#dc7a29"/>
+    <text x="352" y="184" class="cellText" fill="#8a4a12">R1 L2</text>
+    <path d="M304 32 L304 207" stroke="#cbd5e1" stroke-width="2"/>
+    <path d="M100 90 L514 90" stroke="#cbd5e1" stroke-width="2"/>
+    <path d="M100 148 L514 148" stroke="#cbd5e1" stroke-width="2"/>
+  </g>
+
+  <rect x="650" y="708" width="184" height="144" rx="18" fill="#fff7ed" stroke="#f59e0b" stroke-width="2"/>
+  <text x="670" y="746" class="impact">结果</text>
+  <text x="670" y="780" class="tiny">hotness 匹配错位</text>
+  <text x="670" y="810" class="tiny">复制对象不准</text>
+  <text x="670" y="840" class="tiny">迁移方向偏移</text>
+
+  <rect x="120" y="890" width="760" height="54" rx="16" fill="#fef2f2" stroke="#fecaca"/>
+  <text x="146" y="925" class="impact">调优方向偏了，peak-to-average ratio 难以下降，性能收益被抵消</text>
+
+  <!-- Right panel: fix -->
+  <text x="1034" y="226" class="section" fill="#167f60">修复方法</text>
+  <text x="1034" y="266" class="subtitle">显式插入 rank 维，再沿 rank 维聚合</text>
+
+  <rect x="1034" y="300" width="760" height="112" rx="16" fill="#eefaf6" stroke="#9fd8c2"/>
+  <text x="1060" y="332" class="code">local_load = workload().unsqueeze(1)</text>
+  <text x="1060" y="362" class="code">moe_load = all_gather(local_load, dim=1).cpu()</text>
+  <text x="1060" y="392" class="codeSmall">multi_stage: moe_load.permute(2, 0, 1, 3)</text>
+
+  <g transform="translate(1034 446)">
+    <text x="0" y="0" class="label">1. 插入 rank 维</text>
+    <text x="0" y="28" class="tiny">[L, ...] -> [L, 1, ...]</text>
+    <rect x="0" y="56" width="170" height="44" rx="10" fill="#d9f2e9" stroke="#167f60"/>
+    <text x="36" y="84" class="cellText" fill="#0f6148">L0, R0</text>
+    <rect x="0" y="110" width="170" height="44" rx="10" fill="#d9f2e9" stroke="#167f60"/>
+    <text x="36" y="138" class="cellText" fill="#0f6148">L1, R0</text>
+    <rect x="0" y="164" width="170" height="44" rx="10" fill="#d9f2e9" stroke="#167f60"/>
+    <text x="36" y="192" class="cellText" fill="#0f6148">L2, R0</text>
+    <path d="M204 132 L270 132" stroke="#167f60" stroke-width="5" marker-end="url(#arrowGreen)"/>
+    <text x="218" y="112" class="axisText">dim=1</text>
+  </g>
+
+  <g transform="translate(1320 446)">
+    <text x="0" y="0" class="label">2. 聚合后结构</text>
+    <text x="94" y="48" class="axisText">rank 0</text>
+    <text x="230" y="48" class="axisText">rank 1</text>
+    <text x="366" y="48" class="axisText">rank 2</text>
+    <text x="0" y="92" class="axisText">layer 0</text>
+    <text x="0" y="146" class="axisText">layer 1</text>
+    <text x="0" y="200" class="axisText">layer 2</text>
+    <rect x="86" y="62" width="116" height="42" rx="8" fill="#d9f2e9" stroke="#167f60"/>
+    <text x="110" y="89" class="cellText" fill="#0f6148">R0 L0</text>
+    <rect x="222" y="62" width="116" height="42" rx="8" fill="#d8eafe" stroke="#2563eb"/>
+    <text x="246" y="89" class="cellText" fill="#1d4ed8">R1 L0</text>
+    <rect x="358" y="62" width="116" height="42" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+    <text x="382" y="89" class="cellText" fill="#6d28d9">R2 L0</text>
+    <rect x="86" y="116" width="116" height="42" rx="8" fill="#d9f2e9" stroke="#167f60"/>
+    <text x="110" y="143" class="cellText" fill="#0f6148">R0 L1</text>
+    <rect x="222" y="116" width="116" height="42" rx="8" fill="#d8eafe" stroke="#2563eb"/>
+    <text x="246" y="143" class="cellText" fill="#1d4ed8">R1 L1</text>
+    <rect x="358" y="116" width="116" height="42" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+    <text x="382" y="143" class="cellText" fill="#6d28d9">R2 L1</text>
+    <rect x="86" y="170" width="116" height="42" rx="8" fill="#d9f2e9" stroke="#167f60"/>
+    <text x="110" y="197" class="cellText" fill="#0f6148">R0 L2</text>
+    <rect x="222" y="170" width="116" height="42" rx="8" fill="#d8eafe" stroke="#2563eb"/>
+    <text x="246" y="197" class="cellText" fill="#1d4ed8">R1 L2</text>
+    <rect x="358" y="170" width="116" height="42" rx="8" fill="#ede9fe" stroke="#7c3aed"/>
+    <text x="382" y="197" class="cellText" fill="#6d28d9">R2 L2</text>
+  </g>
+
+  <rect x="1034" y="724" width="360" height="144" rx="18" fill="#f0fdfa" stroke="#5eead4" stroke-width="2"/>
+  <text x="1060" y="762" class="impact">普通 EPLB</text>
+  <text x="1060" y="798" class="small">形状稳定为：</text>
+  <text x="1060" y="830" class="codeSmall">[layer, world_size,</text>
+  <text x="1060" y="858" class="codeSmall"> token, expert]</text>
+
+  <rect x="1434" y="724" width="360" height="144" rx="18" fill="#eff6ff" stroke="#93c5fd" stroke-width="2"/>
+  <text x="1460" y="762" class="impact">Multi-stage / FlashLB</text>
+  <text x="1460" y="798" class="small">再转换为算法期望：</text>
+  <text x="1460" y="830" class="codeSmall">[stage, layer, rank,</text>
+  <text x="1460" y="858" class="codeSmall"> expert]</text>
+
+  <rect x="1034" y="890" width="760" height="54" rx="16" fill="#ecfdf5" stroke="#bbf7d0"/>
+  <text x="1060" y="925" class="impact">EPLB hotness、冗余复制、专家迁移与当前 placement 对齐</text>
+
+  <!-- Footer -->
+  <text x="96" y="1032" class="tiny">验证：新增 tests/ut/eplb/test_eplb_updator.py，覆盖 normal 与 multi-stage 形状语义</text>
+  <text x="1512" y="1032" class="tiny">source: github.com/vllm-project/vllm-ascend/pull/7887</text>
+</svg>

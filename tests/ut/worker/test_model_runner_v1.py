@@ -133,6 +133,7 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         runner = self._build_runner()
         runner.input_batch = input_batch
         runner.sampler = MagicMock(return_value=MagicMock())
+        runner._v1_sampler_adapter = None
 
         # Call sample method
         logits = torch.randn(2, 32000)
@@ -214,6 +215,77 @@ class TestNPUModelRunnerV1SamplingContext(unittest.TestCase):
         self.assertEqual(ctx.pos.tolist(), [10, 11, 21])
         self.assertEqual(ctx.input_ids.tolist(), [101, 102, 202])
         self.assertEqual(ctx.cu_num_logits_np.tolist(), [0, 2, 3])
+
+
+class TestNPUModelRunnerV1SamplerAdapter(unittest.TestCase):
+    def _build_runner(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.input_batch = MagicMock()
+        runner.input_batch.num_reqs = 2
+        runner.input_batch.sampling_metadata = SimpleNamespace(
+            max_num_logprobs=None,
+        )
+        runner.input_batch.update_async_output_token_ids = MagicMock()
+        runner.sampler = MagicMock(return_value="default-sampler-output")
+        runner.rejection_sampler = MagicMock(return_value="rejection-sampler-output")
+        runner._v1_sampling_context = SimpleNamespace(num_logits=2)
+        runner._v1_sampler_adapter = MagicMock()
+        runner._v1_sampler_adapter.can_sample.return_value = True
+        runner._v1_sampler_adapter.return_value = "adapter-output"
+        return runner
+
+    @patch("vllm_ascend.worker.model_runner_v1.lmhead_tp_enable")
+    def test_sample_uses_adapter_for_supported_normal_decode(self, mock_lmhead_tp_enable):
+        mock_lmhead_tp_enable.return_value = False
+        runner = self._build_runner()
+        logits = torch.randn(2, 8)
+
+        output = runner._sample(logits=logits, spec_decode_metadata=None)
+
+        self.assertEqual(output, "adapter-output")
+        runner._v1_sampler_adapter.assert_called_once_with(
+            logits=logits,
+            sampling_metadata=runner.input_batch.sampling_metadata,
+            ctx=runner._v1_sampling_context,
+        )
+        runner.sampler.assert_not_called()
+        runner.rejection_sampler.assert_not_called()
+
+    @patch("vllm_ascend.worker.model_runner_v1.lmhead_tp_enable")
+    def test_sample_falls_back_for_unsupported_normal_decode(self, mock_lmhead_tp_enable):
+        mock_lmhead_tp_enable.return_value = False
+        runner = self._build_runner()
+        runner._v1_sampler_adapter.can_sample.return_value = False
+        logits = torch.randn(2, 8)
+
+        output = runner._sample(logits=logits, spec_decode_metadata=None)
+
+        self.assertEqual(output, "default-sampler-output")
+        runner._v1_sampler_adapter.assert_not_called()
+        runner.sampler.assert_called_once_with(
+            logits=logits,
+            sampling_metadata=runner.input_batch.sampling_metadata,
+        )
+        runner.rejection_sampler.assert_not_called()
+
+    @patch("vllm_ascend.worker.model_runner_v1.lmhead_tp_enable")
+    def test_sample_keeps_spec_decode_on_rejection_sampler(self, mock_lmhead_tp_enable):
+        mock_lmhead_tp_enable.return_value = False
+        runner = self._build_runner()
+        logits = torch.randn(3, 8)
+        spec_decode_metadata = SimpleNamespace(logits_indices=[0, 1, 2])
+
+        output = runner._sample(logits=logits, spec_decode_metadata=spec_decode_metadata)
+
+        self.assertEqual(output, "rejection-sampler-output")
+        runner._v1_sampler_adapter.assert_not_called()
+        runner.sampler.assert_not_called()
+        runner.rejection_sampler.assert_called_once_with(
+            spec_decode_metadata,
+            None,
+            logits,
+            runner.input_batch.sampling_metadata,
+        )
 
 
 class TestNPUModelRunnerDebugger(unittest.TestCase):

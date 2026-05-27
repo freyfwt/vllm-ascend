@@ -297,6 +297,14 @@ class NPUModelRunner(GPUModelRunner):
         self.ascend_config = get_ascend_config()
         self.sampling_config = self.ascend_config.sampling_config
         self._v1_sampling_context: V1SamplingContext | None = None
+        self._v1_sampler_adapter = None
+        if self.sampling_config.enable_sampling_optimization:
+            from vllm_ascend.worker.v1.sample.adapter import V1SamplerAdapter
+
+            self._v1_sampler_adapter = V1SamplerAdapter(
+                max_num_reqs=self.max_num_reqs,
+                device=self.device,
+            )
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -2372,14 +2380,31 @@ class NPUModelRunner(GPUModelRunner):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         self.input_batch.update_async_output_token_ids()
+        top_k = getattr(sampling_metadata, "top_k", None)
         enable_reduced_sampling = False
-        if self.input_batch.sampling_metadata.top_k is not None:
-            enable_reduced_sampling = get_ascend_config().sampling_config.enable_reduced_sampling
+        if top_k is not None:
+            enable_reduced_sampling = (
+                get_ascend_config().sampling_config.enable_reduced_sampling
+            )
+        v1_sampler_adapter = self._v1_sampler_adapter
+        if spec_decode_metadata is None and logits is not None and v1_sampler_adapter is not None:
+            ctx = self._v1_sampling_context
+            if ctx is not None and v1_sampler_adapter.can_sample(sampling_metadata, ctx):
+                if lmhead_tp_enable():
+                    logits = logits[: ctx.num_logits]
+                return v1_sampler_adapter(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                    ctx=ctx,
+                )
+
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
-            if self.input_batch.sampling_metadata.top_k is not None and enable_reduced_sampling:
-                max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
+            if top_k is not None and enable_reduced_sampling:
+                max_topk = self.input_batch.top_k_cpu[
+                    self.input_batch.top_k_cpu < logits.shape[1]
+                ].max()
                 self.sampler.prepare_sampling(max_topk)
             return self.sampler(
                 logits=logits,
@@ -2388,8 +2413,10 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
-        if self.input_batch.sampling_metadata.top_k is not None and enable_reduced_sampling:
-            max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
+        if top_k is not None and enable_reduced_sampling:
+            max_topk = self.input_batch.top_k_cpu[
+                self.input_batch.top_k_cpu < logits.shape[1]
+            ].max()
             self.rejection_sampler.prepare_sampling(max_topk)
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,

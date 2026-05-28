@@ -67,6 +67,7 @@ def config_deprecated_logging():
     """
     import logging
     import warnings
+    from vllm_ascend.logging_utils import configure_vllm_microsecond_logging
 
     # Customize warning format to be one line
     def one_line_formatwarning(message, category, filename, lineno, line=None):
@@ -79,6 +80,8 @@ def config_deprecated_logging():
 
     vllm_logger = logging.getLogger("vllm")
     warnings_logger = logging.getLogger("py.warnings")
+
+    configure_vllm_microsecond_logging()
 
     # Propagate vllm logger handlers to warnings logger, to keep the same
     # format with vllm

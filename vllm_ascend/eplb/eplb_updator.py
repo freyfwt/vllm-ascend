@@ -25,6 +25,7 @@ from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
+from vllm_ascend.logging_utils import configure_vllm_microsecond_logging
 
 
 class EplbUpdator:
@@ -46,6 +47,7 @@ class EplbUpdator:
         self.eplb_loader.num_layers = self.adaptor.num_dense_layers + self.adaptor.num_moe_layers
 
     def init_eplb(self, expert_map_path, process):
+        configure_vllm_microsecond_logging()
         self.rank_id = dist.get_rank()
         self.num_expert_load_gather = 10
         self.periodic_load_gather = True
@@ -99,9 +101,13 @@ class EplbUpdator:
         self.eplb_process.planner_q.put(1)
 
     def forward_before(self):
+        configure_vllm_microsecond_logging()
+        logger.info("[EPLB] The forward_before starts.")
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
+            logger.info("[EPLB] The block_update_q.get() starts.")
             self.update_info_all = self.eplb_process.block_update_q.get()
+            logger.info("[EPLB] The block_update_q.get() ends.")
         if self.update_expert_weight_flag():
             (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = self.update_info_all.pop(
                 0
@@ -119,8 +125,11 @@ class EplbUpdator:
             # set asynchronous stream for d2d expert weight update
             self.reqs = []
             self.eplb_loader.asyn_expert_weight_transfer(self.reqs)
+        logger.info("[EPLB] The forward_before ends.")
 
     def forward_end(self):
+        configure_vllm_microsecond_logging()
+        logger.info("[EPLB] The forward_end starts.")
         if self.wakeup_eplb_worker_flag():
             self.compute_and_set_moe_load()
             self.wakeup_eplb_worker()
@@ -129,6 +138,7 @@ class EplbUpdator:
             self.eplb_loader.update_expert_map_and_weight(self.reqs)
 
         self.update_iteration()
+        logger.info("[EPLB] The forward_end ends.")
 
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)

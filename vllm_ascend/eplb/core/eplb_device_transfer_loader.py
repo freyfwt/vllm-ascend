@@ -20,6 +20,7 @@ import torch.distributed as dist
 from vllm.logger import logger
 
 from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
+from vllm_ascend.logging_utils import configure_vllm_microsecond_logging
 
 
 class ExpertWeightUpdateState(Enum):
@@ -81,7 +82,10 @@ class D2DExpertWeightLoader:
 
         # set asynchronous stream for d2d expert weight transfer
         if self.comm_op_list:
+            configure_vllm_microsecond_logging()
+            logger.info("[EPLB] The launch of batch_isend_irecv starts.")
             ret_list = dist.batch_isend_irecv(self.comm_op_list)
+            logger.info("[EPLB] The launch of batch_isend_irecv ends.")
             reqs.extend(ret_list)
 
         self.state = ExpertWeightUpdateState.TRANSFERRING
@@ -93,7 +97,10 @@ class D2DExpertWeightLoader:
 
         # Waiting for send/recv tasks finish
         for req in reqs:
+            configure_vllm_microsecond_logging()
+            logger.info("[EPLB] The req.wait() starts.")
             req.wait()
+            logger.info("[EPLB] The req.wait() ends.")
 
         if self.comm_op_list is not None:
             self.comm_op_list = None
@@ -111,6 +118,7 @@ class D2DExpertWeightLoader:
             self.eplb_adaptor.do_update_expert_weight(self.layer_id, local_expert_to_replace, buffer_tensor_id)
 
         if self.layer_id == self.num_layers - 1:
+            configure_vllm_microsecond_logging()
             logger.info("[EPLB] finished update expert weight.")
 
         self.recv_expert_list = []

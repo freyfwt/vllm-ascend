@@ -319,6 +319,9 @@ class EplbProcess:
         Subprocess entry: bind to specified NPU, loop waiting for planner_q to wake up,
         call do_update, then notify main process update is complete.
         """
+        from vllm_ascend.logging_utils import configure_vllm_microsecond_logging
+
+        configure_vllm_microsecond_logging()
         if self.policy_type == 3:
             from vllm_ascend.eplb.core.policy.policy_flashlb import warm_up
 
@@ -327,7 +330,9 @@ class EplbProcess:
             try:
                 planner_q.get()
 
+                logger.info("[EPLB] The do_update starts.")
                 packed_update_info = self.worker.do_update()
+                logger.info("[EPLB] The do_update ends.")
 
                 while True:
                     if not block_update_q.empty():

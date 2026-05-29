@@ -53,6 +53,13 @@ __aicore__ inline uint64_t Align32(uint64_t value)
     return (value + 31UL) / 32UL * 32UL;
 }
 
+__aicore__ inline void WaitGumbelVectorToMte3()
+{
+    auto eventId = GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3);
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventId);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventId);
+}
+
 template <typename LogitT, bool COMPACT_MODE>
 class GumbelSampleKernel {
 public:
@@ -93,6 +100,8 @@ public:
         positionsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(positions), batchSize_);
         sampledTokenIdsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(sampledTokenIds), batchSize_);
 
+        syncWorkspaceGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(userWorkspace),
+                                         GUMBEL_SAMPLE_SYNC_INT32_COUNT);
         tileMaxGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(
                                        userWorkspace + tilingData_->workspaceTileMaxOffset),
                                    static_cast<uint64_t>(batchSize_) * numTiles_);
@@ -108,20 +117,34 @@ public:
 
         pipe_->InitBuffer(scoreBuf_, tileSizeAligned_ * sizeof(float));
         pipe_->InitBuffer(noiseBuf_, tileSizeAligned_ * sizeof(float));
+        pipe_->InitBuffer(expNoiseBuf_, tileSizeAligned_ * sizeof(float));
+        pipe_->InitBuffer(syncBuf_, GUMBEL_SAMPLE_SYNC_INT32_COUNT * sizeof(int32_t));
+        auto syncLocal = syncBuf_.Get<int32_t>();
+        AscendC::Duplicate<int32_t>(syncLocal, 0, GUMBEL_SAMPLE_SYNC_INT32_COUNT);
+        WaitGumbelVectorToMte3();
+        AscendC::DataCopy(syncWorkspaceGm_, syncLocal, GUMBEL_SAMPLE_SYNC_INT32_COUNT);
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
 
     __aicore__ inline void Process()
     {
         PhaseTileMax();
-        AscendC::SyncAll();
+        SyncAllCores();
         PhaseRowMax();
-        AscendC::SyncAll();
+        SyncAllCores();
         PhaseTileBest();
-        AscendC::SyncAll();
+        SyncAllCores();
         PhaseFinalBest();
     }
 
 private:
+    __aicore__ inline uint32_t WorkCoreIdx()
+    {
+        // Multi-core needs a dense logical rank; host tiling currently pins
+        // usedCoreNum_ to 1 to avoid sparse physical block ids skipping work.
+        return usedCoreNum_ == 1 ? 0U : AscendC::GetBlockIdx();
+    }
+
     __aicore__ inline uint32_t ValidCount(uint32_t row, uint32_t tile)
     {
         uint32_t rowSize = effectiveSize_;
@@ -137,6 +160,15 @@ private:
             return 0;
         }
         return MinU32(tileSize_, rowSize - start);
+    }
+
+    __aicore__ inline void SyncAllCores()
+    {
+        if (usedCoreNum_ <= 1) {
+            return;
+        }
+        auto syncLocal = syncBuf_.Get<int32_t>();
+        AscendC::SyncAll(syncWorkspaceGm_, syncLocal, usedCoreNum_);
     }
 
     __aicore__ inline float RowTemperature(uint32_t row, int32_t req)
@@ -173,7 +205,7 @@ private:
 
     __aicore__ inline void PhaseTileMax()
     {
-        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t coreIdx = WorkCoreIdx();
         uint32_t totalTiles = batchSize_ * numTiles_;
         for (uint32_t task = coreIdx; task < totalTiles; task += usedCoreNum_) {
             uint32_t row = task / numTiles_;
@@ -195,7 +227,7 @@ private:
 
     __aicore__ inline void PhaseRowMax()
     {
-        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t coreIdx = WorkCoreIdx();
         for (uint32_t row = coreIdx; row < batchSize_; row += usedCoreNum_) {
             float best = GUMBEL_NEG_INF;
             for (uint32_t tile = 0; tile < numTiles_; ++tile) {
@@ -235,16 +267,22 @@ private:
             }
         }
         if (!greedy) {
-            AscendC::Log(noise, noise, tileSizeAligned_);
-            AscendC::Muls(noise, noise, -1.0F, tileSizeAligned_);
+            auto expNoise = expNoiseBuf_.Get<float>();
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Log(expNoise, noise, tileSizeAligned_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(expNoise, expNoise, -1.0F, tileSizeAligned_);
+            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Exp(score, score, tileSizeAligned_);
-            AscendC::Div(score, score, noise, tileSizeAligned_);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Div(score, score, expNoise, tileSizeAligned_);
+            AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
     __aicore__ inline void PhaseTileBest()
     {
-        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t coreIdx = WorkCoreIdx();
         uint32_t totalTiles = batchSize_ * numTiles_;
         auto score = scoreBuf_.Get<float>();
         for (uint32_t task = coreIdx; task < totalTiles; task += usedCoreNum_) {
@@ -292,7 +330,7 @@ private:
 
     __aicore__ inline void PhaseFinalBest()
     {
-        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t coreIdx = WorkCoreIdx();
         for (uint32_t row = coreIdx; row < batchSize_; row += usedCoreNum_) {
             float bestScore = GUMBEL_NEG_INF;
             int32_t bestToken = 0;
@@ -335,12 +373,15 @@ private:
     AscendC::GlobalTensor<int64_t> seedsGm_;
     AscendC::GlobalTensor<int64_t> positionsGm_;
     AscendC::GlobalTensor<int32_t> sampledTokenIdsGm_;
+    AscendC::GlobalTensor<int32_t> syncWorkspaceGm_;
     AscendC::GlobalTensor<float> tileMaxGm_;
     AscendC::GlobalTensor<float> rowMaxGm_;
     AscendC::GlobalTensor<float> bestScoreGm_;
     AscendC::GlobalTensor<int32_t> bestIdGm_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> scoreBuf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> noiseBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> expNoiseBuf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> syncBuf_;
 };
 
 }  // namespace sampling

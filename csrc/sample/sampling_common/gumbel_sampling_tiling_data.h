@@ -13,6 +13,9 @@ constexpr uint32_t GUMBEL_SAMPLE_FULL_VOCAB = 0;
 constexpr uint32_t GUMBEL_SAMPLE_COMPACT_CANDIDATES = 1;
 constexpr uint32_t GUMBEL_SAMPLE_TILE_SIZE = 1024;
 constexpr uint32_t GUMBEL_SAMPLE_SYS_WORKSPACE_BYTES = 16U * 1024U * 1024U;
+constexpr uint32_t GUMBEL_SAMPLE_SYNC_INT32_COUNT = 8U * 8U * 32U;
+constexpr uint32_t GUMBEL_SAMPLE_SYNC_WORKSPACE_BYTES =
+    GUMBEL_SAMPLE_SYNC_INT32_COUNT * sizeof(int32_t);
 
 struct GumbelSampleTilingData {
     uint32_t batchSize;

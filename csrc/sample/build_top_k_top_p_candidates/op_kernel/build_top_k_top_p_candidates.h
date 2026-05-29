@@ -60,7 +60,7 @@ public:
 
     __aicore__ inline void Process()
     {
-        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t coreIdx = usedCoreNum_ == 1 ? 0U : AscendC::GetBlockIdx();
         for (uint32_t row = coreIdx; row < batchSize_; row += usedCoreNum_) {
             ProcessRow(row);
         }
@@ -126,7 +126,9 @@ private:
                 expLocal.SetValue(i, GUMBEL_NEG_INF);
             }
         }
+        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Exp(expLocal, expLocal, tileSizeAligned_);
+        AscendC::PipeBarrier<PIPE_V>();
         float sum = 0.0F;
         for (uint32_t i = 0; i < valid; ++i) {
             sum += expLocal.GetValue(i);
@@ -164,7 +166,9 @@ private:
                     expLocal.SetValue(i, GUMBEL_NEG_INF);
                 }
             }
+            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Exp(expLocal, expLocal, tileSizeAligned_);
+            AscendC::PipeBarrier<PIPE_V>();
             for (uint32_t i = 0; i < valid; ++i) {
                 cumulative += expLocal.GetValue(i);
                 if (cumulative >= threshold) {

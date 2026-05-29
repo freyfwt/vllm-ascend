@@ -9,6 +9,7 @@
 
 using namespace ge;
 using vllm_ascend::sampling::GUMBEL_SAMPLE_FULL_VOCAB;
+using vllm_ascend::sampling::GUMBEL_SAMPLE_SYNC_WORKSPACE_BYTES;
 using vllm_ascend::sampling::GUMBEL_SAMPLE_SYS_WORKSPACE_BYTES;
 using vllm_ascend::sampling::GUMBEL_SAMPLE_TILE_SIZE;
 using vllm_ascend::sampling::GumbelSampleTilingData;
@@ -45,35 +46,36 @@ static ge::graphStatus TilingForGumbelSample(gert::TilingContext* context)
     OPS_CHECK(temperatureShape == nullptr,
               OPS_LOG_E(nodeName, "temperature shape is nullptr."), return ge::GRAPH_FAILED);
 
-    auto logitsStorageShape = logitsShape->GetStorageShape();
-    OPS_CHECK(logitsStorageShape.GetDimNum() != 2,
+    auto logitsOriginShape = logitsShape->GetOriginShape();
+    OPS_CHECK(logitsOriginShape.GetDimNum() != 2,
               OPS_LOG_E(nodeName, "logits must be 2D."), return ge::GRAPH_FAILED);
-    uint32_t batchSize = static_cast<uint32_t>(logitsStorageShape.GetDim(0));
-    uint32_t vocabSize = static_cast<uint32_t>(logitsStorageShape.GetDim(1));
+    uint32_t batchSize = static_cast<uint32_t>(logitsOriginShape.GetDim(0));
+    uint32_t vocabSize = static_cast<uint32_t>(logitsOriginShape.GetDim(1));
     OPS_CHECK(batchSize == 0 || vocabSize == 0,
               OPS_LOG_E(nodeName, "batch and vocab must be greater than 0."), return ge::GRAPH_FAILED);
 
-    auto tempStorageShape = temperatureShape->GetStorageShape();
-    uint32_t requestCount = tempStorageShape.GetDimNum() == 0
+    auto tempOriginShape = temperatureShape->GetOriginShape();
+    uint32_t requestCount = tempOriginShape.GetDimNum() == 0
                                 ? 1U
-                                : static_cast<uint32_t>(tempStorageShape.GetDim(0));
+                                : static_cast<uint32_t>(tempOriginShape.GetDim(0));
 
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     uint32_t coreNum = platform.GetCoreNumAiv();
     if (coreNum == 0) {
         coreNum = 1;
     }
+    // 910B AIV block ids may be sparse in this launch mode. Keep one work core
+    // until the kernel has a dense logical-rank mapping.
+    (void)coreNum;
 
     uint32_t dtypeBytes = DtypeBytes(context->GetInputDesc(LOGITS_INDEX)->GetDataType());
     uint32_t dataPerBlock = 32U / dtypeBytes;
     uint32_t tileSizeAligned = (GUMBEL_SAMPLE_TILE_SIZE + dataPerBlock - 1U) / dataPerBlock * dataPerBlock;
     uint32_t numTiles = (vocabSize + GUMBEL_SAMPLE_TILE_SIZE - 1U) / GUMBEL_SAMPLE_TILE_SIZE;
-    uint32_t totalTiles = batchSize * numTiles;
-    uint32_t usedCoreNum = std::min(coreNum, totalTiles);
-    usedCoreNum = std::max(usedCoreNum, 1U);
+    uint32_t usedCoreNum = 1U;
 
     uint64_t tileCount = static_cast<uint64_t>(batchSize) * numTiles;
-    uint64_t offset = 0;
+    uint64_t offset = Align32(GUMBEL_SAMPLE_SYNC_WORKSPACE_BYTES);
     uint32_t tileMaxOffset = static_cast<uint32_t>(offset);
     offset += Align32(tileCount * FLOAT_BYTES);
     uint32_t rowMaxOffset = static_cast<uint32_t>(offset);
@@ -112,9 +114,10 @@ static ge::graphStatus TilingForGumbelSample(gert::TilingContext* context)
     OPS_CHECK(workspaceSizes == nullptr,
               OPS_LOG_E(nodeName, "workspaceSizes is nullptr."), return ge::GRAPH_FAILED);
     workspaceSizes[0] = GUMBEL_SAMPLE_SYS_WORKSPACE_BYTES + offset;
-    context->SetBlockDim(usedCoreNum);
-    OPS_LOG_D(nodeName, "GumbelSample B=%u V=%u tiles=%u cores=%u workspace=%lu",
-              batchSize, vocabSize, numTiles, usedCoreNum, workspaceSizes[0]);
+    uint32_t blockDim = platform.CalcTschBlockDim(usedCoreNum, 0, usedCoreNum);
+    context->SetBlockDim(blockDim);
+    OPS_LOG_D(nodeName, "GumbelSample B=%u V=%u tiles=%u cores=%u blockDim=%u workspace=%lu",
+              batchSize, vocabSize, numTiles, usedCoreNum, blockDim, workspaceSizes[0]);
     return ge::GRAPH_SUCCESS;
 }
 

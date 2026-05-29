@@ -50,11 +50,11 @@ static ge::graphStatus TilingForBuildTopKTopPCandidates(gert::TilingContext* con
     OPS_CHECK(temperatureShape == nullptr,
               OPS_LOG_E(nodeName, "temperature shape is nullptr."), return ge::GRAPH_FAILED);
 
-    auto sortedStorageShape = sortedShape->GetStorageShape();
-    OPS_CHECK(sortedStorageShape.GetDimNum() != 2,
+    auto sortedOriginShape = sortedShape->GetOriginShape();
+    OPS_CHECK(sortedOriginShape.GetDimNum() != 2,
               OPS_LOG_E(nodeName, "sorted_value must be 2D."), return ge::GRAPH_FAILED);
-    uint32_t batchSize = static_cast<uint32_t>(sortedStorageShape.GetDim(0));
-    uint32_t vocabSize = static_cast<uint32_t>(sortedStorageShape.GetDim(1));
+    uint32_t batchSize = static_cast<uint32_t>(sortedOriginShape.GetDim(0));
+    uint32_t vocabSize = static_cast<uint32_t>(sortedOriginShape.GetDim(1));
     OPS_CHECK(batchSize == 0 || vocabSize == 0,
               OPS_LOG_E(nodeName, "batch and vocab must be greater than 0."), return ge::GRAPH_FAILED);
 
@@ -71,18 +71,20 @@ static ge::graphStatus TilingForBuildTopKTopPCandidates(gert::TilingContext* con
         attrs->GetAttrPointer<bool>(ATTR_APPLY_TEMPERATURE_INDEX);
     bool applyTemperature = applyTemperaturePtr == nullptr ? true : *applyTemperaturePtr;
 
-    auto tempStorageShape = temperatureShape->GetStorageShape();
-    uint32_t requestCount = tempStorageShape.GetDimNum() == 0
+    auto tempOriginShape = temperatureShape->GetOriginShape();
+    uint32_t requestCount = tempOriginShape.GetDimNum() == 0
                                 ? 1U
-                                : static_cast<uint32_t>(tempStorageShape.GetDim(0));
+                                : static_cast<uint32_t>(tempOriginShape.GetDim(0));
 
     auto platform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
     uint32_t coreNum = platform.GetCoreNumAiv();
     if (coreNum == 0) {
         coreNum = 1;
     }
-    uint32_t usedCoreNum = std::min(coreNum, batchSize);
-    usedCoreNum = std::max(usedCoreNum, 1U);
+    // 910B AIV block ids may be sparse in this launch mode. Keep one work core
+    // until the kernel has a dense logical-rank mapping.
+    (void)coreNum;
+    uint32_t usedCoreNum = 1U;
 
     uint32_t dtypeBytes = DtypeBytes(context->GetInputDesc(SORTED_VALUE_INDEX)->GetDataType());
     uint32_t dataPerBlock = 32U / dtypeBytes;
@@ -104,9 +106,10 @@ static ge::graphStatus TilingForBuildTopKTopPCandidates(gert::TilingContext* con
     OPS_CHECK(workspaceSizes == nullptr,
               OPS_LOG_E(nodeName, "workspaceSizes is nullptr."), return ge::GRAPH_FAILED);
     workspaceSizes[0] = 0;
-    context->SetBlockDim(usedCoreNum);
-    OPS_LOG_D(nodeName, "BuildTopKTopPCandidates B=%u V=%u C=%u cores=%u topP=%u topK=%u",
-              batchSize, vocabSize, candidateCapacity, usedCoreNum,
+    uint32_t blockDim = platform.CalcTschBlockDim(usedCoreNum, 0, usedCoreNum);
+    context->SetBlockDim(blockDim);
+    OPS_LOG_D(nodeName, "BuildTopKTopPCandidates B=%u V=%u C=%u cores=%u blockDim=%u topP=%u topK=%u",
+              batchSize, vocabSize, candidateCapacity, usedCoreNum, blockDim,
               tilingData->hasTopP, tilingData->hasTopK);
     return ge::GRAPH_SUCCESS;
 }

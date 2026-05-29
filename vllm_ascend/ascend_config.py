@@ -30,13 +30,19 @@ class SamplingConfig:
     def __init__(self, config: dict | None = None):
         if config is None:
             config = {}
-        unknown_options = set(config) - {"enable_sampling_optimization"}
+        supported_options = {
+            "enable_sampling_optimization",
+            "enable_reduced_sampling",
+        }
+        unknown_options = set(config) - supported_options
         if unknown_options:
             raise ValueError(
                 "sampling_config only supports enable_sampling_optimization "
+                "and enable_reduced_sampling "
                 f"in this phase, got {sorted(unknown_options)}"
             )
         self.enable_sampling_optimization: bool = config.get("enable_sampling_optimization", False)
+        self.enable_reduced_sampling: bool = config.get("enable_reduced_sampling", False)
 
 
 class AscendConfig:
@@ -153,6 +159,7 @@ class AscendConfig:
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
         self.multistream_dsa_preprocess = additional_config.get("multistream_dsa_preprocess", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", False)
+        self.prefill_comm_compute_overlap = additional_config.get("prefill_comm_compute_overlap", False)
 
         self.enable_context_parallel = self._get_config_value(
             additional_config,

@@ -105,7 +105,9 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
             [1, 2, 3, -1],
             [4, 5, -1],
         ]
+        input_batch.sampling_metadata.top_k = None
         input_batch.num_reqs = 2
+        input_batch.top_k_cpu = None
         input_batch.prev_req_id_to_index = {
             "req0": 0,
             "req1": 1,

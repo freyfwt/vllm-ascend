@@ -9,6 +9,7 @@ patch
 cpu_binding
 ModelRunner_prepare_inputs
 sampling_optimization
+ascendc_gumbel_sampling
 disaggregated_prefill
 eplb_swift_balancer
 ACL_Graph

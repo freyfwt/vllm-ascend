@@ -19,6 +19,7 @@
 #
 
 import torch
+import vllm.envs as envs
 from vllm.triton_utils import tl, triton
 
 
@@ -72,6 +73,155 @@ def apply_temperature(
         BLOCK_SIZE=BLOCK_SIZE,
         multibuffer=False,
     )
+
+
+def _get_ascend_op(name: str):
+    namespace = getattr(torch.ops, "_C_ascend", None)
+    if namespace is None:
+        return None
+    try:
+        return getattr(namespace, name)
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _is_npu_tensor(tensor: torch.Tensor) -> bool:
+    return tensor.device.type == "npu"
+
+
+def _can_use_gumbel_sample_op(
+    logits: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    pos: torch.Tensor,
+    output_processed_logits: torch.Tensor | None,
+    use_fp64: bool,
+) -> bool:
+    return (
+        not use_fp64
+        and output_processed_logits is None
+        and not envs.VLLM_BATCH_INVARIANT
+        and _get_ascend_op("npu_gumbel_sample") is not None
+        and logits.dim() == 2
+        and _is_npu_tensor(logits)
+        and all(tensor.device == logits.device for tensor in (idx_mapping, temperature, seed, pos))
+        and logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    )
+
+
+def _gumbel_sample_op(
+    logits: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    pos: torch.Tensor,
+    apply_temperature: bool,
+) -> torch.Tensor:
+    return torch.ops._C_ascend.npu_gumbel_sample(
+        logits,
+        idx_mapping.to(dtype=torch.int32),
+        temperature.to(dtype=torch.float32),
+        seed.to(dtype=torch.int64),
+        pos.to(dtype=torch.int64),
+        apply_temperature,
+    )
+
+
+def can_use_compact_top_k_top_p_sample(
+    logits: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    pos: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+) -> bool:
+    return (
+        (k is not None or p is not None)
+        and not envs.VLLM_BATCH_INVARIANT
+        and _get_ascend_op("npu_build_top_k_top_p_candidates") is not None
+        and _get_ascend_op("npu_gumbel_sample_from_candidates") is not None
+        and logits.dim() == 2
+        and _is_npu_tensor(logits)
+        and all(tensor.device == logits.device for tensor in (idx_mapping, temperature, seed, pos))
+        and (k is None or (k.device == logits.device and k.dtype in (torch.int32, torch.int64)))
+        and (p is None or (p.device == logits.device and p.dtype in (torch.float16, torch.bfloat16, torch.float32)))
+        and logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    )
+
+
+def compact_top_k_top_p_sample(
+    logits: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seed: torch.Tensor,
+    pos: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    candidate_capacity: int = 1024,
+    apply_temperature: bool = True,
+) -> torch.Tensor:
+    candidate_logits, candidate_ids, candidate_lens, status = torch.ops._C_ascend.npu_build_top_k_top_p_candidates(
+        logits,
+        idx_mapping.to(dtype=torch.int32),
+        temperature.to(dtype=torch.float32),
+        p=None if p is None else p.to(dtype=logits.dtype),
+        k=None if k is None else k.to(dtype=torch.int32),
+        candidate_capacity=candidate_capacity,
+        apply_temperature=apply_temperature,
+    )
+    sampled = torch.empty((logits.shape[0],), dtype=torch.int32, device=logits.device)
+
+    compact_rows = status == 0
+    no_filter_rows = status == 1
+    overflow_rows = status == 2
+
+    if bool(compact_rows.any()):
+        sampled[compact_rows] = torch.ops._C_ascend.npu_gumbel_sample_from_candidates(
+            candidate_logits[compact_rows],
+            candidate_ids[compact_rows],
+            candidate_lens[compact_rows],
+            idx_mapping[compact_rows].to(dtype=torch.int32),
+            seed.to(dtype=torch.int64),
+            pos[compact_rows].to(dtype=torch.int64),
+        )
+
+    if bool(no_filter_rows.any()):
+        sampled[no_filter_rows] = _gumbel_sample_op(
+            logits=logits[no_filter_rows],
+            idx_mapping=idx_mapping[no_filter_rows],
+            temperature=temperature,
+            seed=seed,
+            pos=pos[no_filter_rows],
+            apply_temperature=apply_temperature,
+        )
+
+    if bool(overflow_rows.any()):
+        from vllm_ascend.sample.sampler import apply_top_k_top_p
+
+        overflow_logits = logits[overflow_rows].clone()
+        overflow_idx_mapping = idx_mapping[overflow_rows]
+        if apply_temperature:
+            apply_temperature_fn = globals()["apply_temperature"]
+            apply_temperature_fn(
+                overflow_logits,
+                overflow_idx_mapping,
+                temperature,
+            )
+        overflow_k = k[overflow_rows] if k is not None else None
+        overflow_p = p[overflow_rows] if p is not None else None
+        overflow_logits = apply_top_k_top_p(overflow_logits, overflow_k, overflow_p)
+        sampled[overflow_rows] = _gumbel_sample_op(
+            logits=overflow_logits,
+            idx_mapping=overflow_idx_mapping,
+            temperature=temperature,
+            seed=seed,
+            pos=pos[overflow_rows],
+            apply_temperature=False,
+        )
+
+    return sampled
 
 
 @triton.jit
@@ -161,6 +311,24 @@ def gumbel_sample(
 ) -> torch.Tensor:
     if use_fp64:
         raise NotImplementedError("FP64 Gumbel sampling is not supported on NPU.")
+
+    if _can_use_gumbel_sample_op(
+        logits=logits,
+        idx_mapping=idx_mapping,
+        temperature=temperature,
+        seed=seed,
+        pos=pos,
+        output_processed_logits=output_processed_logits,
+        use_fp64=use_fp64,
+    ):
+        return _gumbel_sample_op(
+            logits=logits,
+            idx_mapping=idx_mapping,
+            temperature=temperature,
+            seed=seed,
+            pos=pos,
+            apply_temperature=apply_temperature,
+        )
 
     num_reqs, vocab_size = logits.shape
     BLOCK_SIZE = 1024

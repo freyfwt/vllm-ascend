@@ -502,6 +502,63 @@ at::Tensor npu_hamming_dist_top_k_meta(const at::Tensor &hashq,
     return out;
 }
 
+at::Tensor npu_gumbel_sample_meta(
+    const at::Tensor& logits,
+    const at::Tensor& idx_mapping,
+    const at::Tensor& temperature,
+    const at::Tensor& seeds,
+    const at::Tensor& positions,
+    bool apply_temperature)
+{
+    (void)idx_mapping;
+    (void)temperature;
+    (void)seeds;
+    (void)positions;
+    (void)apply_temperature;
+    return at::empty({logits.size(0)}, logits.options().dtype(at::kInt).device(at::kMeta));
+}
+
+at::Tensor npu_gumbel_sample_from_candidates_meta(
+    const at::Tensor& candidate_logits,
+    const at::Tensor& candidate_ids,
+    const at::Tensor& candidate_lens,
+    const at::Tensor& idx_mapping,
+    const at::Tensor& seeds,
+    const at::Tensor& positions)
+{
+    (void)candidate_ids;
+    (void)candidate_lens;
+    (void)idx_mapping;
+    (void)seeds;
+    (void)positions;
+    return at::empty({candidate_logits.size(0)},
+                     candidate_logits.options().dtype(at::kInt).device(at::kMeta));
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+npu_build_top_k_top_p_candidates_meta(
+    const at::Tensor& logits,
+    const at::Tensor& idx_mapping,
+    const at::Tensor& temperature,
+    const c10::optional<at::Tensor>& p,
+    const c10::optional<at::Tensor>& k,
+    int64_t candidate_capacity,
+    bool apply_temperature)
+{
+    (void)idx_mapping;
+    (void)temperature;
+    (void)p;
+    (void)k;
+    (void)apply_temperature;
+    at::Tensor candidate_logits = at::empty(
+        {logits.size(0), candidate_capacity}, logits.options().device(at::kMeta));
+    auto int_options = logits.options().dtype(at::kInt).device(at::kMeta);
+    at::Tensor candidate_ids = at::empty({logits.size(0), candidate_capacity}, int_options);
+    at::Tensor candidate_lens = at::empty({logits.size(0)}, int_options);
+    at::Tensor candidate_status = at::empty({logits.size(0)}, int_options);
+    return {candidate_logits, candidate_ids, candidate_lens, candidate_status};
+}
+
 at::Tensor npu_sign_bits_pack_meta(const at::Tensor& input,
                                    const int64_t size) {
     int64_t ySize = (input.size(0) + 7) / 8;
@@ -1605,6 +1662,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("transpose_kv_cache_by_block", &vllm_ascend::meta::transpose_kv_cache_by_block_meta);
     // hamming_dist_top_k
     ops.impl("npu_hamming_dist_top_k", &vllm_ascend::meta::npu_hamming_dist_top_k_meta);
+    // fused gumbel sampling
+    ops.impl("npu_gumbel_sample", &vllm_ascend::meta::npu_gumbel_sample_meta);
+    ops.impl("npu_gumbel_sample_from_candidates",
+             &vllm_ascend::meta::npu_gumbel_sample_from_candidates_meta);
+    ops.impl("npu_build_top_k_top_p_candidates",
+             &vllm_ascend::meta::npu_build_top_k_top_p_candidates_meta);
     // reshape_and_cache_bnsd
     ops.impl("npu_reshape_and_cache_bnsd", &vllm_ascend::meta::npu_reshape_and_cache_bnsd_meta);
     // npu_sign_bits_pack

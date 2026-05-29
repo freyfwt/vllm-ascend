@@ -31,6 +31,9 @@
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
 #include "moe/apply_top_k_top_p_custom/apply_top_k_top_p_custom_torch_adpt.h"
+#include "sample/gumbel_sample/gumbel_sample_torch_adpt.h"
+#include "sample/gumbel_sample_from_candidates/gumbel_sample_from_candidates_torch_adpt.h"
+#include "sample/build_top_k_top_p_candidates/build_top_k_top_p_candidates_torch_adpt.h"
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "mla_preprocess/mla_preprocess_torch_adpt.h"
@@ -2525,6 +2528,28 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def("npu_apply_top_k_top_p(Tensor logits, Tensor? p=None, Tensor? k=None) -> Tensor");
     ops.impl("npu_apply_top_k_top_p", torch::kPrivateUse1, &vllm_ascend::npu_apply_top_k_top_p);
+
+    ops.def(
+        "npu_gumbel_sample(Tensor logits, Tensor idx_mapping, Tensor temperature, "
+        "Tensor seeds, Tensor positions, bool apply_temperature=True) -> Tensor");
+    ops.impl("npu_gumbel_sample", torch::kPrivateUse1,
+             &vllm_ascend::npu_gumbel_sample);
+
+    ops.def(
+        "npu_gumbel_sample_from_candidates(Tensor candidate_logits, "
+        "Tensor candidate_ids, Tensor candidate_lens, Tensor idx_mapping, "
+        "Tensor seeds, Tensor positions) -> Tensor");
+    ops.impl("npu_gumbel_sample_from_candidates", torch::kPrivateUse1,
+             &vllm_ascend::npu_gumbel_sample_from_candidates);
+
+    ops.def(
+        "npu_build_top_k_top_p_candidates(Tensor logits, Tensor idx_mapping, "
+        "Tensor temperature, *, Tensor? p=None, Tensor? k=None, "
+        "int candidate_capacity=1024, bool apply_temperature=True) -> "
+        "(Tensor candidate_logits, Tensor candidate_ids, Tensor candidate_lens, "
+        "Tensor candidate_status)");
+    ops.impl("npu_build_top_k_top_p_candidates", torch::kPrivateUse1,
+             &vllm_ascend::npu_build_top_k_top_p_candidates);
 
     ops.def(
         "npu_hamming_dist_top_k(Tensor q, Tensor k_comp, Tensor k_comp_rope, Tensor k,"

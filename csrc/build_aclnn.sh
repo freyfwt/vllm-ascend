@@ -11,6 +11,7 @@ resolve_op_dir() {
     local op_name=$1
     local candidate_dir
     for candidate_dir in \
+        "${ROOT_DIR}/csrc/sample/${op_name}" \
         "${ROOT_DIR}/csrc/moe/${op_name}" \
         "${ROOT_DIR}/csrc/gmm/${op_name}" \
         "${ROOT_DIR}/csrc/attention/${op_name}" \
@@ -94,6 +95,9 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "moe_gating_top_k_hash"
         "add_rms_norm_bias"
         "apply_top_k_top_p_custom"
+        "gumbel_sample"
+        "gumbel_sample_from_candidates"
+        "build_top_k_top_p_candidates"
         "transpose_kv_cache_by_block"
         "copy_and_expand_eagle_inputs"
         "causal_conv1d"
@@ -176,6 +180,9 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "moe_gating_top_k_hash"
         "add_rms_norm_bias"
         "apply_top_k_top_p_custom"
+        "gumbel_sample"
+        "gumbel_sample_from_candidates"
+        "build_top_k_top_p_candidates"
         "transpose_kv_cache_by_block"
         "copy_and_expand_eagle_inputs"
         "causal_conv1d"

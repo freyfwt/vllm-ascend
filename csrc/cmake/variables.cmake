@@ -316,4 +316,5 @@ set(OPS_CATEGORY_LIST
   "attention"
   "moe"
   "mc2"
+  "sample"
 )

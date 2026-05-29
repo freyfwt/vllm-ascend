@@ -153,6 +153,48 @@ class TestV1SamplerAdapter(TestBase):
         self.assertIs(mock_gumbel_sample.call_args.kwargs["logits"], filtered_logits)
         self.assertFalse(mock_gumbel_sample.call_args.kwargs["apply_temperature"])
 
+    def test_prefers_compact_top_k_top_p_when_available(self):
+        from vllm_ascend.worker.v1.sample.adapter import V1SamplerAdapter
+
+        adapter = V1SamplerAdapter(
+            max_num_reqs=2,
+            device=torch.device("cpu"),
+        )
+        logits = torch.randn(2, 8)
+        top_k = torch.tensor([4, 8], dtype=torch.int32)
+        top_p = torch.tensor([0.9, 1.0], dtype=torch.float32)
+
+        with (
+            patch(
+                "vllm_ascend.worker.v2.sample.gumbel.can_use_compact_top_k_top_p_sample",
+                return_value=True,
+            ) as mock_can_use_compact,
+            patch(
+                "vllm_ascend.worker.v2.sample.gumbel.compact_top_k_top_p_sample",
+                return_value=torch.tensor([3, 5], dtype=torch.int32),
+            ) as mock_compact_sample,
+            patch(
+                "vllm_ascend.worker.v2.sample.gumbel.apply_temperature",
+            ) as mock_apply_temperature,
+            patch("vllm_ascend.sample.sampler.apply_top_k_top_p") as mock_top_k_top_p,
+            patch("vllm_ascend.worker.v2.sample.gumbel.gumbel_sample") as mock_gumbel_sample,
+        ):
+            output = adapter(
+                logits=logits,
+                sampling_metadata=_metadata(top_k=top_k, top_p=top_p),
+                ctx=_ctx(("req0", "req1")),
+            )
+
+        self.assertEqual(output.sampled_token_ids.tolist(), [[3], [5]])
+        mock_can_use_compact.assert_called_once()
+        mock_compact_sample.assert_called_once()
+        self.assertIs(mock_compact_sample.call_args.kwargs["logits"], logits)
+        self.assertIs(mock_compact_sample.call_args.kwargs["k"], top_k)
+        self.assertIs(mock_compact_sample.call_args.kwargs["p"], top_p)
+        mock_apply_temperature.assert_not_called()
+        mock_top_k_top_p.assert_not_called()
+        mock_gumbel_sample.assert_not_called()
+
     def test_temperature_none_maps_to_greedy_gumbel_temperature(self):
         from vllm_ascend.worker.v1.sample.adapter import V1SamplerAdapter
 

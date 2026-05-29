@@ -101,6 +101,25 @@ class V1SamplerAdapter:
         from vllm_ascend.worker.v2.sample import gumbel as gumbel_ops
 
         if has_top_k_top_p:
+            if gumbel_ops.can_use_compact_top_k_top_p_sample(
+                logits=logits,
+                idx_mapping=ctx.expanded_idx_mapping,
+                temperature=temperature,
+                seed=seeds,
+                pos=ctx.pos,
+                k=top_k,
+                p=top_p,
+            ):
+                return gumbel_ops.compact_top_k_top_p_sample(
+                    logits=logits,
+                    idx_mapping=ctx.expanded_idx_mapping,
+                    temperature=temperature,
+                    seed=seeds,
+                    pos=ctx.pos,
+                    k=top_k,
+                    p=top_p,
+                )
+
             from vllm_ascend.sample.sampler import apply_top_k_top_p
 
             gumbel_ops.apply_temperature(logits, ctx.expanded_idx_mapping, temperature)

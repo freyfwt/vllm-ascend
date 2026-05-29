@@ -86,6 +86,7 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
                 "${CMAKE_CURRENT_SOURCE_DIR}/moe/**/op_host/CMakeLists.txt"
                 "${CMAKE_CURRENT_SOURCE_DIR}/ffn/**/op_host/CMakeLists.txt"
                 "${CMAKE_CURRENT_SOURCE_DIR}/mc2/**/op_host/CMakeLists.txt"
+                "${CMAKE_CURRENT_SOURCE_DIR}/sample/**/op_host/CMakeLists.txt"
                 "${CMAKE_CURRENT_SOURCE_DIR}/posembedding/**/framework/CMakeLists.txt"
                 "${CMAKE_CURRENT_SOURCE_DIR}/moe/**/framework/CMakeLists.txt"
                 "${CMAKE_CURRENT_SOURCE_DIR}/ffn/**/framework/CMakeLists.txt"

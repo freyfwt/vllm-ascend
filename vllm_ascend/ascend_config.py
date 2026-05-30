@@ -270,6 +270,11 @@ class AscendConfig:
 
         # Enable optimized reduce sampling scheme
         self.enable_reduce_sample = additional_config.get("enable_reduce_sample", False)
+        # POC only: route v1 probabilistic spec decode through upstream GPU
+        # rejection sampler with a lightweight adapter.
+        self.enable_v1_upstream_rejection_sampler_poc = additional_config.get(
+            "enable_v1_upstream_rejection_sampler_poc", False
+        )
 
         self.mix_placement = additional_config.get("mix_placement", False)
         self._check_mix_placement()

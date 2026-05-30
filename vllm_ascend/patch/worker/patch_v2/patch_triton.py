@@ -1,6 +1,6 @@
 from vllm.v1.worker.gpu import input_batch, model_runner, structured_outputs
 from vllm.v1.worker.gpu.sample import bad_words, gumbel, logprob, penalties, prompt_logprob, sampler, states
-from vllm.v1.worker.gpu.spec_decode import rejection_sampler, rejection_sampler_utils
+from vllm.v1.worker.gpu.spec_decode import rejection_sampler
 from vllm.v1.worker.gpu.spec_decode.eagle import speculator
 
 from vllm_ascend.worker.v2.input_batch import post_update
@@ -13,6 +13,11 @@ from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
     rejection_sample as npu_rejection_sample,
 )
 from vllm_ascend.worker.v2.structured_outputs import _apply_grammar_bitmask_kernel
+
+try:
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils
+except ImportError:
+    rejection_sampler_utils = None
 
 penalties.apply_penalties = apply_penalties
 # because sampler.py and speculator.py are imported before this patch, they must be overridden
@@ -30,5 +35,7 @@ gumbel.apply_temperature = apply_temperature
 states.apply_temperature = apply_temperature
 logprob.compute_token_logprobs = compute_token_logprobs
 structured_outputs._apply_grammar_bitmask_kernel = _apply_grammar_bitmask_kernel
-rejection_sampler_utils.rejection_sample = npu_rejection_sample
+if rejection_sampler_utils is not None:
+    rejection_sampler_utils.rejection_sample = npu_rejection_sample
 rejection_sampler.rejection_sample = npu_rejection_sample
+rejection_sampler.probabilistic_rejection_sample = npu_rejection_sample

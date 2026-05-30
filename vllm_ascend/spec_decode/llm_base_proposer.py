@@ -187,6 +187,35 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.enable_enpu = self.runner.enable_enpu
         self.use_eagle = self.runner.use_eagle
 
+    def _save_draft_logits_poc(
+        self,
+        logits: torch.Tensor,
+        draft_step: int,
+        num_reqs: int,
+    ) -> None:
+        if not getattr(self.runner, "use_upstream_rejection_sampler_poc", False):
+            return
+
+        draft_logits = self.runner.draft_logits_poc
+        if (
+            draft_logits is None
+            or draft_logits.shape[0] < self.runner.max_num_reqs
+            or draft_logits.shape[1] < self.num_speculative_tokens
+            or draft_logits.shape[2] != logits.shape[-1]
+            or draft_logits.dtype != logits.dtype
+        ):
+            self.runner.draft_logits_poc = torch.empty(
+                (
+                    self.runner.max_num_reqs,
+                    self.num_speculative_tokens,
+                    logits.shape[-1],
+                ),
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            draft_logits = self.runner.draft_logits_poc
+        draft_logits[:num_reqs, draft_step].copy_(logits[:num_reqs])
+
     def _get_model(self) -> nn.Module:
         """
         Default method to call get_model(). Can be overridden by subclasses which
@@ -963,6 +992,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 logits = logits[:num_indices]
                 token_indices_to_sample = token_indices_to_sample[:num_indices]
             draft_token_ids = logits.argmax(dim=-1)
+            self._save_draft_logits_poc(logits, 0, draft_token_ids.shape[0])
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -1101,6 +1131,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     logits = logits[:num_indices]
                     token_indices_to_sample = token_indices_to_sample[:num_indices]
                 draft_token_ids = logits.argmax(dim=-1)
+                self._save_draft_logits_poc(
+                    logits,
+                    draft_step + 1,
+                    draft_token_ids.shape[0],
+                )
 
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]

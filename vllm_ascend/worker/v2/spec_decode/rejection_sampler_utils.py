@@ -19,11 +19,25 @@
 
 import torch
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-    _compute_block_stats_kernel,
-    _compute_global_lse,
-    _insert_resampled_kernel,
-)
+
+try:
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+        _compute_block_stats_kernel,
+        _compute_global_lse,
+        _insert_resampled_kernel,
+    )
+
+    _COMPUTE_BLOCK_STATS_HAS_DRAFT_LOGITS = True
+except ModuleNotFoundError:
+    from vllm.v1.worker.gpu.spec_decode.probabilistic_rejection_sampler_utils import (
+        _compute_block_max_and_sumexp_kernel as _compute_block_stats_kernel,
+    )
+    from vllm.v1.worker.gpu.spec_decode.probabilistic_rejection_sampler_utils import (
+        _compute_global_lse,
+        _insert_resampled_kernel,
+    )
+
+    _COMPUTE_BLOCK_STATS_HAS_DRAFT_LOGITS = False
 
 
 @triton.jit
@@ -75,7 +89,7 @@ def _npu_gumbel_block_argmax(
 
 
 @triton.jit
-def _resample_kernel(
+def _resample_dense_kernel(
     # [num_reqs, num_blocks]
     resampled_local_argmax_ptr,
     resampled_local_argmax_stride,
@@ -107,6 +121,9 @@ def _resample_kernel(
     seed_ptr,
     # [num_logits]
     pos_ptr,
+    # [num_reqs, vocab_size]
+    resample_gumbel_ptr,
+    resample_gumbel_stride,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
@@ -158,21 +175,15 @@ def _resample_kernel(
             float("-inf"),
         ).to(tl.float32)
 
-    value, idx = _npu_gumbel_block_argmax(
-        residual_logits,
-        block,
-        mask,
-        resample_token_idx,
-        expanded_idx_mapping_ptr,
-        temp_ptr,
-        seed_ptr,
-        pos_ptr,
-        None,
-        0,
-        None,
-        vocab_size,
-        APPLY_TEMPERATURE=False,
-    )
+    if temp != 0.0:
+        gumbel_noise = tl.load(
+            resample_gumbel_ptr + req_idx * resample_gumbel_stride + block,
+            mask=mask,
+            other=float("-inf"),
+        ).to(tl.float32)
+        residual_logits = residual_logits + gumbel_noise
+
+    value, idx = tl.max(residual_logits, axis=0, return_indices=True)
     token_id = block_idx * BLOCK_SIZE + idx
     tl.store(
         resampled_local_argmax_ptr + req_idx * resampled_local_argmax_stride + block_idx,
@@ -229,16 +240,26 @@ def _probabilistic_rejection_kernel(
     seed_ptr,
     # [num_logits]
     pos_ptr,
+    # [num_logits]
+    accept_uniform_ptr,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
-    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_tokens = end_idx - start_idx
-    seed = tl.load(seed_ptr + req_state_idx)  # noqa: F841
+    if not HAS_DRAFT_LOGITS:
+        for i in range(num_tokens - 1):
+            draft_sampled = tl.load(draft_sampled_ptr + start_idx + i + 1)
+            tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
+        tl.store(rejected_steps_ptr + req_idx, num_tokens - 1)
+        tl.store(target_rejected_logsumexp_ptr + req_idx, 0.0)
+        tl.store(draft_rejected_logsumexp_ptr + req_idx, 0.0)
+        return
+
+    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
 
     rejected_step = 0
@@ -280,8 +301,7 @@ def _probabilistic_rejection_kernel(
                     PADDED_VOCAB_NUM_BLOCKS,
                 )
                 target_log_prob = target_logit - target_lse
-                # NPU does not support tl_rand64; always accept the draft token.
-                u = tl.full([], 0.0, dtype=tl.float32)
+                u = tl.load(accept_uniform_ptr + logit_idx).to(tl.float32)
                 if HAS_DRAFT_LOGITS:
                     draft_logit = tl.load(
                         draft_logits_ptr
@@ -337,6 +357,8 @@ def rejection_sample(
     # [num_speculative_steps]
     synthetic_conditional_rates: torch.Tensor | None = None,
     use_fp64: bool = False,
+    accept_uniform: torch.Tensor | None = None,
+    resample_gumbel: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if use_fp64:
         raise NotImplementedError("FP64 rejection sampling is not supported on NPU.")
@@ -352,6 +374,18 @@ def rejection_sample(
     num_logits, vocab_size = target_logits.shape
     has_draft_logits = draft_logits is not None
 
+    if accept_uniform is None:
+        accept_uniform = torch.rand(num_logits, dtype=torch.float32, device=target_logits.device)
+        accept_uniform.clamp_(min=1e-20)
+    if resample_gumbel is None:
+        resample_gumbel = torch.empty(
+            (num_reqs, vocab_size),
+            dtype=torch.float32,
+            device=target_logits.device,
+        )
+        resample_gumbel.exponential_()
+        resample_gumbel.log_().neg_()
+
     if draft_logits is None:
         # When draft_logits is None, create a dummy tensor so that Triton
         # kernel signatures receive valid pointers/strides. The kernels
@@ -364,35 +398,45 @@ def rejection_sample(
     VOCAB_BLOCK_SIZE = 8192
     vocab_num_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK_SIZE)
     padded_vocab_num_blocks = triton.next_power_of_2(vocab_num_blocks)
-    target_local_argmax = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.int64)
-    target_local_max = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
-    target_local_sumexp = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
-    draft_local_max = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
-    draft_local_sumexp = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
-    _compute_block_stats_kernel[(num_logits, vocab_num_blocks)](
-        target_local_argmax,
-        target_local_argmax.stride(0),
-        target_local_max,
-        target_local_max.stride(0),
-        target_local_sumexp,
-        target_local_sumexp.stride(0),
-        draft_local_max,
-        draft_local_max.stride(0),
-        draft_local_sumexp,
-        draft_local_sumexp.stride(0),
-        target_logits,
-        target_logits.stride(0),
-        draft_logits,
-        draft_logits.stride(0),
-        draft_logits.stride(1),
-        expanded_idx_mapping,
-        expanded_local_pos,
-        temperature,
-        vocab_size,
-        num_speculative_steps,
-        BLOCK_SIZE=VOCAB_BLOCK_SIZE,
-        HAS_DRAFT_LOGITS=has_draft_logits,
-    )
+    if has_draft_logits:
+        target_local_argmax = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.int64)
+        target_local_max = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
+        target_local_sumexp = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
+        draft_local_max = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
+        draft_local_sumexp = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
+        compute_block_stats_kwargs = {"BLOCK_SIZE": VOCAB_BLOCK_SIZE}
+        if _COMPUTE_BLOCK_STATS_HAS_DRAFT_LOGITS:
+            compute_block_stats_kwargs["HAS_DRAFT_LOGITS"] = True
+
+        _compute_block_stats_kernel[(num_logits, vocab_num_blocks)](
+            target_local_argmax,
+            target_local_argmax.stride(0),
+            target_local_max,
+            target_local_max.stride(0),
+            target_local_sumexp,
+            target_local_sumexp.stride(0),
+            draft_local_max,
+            draft_local_max.stride(0),
+            draft_local_sumexp,
+            draft_local_sumexp.stride(0),
+            target_logits,
+            target_logits.stride(0),
+            draft_logits,
+            draft_logits.stride(0),
+            draft_logits.stride(1),
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperature,
+            vocab_size,
+            num_speculative_steps,
+            **compute_block_stats_kwargs,
+        )
+    else:
+        target_local_argmax = target_logits.new_empty(1, 1, dtype=torch.int64)
+        target_local_max = target_logits.new_empty(1, 1, dtype=torch.float32)
+        target_local_sumexp = target_logits.new_empty(1, 1, dtype=torch.float32)
+        draft_local_max = target_logits.new_empty(1, 1, dtype=torch.float32)
+        draft_local_sumexp = target_logits.new_empty(1, 1, dtype=torch.float32)
 
     # Sample up until the first rejected/bonus token, and store
     # the step.
@@ -427,6 +471,7 @@ def rejection_sample(
         temperature,
         seed,
         pos,
+        accept_uniform,
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
@@ -440,7 +485,7 @@ def rejection_sample(
     resampled_local_argmax = target_logits.new_empty(num_reqs, resample_num_blocks, dtype=torch.int64)
     # NPU does not support float64; use float32 for resampled_local_max.
     resampled_local_max = target_logits.new_empty(num_reqs, resample_num_blocks, dtype=torch.float32)
-    _resample_kernel[(num_reqs, resample_num_blocks)](
+    _resample_dense_kernel[(num_reqs, resample_num_blocks)](
         resampled_local_argmax,
         resampled_local_argmax.stride(0),
         resampled_local_max,
@@ -459,6 +504,8 @@ def rejection_sample(
         temperature,
         seed,
         pos,
+        resample_gumbel,
+        resample_gumbel.stride(0),
         vocab_size,
         BLOCK_SIZE=RESAMPLE_BLOCK_SIZE,
         HAS_DRAFT_LOGITS=has_draft_logits,

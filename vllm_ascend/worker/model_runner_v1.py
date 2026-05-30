@@ -26,6 +26,7 @@ from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
 from multiprocessing import Manager
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import numpy as np
@@ -46,6 +47,7 @@ from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
 from vllm.sequence import IntermediateTensors
+from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler
@@ -93,6 +95,7 @@ from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
     get_total_cp_world_size,
 )
+from vllm.v1.worker.gpu.spec_decode import rejection_sampler as upstream_gpu_rejection_sampler
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, GPUModelRunner
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -124,7 +127,7 @@ from vllm_ascend.eplb.utils import model_register
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
-from vllm_ascend.sample.sampler import AscendSampler
+from vllm_ascend.sample.sampler import AscendSampler, apply_top_k_top_p
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -243,6 +246,87 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
 
 
+class _PocSamplingStates:
+    def __init__(
+        self,
+        sampling_metadata: SamplingMetadata,
+        num_reqs: int,
+        device: torch.device,
+        seeds: torch.Tensor,
+    ) -> None:
+        temperature = sampling_metadata.temperature
+        if temperature is None:
+            temperature = torch.zeros(num_reqs, dtype=torch.float32, device=device)
+        self.temperature = SimpleNamespace(gpu=temperature)
+        self.seeds = SimpleNamespace(gpu=seeds)
+
+
+class _PocGpuSamplerAdapter:
+    """Tiny adapter for upstream worker/gpu rejection sampler POC.
+
+    Only temperature, top_k and top_p are intentionally wired.
+    """
+
+    def __init__(
+        self,
+        sampling_metadata: SamplingMetadata,
+        num_reqs: int,
+        device: torch.device,
+        seeds: torch.Tensor,
+    ) -> None:
+        self.sampling_metadata = sampling_metadata
+        self.sampling_states = _PocSamplingStates(
+            sampling_metadata,
+            num_reqs,
+            device,
+            seeds,
+        )
+
+    def apply_sampling_params(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        temperature = self.sampling_states.temperature.gpu[expanded_idx_mapping]
+        temperature = torch.where(
+            temperature == 0,
+            torch.ones_like(temperature),
+            temperature,
+        )
+        logits.div_(temperature.unsqueeze(-1))
+
+        top_k = self.sampling_metadata.top_k
+        top_p = self.sampling_metadata.top_p
+        if top_k is not None:
+            top_k = top_k[expanded_idx_mapping]
+        if top_p is not None:
+            top_p = top_p[expanded_idx_mapping]
+        if top_k is not None or top_p is not None:
+            logits = apply_top_k_top_p(logits, top_k, top_p)
+        return logits
+
+
+@triton.jit
+def _fill_upstream_rejection_mapping_poc_kernel(
+    cu_num_logits_ptr,
+    expanded_idx_mapping_ptr,
+    expanded_local_pos_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    start_idx = tl.load(cu_num_logits_ptr + req_idx)
+    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+    local_pos = tl.arange(0, BLOCK_SIZE)
+    offset = start_idx + local_pos
+    mask = offset < end_idx
+    tl.store(expanded_idx_mapping_ptr + offset, req_idx, mask=mask)
+    tl.store(expanded_local_pos_ptr + offset, local_pos, mask=mask)
+
+
+def _next_power_of_2(value: int) -> int:
+    return 1 << (value - 1).bit_length()
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
@@ -295,6 +379,24 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.use_upstream_rejection_sampler_poc = (
+            self.ascend_config.enable_v1_upstream_rejection_sampler_poc
+        )
+        self.upstream_rejection_sampler_poc_seeds: torch.Tensor | None = None
+        self.upstream_rejection_sampler_poc_accept_uniform: torch.Tensor | None = None
+        self.upstream_rejection_sampler_poc_resample_gumbel: torch.Tensor | None = None
+        self.upstream_rejection_sampler_poc_cu_num_logits: torch.Tensor | None = None
+        self.upstream_rejection_sampler_poc_idx_mapping: torch.Tensor | None = None
+        self.upstream_rejection_sampler_poc_expanded_idx_mapping: torch.Tensor | None = None
+        self.upstream_rejection_sampler_poc_expanded_local_pos: torch.Tensor | None = None
+        self.draft_logits_poc: torch.Tensor | None = None
+        if self.use_upstream_rejection_sampler_poc:
+            self.upstream_rejection_sampler_poc_seeds = torch.arange(
+                1,
+                self.max_num_reqs + 1,
+                dtype=torch.int64,
+                device=device,
+            )
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
@@ -2313,11 +2415,16 @@ class NPUModelRunner(GPUModelRunner):
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        enable_reduce_sample = getattr(
+            getattr(self, "ascend_config", None),
+            "enable_reduce_sample",
+            False,
+        )
         self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
-            if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
+            if self.input_batch.sampling_metadata.top_k is not None and enable_reduce_sample:
                 max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
                 self.sampler.prepare_sampling(max_topk)
             return self.sampler(
@@ -2327,7 +2434,53 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
-        if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
+        if getattr(self, "use_upstream_rejection_sampler_poc", False):
+            assert self.speculative_config.rejection_sample_method == "probabilistic"
+            assert not enable_reduce_sample
+            assert self.upstream_rejection_sampler_poc_seeds is not None
+            poc_input_batch = self._make_upstream_rejection_input_batch_poc(
+                spec_decode_metadata,
+                logits.device,
+            )
+            assert self.draft_logits_poc is not None
+            poc_sampler = _PocGpuSamplerAdapter(
+                sampling_metadata,
+                self.input_batch.num_reqs,
+                logits.device,
+                self.upstream_rejection_sampler_poc_seeds,
+            )
+            draft_sampled = poc_input_batch.input_ids[poc_input_batch.logits_indices]
+            pos = poc_input_batch.positions[poc_input_batch.logits_indices]
+            processed_logits = poc_sampler.apply_sampling_params(
+                logits,
+                poc_input_batch.expanded_idx_mapping,
+            )
+            accept_uniform, resample_gumbel = self._make_upstream_rejection_randoms_poc(
+                processed_logits.shape[0],
+                self.input_batch.num_reqs,
+                processed_logits.shape[1],
+                logits.device,
+            )
+            sampled, _ = upstream_gpu_rejection_sampler.probabilistic_rejection_sample(
+                processed_logits,
+                self.draft_logits_poc,
+                draft_sampled,
+                poc_input_batch.cu_num_logits,
+                pos,
+                poc_input_batch.idx_mapping,
+                poc_input_batch.expanded_idx_mapping,
+                poc_input_batch.expanded_local_pos,
+                poc_sampler.sampling_states.temperature.gpu,
+                poc_sampler.sampling_states.seeds.gpu,
+                self.speculative_config.num_speculative_tokens,
+                accept_uniform=accept_uniform,
+                resample_gumbel=resample_gumbel,
+            )
+            return SamplerOutput(
+                sampled_token_ids=sampled,
+                logprobs_tensors=None,
+            )
+        if self.input_batch.sampling_metadata.top_k is not None and enable_reduce_sample:
             max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
             self.rejection_sampler.prepare_sampling(max_topk)
         sampler_output = self.rejection_sampler(
@@ -2337,6 +2490,125 @@ class NPUModelRunner(GPUModelRunner):
             sampling_metadata,
         )
         return sampler_output
+
+    def _make_upstream_rejection_input_batch_poc(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        device: torch.device,
+    ) -> SimpleNamespace:
+        num_reqs = len(spec_decode_metadata.num_draft_tokens)
+        total_num_logits = spec_decode_metadata.logits_indices.shape[0]
+
+        cu_num_logits = self._get_upstream_rejection_poc_buffer(
+            "upstream_rejection_sampler_poc_cu_num_logits",
+            (num_reqs + 1,),
+            torch.int32,
+            device,
+        )
+        cu_num_logits[0] = 0
+        cu_num_logits[1 : num_reqs + 1].copy_(spec_decode_metadata.cu_num_sampled_tokens)
+        idx_mapping = self._get_upstream_rejection_idx_mapping_poc(num_reqs, device)
+        expanded_idx_mapping = self._get_upstream_rejection_poc_buffer(
+            "upstream_rejection_sampler_poc_expanded_idx_mapping",
+            (total_num_logits,),
+            torch.int32,
+            device,
+        )
+        expanded_local_pos = self._get_upstream_rejection_poc_buffer(
+            "upstream_rejection_sampler_poc_expanded_local_pos",
+            (total_num_logits,),
+            torch.int32,
+            device,
+        )
+        mapping_block_size = _next_power_of_2(
+            self.speculative_config.num_speculative_tokens + 1
+        )
+        _fill_upstream_rejection_mapping_poc_kernel[(num_reqs,)](
+            cu_num_logits,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            BLOCK_SIZE=mapping_block_size,
+            num_warps=1,
+        )
+
+        return SimpleNamespace(
+            idx_mapping=idx_mapping,
+            expanded_idx_mapping=expanded_idx_mapping,
+            expanded_local_pos=expanded_local_pos,
+            input_ids=self.input_ids.gpu,
+            positions=self.positions,
+            logits_indices=spec_decode_metadata.logits_indices,
+            cu_num_logits=cu_num_logits[: num_reqs + 1],
+        )
+
+    def _get_upstream_rejection_poc_buffer(
+        self,
+        attr_name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        buffer = getattr(self, attr_name, None)
+        needs_alloc = buffer is None or buffer.dtype != dtype or buffer.device != device
+        if not needs_alloc:
+            needs_alloc = any(buffer.shape[i] < shape[i] for i in range(len(shape)))
+        if needs_alloc:
+            buffer = torch.empty(shape, dtype=dtype, device=device)
+            setattr(self, attr_name, buffer)
+        slices = tuple(slice(0, dim) for dim in shape)
+        return buffer[slices]
+
+    def _get_upstream_rejection_idx_mapping_poc(
+        self,
+        num_reqs: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        idx_mapping = getattr(self, "upstream_rejection_sampler_poc_idx_mapping", None)
+        if (
+            idx_mapping is None
+            or idx_mapping.shape[0] < num_reqs
+            or idx_mapping.device != device
+        ):
+            idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
+            self.upstream_rejection_sampler_poc_idx_mapping = idx_mapping
+        return idx_mapping[:num_reqs]
+
+    def _make_upstream_rejection_randoms_poc(
+        self,
+        num_logits: int,
+        num_reqs: int,
+        vocab_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        accept_uniform = getattr(
+            self, "upstream_rejection_sampler_poc_accept_uniform", None
+        )
+        if accept_uniform is None or accept_uniform.shape[0] < num_logits or accept_uniform.device != device:
+            accept_uniform_cpu = torch.rand(num_logits, dtype=torch.float32)
+            accept_uniform_cpu.clamp_(min=1e-20)
+            if getattr(self, "pin_memory", False):
+                accept_uniform_cpu = accept_uniform_cpu.pin_memory()
+            accept_uniform = accept_uniform_cpu.to(device=device, non_blocking=True)
+            self.upstream_rejection_sampler_poc_accept_uniform = accept_uniform
+
+        resample_gumbel = getattr(
+            self, "upstream_rejection_sampler_poc_resample_gumbel", None
+        )
+        if (
+            resample_gumbel is None
+            or resample_gumbel.shape[0] < num_reqs
+            or resample_gumbel.shape[1] < vocab_size
+            or resample_gumbel.device != device
+        ):
+            resample_gumbel_cpu = torch.empty((num_reqs, vocab_size), dtype=torch.float32)
+            resample_gumbel_cpu.exponential_()
+            resample_gumbel_cpu.log_().neg_()
+            if getattr(self, "pin_memory", False):
+                resample_gumbel_cpu = resample_gumbel_cpu.pin_memory()
+            resample_gumbel = resample_gumbel_cpu.to(device=device, non_blocking=True)
+            self.upstream_rejection_sampler_poc_resample_gumbel = resample_gumbel
+
+        return accept_uniform[:num_logits], resample_gumbel[:num_reqs, :vocab_size]
 
     # TODO: remove this func after eagle_proposer is refactored and
     #  _bookkeeping_sync is moved after propose_draft_token_ids

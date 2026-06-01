@@ -152,6 +152,18 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.worker.v1.sample.adapter import (
+    V1SamplingRandomManager,
+    V1SamplingRandoms,
+    V1V2SamplingInputBuilder,
+    process_regular_logits,
+    process_spec_decode_logits,
+    sample_from_processed_logits,
+    temperature_for_sampling,
+)
+from vllm_ascend.worker.v1.sample.rejection_sampler_without_draft_probs import (
+    rejection_sample_without_draft_probs,
+)
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -291,6 +303,9 @@ class NPUModelRunner(GPUModelRunner):
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
         self.sampler = AscendSampler()
+        self._v1_v2_sampling_builder = V1V2SamplingInputBuilder()
+        self._v1_v2_sampling_random_manager = V1SamplingRandomManager(device)
+        self._v1_v2_sampling_randoms: V1SamplingRandoms | None = None
         self.attn_state: AscendAttentionState | None = None
 
         # Ascend-specific configurations
@@ -1966,7 +1981,14 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False  # type: ignore[has-type]
-        if self.ascend_config.enable_async_exponential:
+        self._v1_v2_sampling_randoms = None
+        if self._can_use_v1_v2_sampling_path(
+            self.input_batch.sampling_metadata, spec_decode_metadata
+        ):
+            self._v1_v2_sampling_randoms = self._prepare_v1_v2_sampling_randoms(
+                spec_decode_metadata, logits_indices
+            )
+        elif self.ascend_config.enable_async_exponential:
             self.sampler.do_async_exponential(
                 b_s=logits_indices.shape[0],
                 head_dim=self.model_config.get_vocab_size(),
@@ -2307,11 +2329,126 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
+    def _can_use_v1_v2_sampling_path(
+        self,
+        sampling_metadata: SamplingMetadata,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        if self.device.type != "npu":
+            return False
+        if sampling_metadata.max_num_logprobs is not None:
+            return False
+        if getattr(sampling_metadata, "logprob_token_ids", None):
+            return False
+        if lmhead_tp_enable():
+            return False
+        if self.ascend_config.enable_reduce_sample:
+            return False
+        if spec_decode_metadata is None:
+            return True
+        return (
+            self.speculative_config is not None
+            and self.speculative_config.rejection_sample_method == "probabilistic"
+        )
+
+    def _prepare_v1_v2_sampling_randoms(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        logits_indices: torch.Tensor,
+    ) -> V1SamplingRandoms:
+        sampling_metadata = self.input_batch.sampling_metadata
+        vocab_size = self.model_config.get_vocab_size()
+        if spec_decode_metadata is None:
+            return self._v1_v2_sampling_random_manager.prepare_regular(
+                int(logits_indices.shape[0]),
+                vocab_size,
+                sampling_metadata,
+            )
+        return self._v1_v2_sampling_random_manager.prepare_spec_decode(
+            int(spec_decode_metadata.logits_indices.shape[0]),
+            self.input_batch.num_reqs,
+            vocab_size,
+            spec_decode_metadata.num_draft_tokens,
+            sampling_metadata,
+        )
+
+    def _sample_with_v1_v2_sampling_path(
+        self,
+        logits: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        sampling_metadata: SamplingMetadata,
+        randoms: V1SamplingRandoms,
+    ) -> SamplerOutput:
+        self._v1_v2_sampling_random_manager.wait(randoms)
+        if spec_decode_metadata is None:
+            processed_logits, greedy_sampled = process_regular_logits(
+                self.sampler, logits, sampling_metadata
+            )
+            sampled = sample_from_processed_logits(
+                processed_logits,
+                sampling_metadata,
+                randoms.sample_gumbel,
+                greedy_sampled,
+            )
+            return SamplerOutput(
+                sampled_token_ids=sampled.to(torch.int32).view(-1, 1),
+                logprobs_tensors=None,
+            )
+
+        assert randoms.accept_uniform is not None
+        assert randoms.resample_gumbel is not None
+        num_reqs = self.input_batch.num_reqs
+        num_speculative_steps = self.speculative_config.num_speculative_tokens
+        temperature = temperature_for_sampling(
+            sampling_metadata, num_reqs, logits.device
+        )
+        spec_inputs = self._v1_v2_sampling_builder.build_spec_decode_inputs(
+            spec_decode_metadata,
+            self.input_ids.gpu,
+            self.positions,
+            temperature,
+            num_speculative_steps,
+        )
+        processed_logits = process_spec_decode_logits(
+            self.sampler,
+            self.rejection_sampler,
+            logits,
+            sampling_metadata,
+            spec_decode_metadata,
+        )
+        sampled, _ = rejection_sample_without_draft_probs(
+            processed_logits,
+            spec_inputs.draft_sampled,
+            spec_inputs.cu_num_logits,
+            spec_inputs.positions,
+            spec_inputs.idx_mapping,
+            spec_inputs.expanded_idx_mapping,
+            spec_inputs.expanded_local_pos,
+            spec_inputs.temperature,
+            randoms.accept_uniform,
+            randoms.resample_gumbel,
+            num_speculative_steps,
+        )
+        return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         self.input_batch.update_async_output_token_ids()
+        randoms = getattr(self, "_v1_v2_sampling_randoms", None)
+        self._v1_v2_sampling_randoms = None
+        if (
+            logits is not None
+            and randoms is not None
+            and self._can_use_v1_v2_sampling_path(
+                sampling_metadata, spec_decode_metadata
+            )
+        ):
+            return self._sample_with_v1_v2_sampling_path(
+                logits, spec_decode_metadata, sampling_metadata, randoms
+            )
+
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]

@@ -151,16 +151,14 @@ def _probabilistic_rejection_kernel(
                 )
                 max_block_idx = tl.argmax(local_max, axis=0)
                 target_argmax = tl.load(
-                    target_local_argmax_ptr
-                    + logit_idx * target_local_argmax_stride
-                    + max_block_idx
+                    target_local_argmax_ptr + logit_idx * target_local_argmax_stride + max_block_idx
                 )
                 accepted &= target_argmax == draft_sampled
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, target_argmax)
             else:
-                target_logit = tl.load(
-                    target_logits_ptr + logit_idx * target_logits_stride + draft_sampled
-                ).to(tl.float32)
+                target_logit = tl.load(target_logits_ptr + logit_idx * target_logits_stride + draft_sampled).to(
+                    tl.float32
+                )
                 target_lse = _compute_global_lse(
                     target_local_max_ptr,
                     target_local_max_stride,
@@ -270,11 +268,7 @@ def _insert_resampled_kernel(
         other=float("-inf"),
     )
     max_block_idx = tl.argmax(local_max, axis=0)
-    resampled = tl.load(
-        resampled_local_argmax_ptr
-        + req_idx * resampled_local_argmax_stride
-        + max_block_idx
-    )
+    resampled = tl.load(resampled_local_argmax_ptr + req_idx * resampled_local_argmax_stride + max_block_idx)
     tl.store(sampled_ptr + req_idx * sampled_stride + num_sampled, resampled)
 
 
@@ -298,12 +292,8 @@ def rejection_sample_without_draft_probs(
     vocab_block_size = 8192
     vocab_num_blocks = triton.cdiv(vocab_size, vocab_block_size)
     padded_vocab_num_blocks = triton.next_power_of_2(vocab_num_blocks)
-    target_local_argmax = torch.empty(
-        (num_logits, vocab_num_blocks), dtype=torch.int64, device=target_logits.device
-    )
-    target_local_max = torch.empty(
-        (num_logits, vocab_num_blocks), dtype=torch.float32, device=target_logits.device
-    )
+    target_local_argmax = torch.empty((num_logits, vocab_num_blocks), dtype=torch.int64, device=target_logits.device)
+    target_local_max = torch.empty((num_logits, vocab_num_blocks), dtype=torch.float32, device=target_logits.device)
     target_local_sumexp = torch.empty_like(target_local_max)
     _target_block_stats_kernel[(num_logits, vocab_num_blocks)](
         target_local_argmax,
@@ -358,9 +348,7 @@ def rejection_sample_without_draft_probs(
     resampled_local_argmax = torch.empty(
         (num_reqs, resample_num_blocks), dtype=torch.int64, device=target_logits.device
     )
-    resampled_local_max = torch.empty(
-        (num_reqs, resample_num_blocks), dtype=torch.float32, device=target_logits.device
-    )
+    resampled_local_max = torch.empty((num_reqs, resample_num_blocks), dtype=torch.float32, device=target_logits.device)
     _resample_kernel[(num_reqs, resample_num_blocks)](
         resampled_local_argmax,
         resampled_local_argmax.stride(0),

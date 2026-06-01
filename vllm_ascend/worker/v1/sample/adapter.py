@@ -85,19 +85,13 @@ class V1V2SamplingInputBuilder:
         num_logits = int(metadata.logits_indices.shape[0])
         device = input_ids.device
 
-        cu_num_logits = self._buffer(
-            "cu_num_logits", (num_reqs + 1,), torch.int32, device
-        )
+        cu_num_logits = self._buffer("cu_num_logits", (num_reqs + 1,), torch.int32, device)
         cu_num_logits[0] = 0
         cu_num_logits[1:].copy_(metadata.cu_num_sampled_tokens)
 
         idx_mapping = self._idx_mapping(num_reqs, device)
-        expanded_idx_mapping = self._buffer(
-            "expanded_idx_mapping", (num_logits,), torch.int32, device
-        )
-        expanded_local_pos = self._buffer(
-            "expanded_local_pos", (num_logits,), torch.int32, device
-        )
+        expanded_idx_mapping = self._buffer("expanded_idx_mapping", (num_logits,), torch.int32, device)
+        expanded_local_pos = self._buffer("expanded_local_pos", (num_logits,), torch.int32, device)
         block_size = _next_power_of_2(num_speculative_steps + 1)
         _fill_spec_decode_mapping_kernel[(num_reqs,)](
             cu_num_logits,
@@ -160,12 +154,8 @@ class V1SamplingRandomManager:
     ) -> V1SamplingRandoms:
         if sampling_metadata.all_greedy:
             return V1SamplingRandoms()
-        sample_gumbel = self._buffer(
-            "sample_gumbel", (num_reqs, vocab_size), torch.float32
-        )
-        self._record_randoms(
-            lambda: self._fill_gumbel(sample_gumbel, sampling_metadata.generators)
-        )
+        sample_gumbel = self._buffer("sample_gumbel", (num_reqs, vocab_size), torch.float32)
+        self._record_randoms(lambda: self._fill_gumbel(sample_gumbel, sampling_metadata.generators))
         return V1SamplingRandoms(sample_gumbel=sample_gumbel, ready_event=self._event)
 
     def prepare_spec_decode(
@@ -182,12 +172,8 @@ class V1SamplingRandomManager:
                 resample_gumbel=self._buffer("resample_gumbel", (1, 1), torch.float32),
             )
 
-        accept_uniform = self._buffer(
-            "accept_uniform", (num_logits,), torch.float32
-        )
-        resample_gumbel = self._buffer(
-            "resample_gumbel", (num_reqs, vocab_size), torch.float32
-        )
+        accept_uniform = self._buffer("accept_uniform", (num_logits,), torch.float32)
+        resample_gumbel = self._buffer("resample_gumbel", (num_reqs, vocab_size), torch.float32)
 
         def fill() -> None:
             accept_uniform.uniform_()
@@ -196,9 +182,7 @@ class V1SamplingRandomManager:
                 num_rows = num_draft + 1
                 generator = sampling_metadata.generators.get(req_idx)
                 if generator is not None:
-                    accept_uniform[offset : offset + num_draft].uniform_(
-                        generator=generator
-                    )
+                    accept_uniform[offset : offset + num_draft].uniform_(generator=generator)
                 offset += num_rows
             accept_uniform.clamp_(min=1e-20)
             self._fill_gumbel(resample_gumbel, sampling_metadata.generators)
@@ -257,9 +241,7 @@ def temperature_for_sampling(
 ) -> torch.Tensor:
     if sampling_metadata.temperature is None:
         return torch.zeros(num_reqs, dtype=torch.float32, device=device)
-    return sampling_metadata.temperature[:num_reqs].to(
-        device=device, dtype=torch.float32
-    )
+    return sampling_metadata.temperature[:num_reqs].to(device=device, dtype=torch.float32)
 
 
 def process_regular_logits(
@@ -268,9 +250,7 @@ def process_regular_logits(
     sampling_metadata: SamplingMetadata,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     logits = logits.to(torch.float32)
-    logits = sampler.apply_logits_processors(
-        logits, sampling_metadata, predict_bonus_token=False
-    )
+    logits = sampler.apply_logits_processors(logits, sampling_metadata, predict_bonus_token=False)
     greedy_sampled = None
     if not sampling_metadata.all_random:
         greedy_sampled = sampler.greedy_sample(logits)
@@ -291,22 +271,14 @@ def process_spec_decode_logits(
     target_indices = metadata.target_logits_indices
     if int(target_indices.numel()) > 0:
         target_logits = logits[target_indices].to(torch.float32)
-        target_logits = rejection_sampler.apply_logits_processors(
-            target_logits, sampling_metadata, metadata
-        )
-        target_logits = _apply_expanded_constraints(
-            target_logits, metadata.cu_num_draft_tokens, sampling_metadata
-        )
+        target_logits = rejection_sampler.apply_logits_processors(target_logits, sampling_metadata, metadata)
+        target_logits = _apply_expanded_constraints(target_logits, metadata.cu_num_draft_tokens, sampling_metadata)
         processed[target_indices] = target_logits
 
     bonus_indices = metadata.bonus_logits_indices
     bonus_logits = logits[bonus_indices].to(torch.float32)
-    bonus_logits = sampler.apply_logits_processors(
-        bonus_logits, sampling_metadata, predict_bonus_token=True
-    )
-    processed[bonus_indices] = _apply_single_step_constraints(
-        bonus_logits, sampling_metadata
-    )
+    bonus_logits = sampler.apply_logits_processors(bonus_logits, sampling_metadata, predict_bonus_token=True)
+    processed[bonus_indices] = _apply_single_step_constraints(bonus_logits, sampling_metadata)
     return processed
 
 
@@ -322,9 +294,7 @@ def sample_from_processed_logits(
         return greedy_sampled
     if sample_gumbel is None:
         raise RuntimeError("sample_gumbel is required for random sampling")
-    sample_gumbel = sample_gumbel[
-        : processed_logits.shape[0], : processed_logits.shape[1]
-    ]
+    sample_gumbel = sample_gumbel[: processed_logits.shape[0], : processed_logits.shape[1]]
     random_sampled = (processed_logits + sample_gumbel).argmax(dim=-1).view(-1)
     if sampling_metadata.all_random:
         return random_sampled
@@ -346,9 +316,7 @@ def _apply_single_step_constraints(
     assert sampling_metadata.temperature is not None
     temperature = sampling_metadata.temperature
     if not sampling_metadata.all_random:
-        temperature = torch.where(
-            temperature < _SAMPLING_EPS, torch.ones_like(temperature), temperature
-        )
+        temperature = torch.where(temperature < _SAMPLING_EPS, torch.ones_like(temperature), temperature)
     logits.div_(temperature.unsqueeze(-1))
     for processor in sampling_metadata.logitsprocs.argmax_invariant:
         logits = processor.apply(logits)
@@ -377,14 +345,10 @@ def _apply_expanded_constraints(
 
     top_k = None
     if sampling_metadata.top_k is not None:
-        top_k = expand_batch_to_tokens(
-            sampling_metadata.top_k, cu_num_tokens, num_tokens
-        )
+        top_k = expand_batch_to_tokens(sampling_metadata.top_k, cu_num_tokens, num_tokens)
     top_p = None
     if sampling_metadata.top_p is not None:
-        top_p = expand_batch_to_tokens(
-            sampling_metadata.top_p, cu_num_tokens, num_tokens
-        )
+        top_p = expand_batch_to_tokens(sampling_metadata.top_p, cu_num_tokens, num_tokens)
     return _apply_top_k_top_p(logits, top_k, top_p)
 
 

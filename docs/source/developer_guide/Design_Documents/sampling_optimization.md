@@ -109,7 +109,78 @@ Conclusions:
   random number generation, fewer Python-side intermediate constructions, and a
   more compact sampling path.
 
-### 4.3 Experiments That Should Not Be Productized
+### 4.3 Current Implementation Puncture Result
+
+After implementing the ModelRunnerV1 bridge, the puncture benchmark compared
+three paths for both regular sampling and no-draft-probabilities speculative
+rejection sampling:
+
+1. `v1_original`: the current ModelRunnerV1 Ascend sampler or rejection
+   sampler path;
+2. `v2_native`: the V1 bridge using the current V2 NPU native sampling helper;
+3. `our_optimized`: the V1 bridge using prefetched random tensors and the
+   optimized no-draft-probabilities operator.
+
+The benchmark was run on a real NPU with NPU event timing, 5 warmup iterations,
+and 20 measured iterations. Timing covers the sampling critical path only. The
+`our_optimized` rows assume random tensors have already been prefetched, which
+matches the intended ModelRunnerV1 overlap design.
+
+Test command:
+
+```bash
+python benchmarks/ops/bench_v1_sampling_paths.py \
+  --batch-size 128 --vocab-size <vocab_size> --spec-steps 3 \
+  --warmups 5 --iterations 20
+```
+
+Regular sampling:
+
+| Vocab size | Path | Mean ms | Median ms | P90 ms | Speedup vs v1 |
+|---:|---|---:|---:|---:|---:|
+| 32000 | v1 original | 0.946 | 0.943 | 0.967 | 1.00x |
+| 32000 | v2 native | 33.316 | 33.260 | 33.535 | 0.03x |
+| 32000 | our optimized | 0.249 | 0.248 | 0.265 | 3.80x |
+| 151936 | v1 original | 3.120 | 3.106 | 3.129 | 1.00x |
+| 151936 | v2 native | 152.799 | 152.789 | 152.848 | 0.02x |
+| 151936 | our optimized | 0.755 | 0.754 | 0.762 | 4.13x |
+
+Speculative rejection sampling without draft probabilities:
+
+| Vocab size | Path | Mean ms | Median ms | P90 ms | Speedup vs v1 |
+|---:|---|---:|---:|---:|---:|
+| 32000 | v1 original | 2.773 | 2.771 | 2.788 | 1.00x |
+| 32000 | v2 native | 33.809 | 33.798 | 33.849 | 0.08x |
+| 32000 | our optimized | 1.998 | 2.001 | 2.061 | 1.39x |
+| 151936 | v1 original | 11.462 | 11.460 | 11.484 | 1.00x |
+| 151936 | v2 native | 153.445 | 153.437 | 153.553 | 0.07x |
+| 151936 | our optimized | 6.491 | 6.535 | 6.739 | 1.77x |
+
+Standalone random prefetch cost, not included in the critical-path speedup
+above:
+
+| Vocab size | Prefetch tensor | Mean ms | Median ms | P90 ms |
+|---:|---|---:|---:|---:|
+| 32000 | regular sampling Gumbel | 0.657 | 0.653 | 0.665 |
+| 32000 | rejection uniform + resample Gumbel | 0.761 | 0.758 | 0.773 |
+| 151936 | regular sampling Gumbel | 2.610 | 2.638 | 2.659 |
+| 151936 | rejection uniform + resample Gumbel | 2.716 | 2.719 | 2.769 |
+
+Conclusions:
+
+- The optimized regular sampling path shows strong speedup because the
+  critical path only needs processed logits plus prefetched Gumbel tensors.
+- The optimized rejection path also improves over the V1 original path, and the
+  gain increases at the larger vocab size.
+- Directly routing through the current V2 NPU native helper is not a viable V1
+  bridge for this case. Its in-kernel random path is dominated by dense-vocab
+  random generation and is much slower than both the V1 original path and the
+  prefetched-random optimized path.
+- If random prefetch cannot overlap with model execution, the standalone random
+  generation cost should be accounted for separately. The design depends on
+  moving this work before sampling and overlapping it with model forward.
+
+### 4.4 Experiments That Should Not Be Productized
 
 #### Candidate resampling
 

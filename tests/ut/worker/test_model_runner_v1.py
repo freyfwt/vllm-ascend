@@ -150,6 +150,49 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         self.assertEqual(actual_output_token_ids[1], [4, 5, 7])
 
 
+class TestNPUModelRunnerOriginalLogits(unittest.TestCase):
+    def _build_runner(self, compute_nans=False):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.sampling_bridge = SimpleNamespace(sampler=SimpleNamespace(compute_nans=compute_nans))
+        return runner
+
+    def test_preserves_original_logits_for_generation_logprobs(self):
+        runner = self._build_runner()
+        sampling_metadata = SimpleNamespace(
+            max_num_logprobs=1,
+            logprob_token_ids=None,
+        )
+
+        self.assertTrue(runner._should_preserve_original_logits(sampling_metadata, None))
+
+    def test_preserves_original_logits_for_requested_logprob_token_ids(self):
+        runner = self._build_runner()
+        sampling_metadata = SimpleNamespace(
+            max_num_logprobs=None,
+            logprob_token_ids={"req0": [1]},
+        )
+
+        self.assertTrue(runner._should_preserve_original_logits(sampling_metadata, None))
+
+    def test_preserves_original_logits_for_nan_diagnostics(self):
+        runner = self._build_runner(compute_nans=True)
+        sampling_metadata = SimpleNamespace(
+            max_num_logprobs=None,
+            logprob_token_ids=None,
+        )
+
+        self.assertTrue(runner._should_preserve_original_logits(sampling_metadata, None))
+
+    def test_does_not_preserve_original_logits_for_plain_sampling(self):
+        runner = self._build_runner()
+        sampling_metadata = SimpleNamespace(
+            max_num_logprobs=None,
+            logprob_token_ids=None,
+        )
+
+        self.assertFalse(runner._should_preserve_original_logits(sampling_metadata, None))
+
+
 class TestNPUModelRunnerDebugger(unittest.TestCase):
     def _build_runner(self, debugger=None):
         runner = NPUModelRunner.__new__(NPUModelRunner)

@@ -40,6 +40,20 @@ class TestSamplingBridge(unittest.TestCase):
 
         self.assertEqual(sampled.tolist(), [1, 1])
 
+    def test_sample_processed_logits_skips_mixed_logic_for_all_random(self):
+        processed_logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
+        sampling_gumbel = torch.tensor([[2.0, 0.0], [0.0, 4.0]])
+
+        sampled = sample_processed_logits(
+            processed_logits,
+            torch.empty(0, dtype=torch.float32),
+            torch.tensor([0, 1], dtype=torch.int32),
+            sampling_gumbel,
+            all_random=True,
+        )
+
+        self.assertEqual(sampled.tolist(), [0, 1])
+
     def test_sample_regular_uses_gpu_sampler_processing(self):
         bridge = SamplingBridge.__new__(SamplingBridge)
         bridge.sampler = _FakeSampler(torch.tensor([1.0, 1.0]))
@@ -60,6 +74,28 @@ class TestSamplingBridge(unittest.TestCase):
 
         self.assertEqual(output.sampled_token_ids.tolist(), [[0], [1]])
         self.assertEqual(len(bridge.sampler.apply_calls), 1)
+
+    def test_sample_regular_processes_logits_in_place_when_raw_is_not_needed(self):
+        bridge = SamplingBridge.__new__(SamplingBridge)
+        bridge.sampler = _FakeInplaceSampler(torch.tensor([1.0, 1.0]))
+        input_batch = SimpleNamespace(
+            positions=torch.arange(2, dtype=torch.int64),
+            input_ids=torch.tensor([3, 4], dtype=torch.int32),
+            logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+            expanded_idx_mapping=torch.tensor([0, 1], dtype=torch.int32),
+            idx_mapping_np=np.array([0, 1], dtype=np.int32),
+            expanded_local_pos=torch.zeros(2, dtype=torch.int32),
+        )
+        logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
+
+        bridge.sample_regular(
+            logits,
+            input_batch,
+            torch.zeros_like(logits),
+            preserve_original_logits=False,
+        )
+
+        self.assertEqual(logits.tolist(), [[1.0, 2.0], [4.0, 1.0]])
 
     def test_prepare_syncs_request_states_from_mrv1_cpu_mirror(self):
         with (
@@ -150,12 +186,56 @@ class TestSamplingBridge(unittest.TestCase):
 
 class _FakeSampler:
     def __init__(self, temperature):
-        self.sampling_states = SimpleNamespace(temperature=SimpleNamespace(gpu=temperature))
+        self.sampling_states = SimpleNamespace(temperature=_FakeTemperature(temperature))
         self.apply_calls = []
 
     def apply_sampling_params(self, *args):
         self.apply_calls.append(args)
         return args[0].to(torch.float32)
+
+
+class _FakeInplaceSampler:
+    def __init__(self, temperature):
+        self.num_speculative_tokens = 1
+        self.logit_bias_state = _FakeAddOneLogitBiasState()
+        self.penalties_state = _FakeNoopState()
+        self.bad_words_state = _FakeNoopState()
+        self.sampling_states = _FakeSamplingStates(temperature)
+
+
+class _FakeAddOneLogitBiasState:
+    @staticmethod
+    def apply_logit_bias(logits, *args):
+        del args
+        logits.add_(1.0)
+
+
+class _FakeNoopState:
+    @staticmethod
+    def apply_penalties(*args):
+        del args
+
+    @staticmethod
+    def apply_bad_words(*args):
+        del args
+
+
+class _FakeSamplingStates:
+    def __init__(self, temperature):
+        self.temperature = _FakeTemperature(temperature)
+
+    @staticmethod
+    def apply_temperature(*args):
+        del args
+
+    @staticmethod
+    def apply_min_p(*args):
+        del args
+
+    @staticmethod
+    def apply_top_k_top_p(logits, *args):
+        del args
+        return logits
 
 
 class _FakeRequestState:
@@ -182,13 +262,19 @@ class _FakeGpuSampler:
     def __init__(self, **kwargs):
         del kwargs
         self.added = []
-        self.sampling_states = SimpleNamespace(temperature=SimpleNamespace(gpu=torch.ones(4)))
+        self.sampling_states = SimpleNamespace(temperature=_FakeTemperature(torch.ones(4)))
 
     def add_request(self, req_idx, prompt_len, sampling_params):
         self.added.append((req_idx, prompt_len, sampling_params.name))
 
     def apply_staged_writes(self):
         pass
+
+
+class _FakeTemperature:
+    def __init__(self, temperature):
+        self.gpu = temperature
+        self.np = temperature.detach().cpu().numpy()
 
 
 if __name__ == "__main__":

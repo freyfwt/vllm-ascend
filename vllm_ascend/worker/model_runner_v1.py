@@ -1985,8 +1985,14 @@ class NPUModelRunner(GPUModelRunner):
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False  # type: ignore[has-type]
         self._sampling_noise = None
+        preserve_original_logits = self._should_preserve_original_logits(
+            self.input_batch.sampling_metadata,
+            spec_decode_metadata,
+        )
         if self._supports_fast_sampling(
-            self.input_batch.sampling_metadata, spec_decode_metadata
+            self.input_batch.sampling_metadata,
+            spec_decode_metadata,
+            preserve_original_logits,
         ):
             self._sampling_noise = self._prepare_sampling_noise(
                 spec_decode_metadata, logits_indices
@@ -2336,14 +2342,13 @@ class NPUModelRunner(GPUModelRunner):
         self,
         sampling_metadata: SamplingMetadata,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        preserve_original_logits: bool,
     ) -> bool:
         if self.sampling_bridge is None:
             return False
         if self.device.type != "npu":
             return False
-        if sampling_metadata.max_num_logprobs is not None:
-            return False
-        if getattr(sampling_metadata, "logprob_token_ids", None):
+        if preserve_original_logits:
             return False
         if lmhead_tp_enable():
             return False
@@ -2355,6 +2360,27 @@ class NPUModelRunner(GPUModelRunner):
             self.speculative_config is not None
             and self.speculative_config.rejection_sample_method == "probabilistic"
             and self.sampling_bridge.rejection_sampler is not None
+        )
+
+    def _should_preserve_original_logits(
+        self,
+        sampling_metadata: SamplingMetadata,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        """Return whether downstream consumers still need raw model logits.
+
+        Keep this check in the runner because logits ownership is decided by
+        the full MRv1 pipeline: sampling output, bookkeeping, and speculative
+        proposer state updates.
+        """
+        del spec_decode_metadata
+        if sampling_metadata.max_num_logprobs is not None:
+            return True
+        if getattr(sampling_metadata, "logprob_token_ids", None):
+            return True
+        return (
+            self.sampling_bridge is not None
+            and self.sampling_bridge.sampler.compute_nans
         )
 
     def _prepare_sampling_noise(
@@ -2384,6 +2410,7 @@ class NPUModelRunner(GPUModelRunner):
         spec_decode_metadata: SpecDecodeMetadata | None,
         sampling_metadata: SamplingMetadata,
         noise: SamplingNoise,
+        preserve_original_logits: bool,
     ) -> SamplerOutput | None:
         assert self.sampling_bridge is not None
         bridge_input = self.sampling_bridge.prepare(
@@ -2404,6 +2431,7 @@ class NPUModelRunner(GPUModelRunner):
                 logits,
                 bridge_input,
                 noise.sampling_gumbel,
+                preserve_original_logits,
             )
 
         assert noise.acceptance_uniform is not None
@@ -2414,6 +2442,7 @@ class NPUModelRunner(GPUModelRunner):
             bridge_input,
             noise.acceptance_uniform,
             noise.recovery_gumbel,
+            preserve_original_logits,
         )
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -2423,15 +2452,25 @@ class NPUModelRunner(GPUModelRunner):
         self.input_batch.update_async_output_token_ids()
         noise = getattr(self, "_sampling_noise", None)
         self._sampling_noise = None
+        preserve_original_logits = self._should_preserve_original_logits(
+            sampling_metadata,
+            spec_decode_metadata,
+        )
         if (
             logits is not None
             and noise is not None
             and self._supports_fast_sampling(
-                sampling_metadata, spec_decode_metadata
+                sampling_metadata,
+                spec_decode_metadata,
+                preserve_original_logits,
             )
         ):
             sampler_output = self._run_fast_sampling(
-                logits, spec_decode_metadata, sampling_metadata, noise
+                logits,
+                spec_decode_metadata,
+                sampling_metadata,
+                noise,
+                preserve_original_logits,
             )
             if sampler_output is not None:
                 return sampler_output

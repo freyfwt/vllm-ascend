@@ -273,7 +273,12 @@ def main() -> None:
         )
 
     def regular_our_optimized() -> torch.Tensor:
-        return bridge.sample_regular(regular_logits, regular_inputs, regular_gumbel).sampled_token_ids
+        return bridge.sample_regular(
+            regular_logits,
+            regular_inputs,
+            regular_gumbel,
+            preserve_original_logits=False,
+        ).sampled_token_ids
 
     def rejection_v1_original() -> torch.Tensor:
         return rejection_sampler(spec_metadata, None, spec_logits, sampling_metadata).sampled_token_ids
@@ -310,6 +315,7 @@ def main() -> None:
             spec_inputs,
             rejection_acceptance_uniform,
             rejection_recovery_gumbel,
+            preserve_original_logits=False,
         ).sampled_token_ids
 
     def regular_our_random_prefetch() -> torch.Tensor:

@@ -436,20 +436,91 @@ def sample_processed_logits(
     temperature: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
     sampling_gumbel: torch.Tensor | None,
+    all_random: bool = False,
+    all_greedy: bool = False,
 ) -> torch.Tensor:
+    if sampling_gumbel is not None:
+        sampling_gumbel = sampling_gumbel[
+            : processed_logits.shape[0],
+            : processed_logits.shape[1],
+        ]
+    if sampling_gumbel is not None and all_random:
+        return (processed_logits + sampling_gumbel).argmax(dim=-1).view(-1)
+
     greedy_tokens = processed_logits.argmax(dim=-1).view(-1)
-    if sampling_gumbel is None:
+    if sampling_gumbel is None or all_greedy:
         return greedy_tokens
-    sampling_gumbel = sampling_gumbel[
-        : processed_logits.shape[0],
-        : processed_logits.shape[1],
-    ]
     random_tokens = (processed_logits + sampling_gumbel).argmax(dim=-1).view(-1)
     row_temperature = temperature[expanded_idx_mapping].to(dtype=torch.float32)
     return torch.where(
         row_temperature < _SAMPLING_EPS,
         greedy_tokens,
         random_tokens,
+    )
+
+
+def apply_sampling_params(
+    sampler: GpuSampler,
+    logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    idx_mapping_np: np.ndarray,
+    pos: torch.Tensor,
+    input_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    preserve_original_logits: bool,
+) -> torch.Tensor:
+    if preserve_original_logits:
+        # Delegate to the upstream implementation when raw logits must remain
+        # available for later consumers such as raw logprobs.
+        return sampler.apply_sampling_params(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+        )
+
+    if logits.dtype == torch.float32:
+        processed_logits = logits
+    else:
+        processed_logits = logits.to(torch.float32)
+
+    sampler.logit_bias_state.apply_logit_bias(
+        processed_logits,
+        expanded_idx_mapping,
+        idx_mapping_np,
+        pos,
+    )
+    sampler.penalties_state.apply_penalties(
+        processed_logits,
+        expanded_idx_mapping,
+        idx_mapping_np,
+        input_ids,
+        expanded_local_pos,
+        sampler.num_speculative_tokens,
+    )
+    sampler.bad_words_state.apply_bad_words(
+        processed_logits,
+        expanded_idx_mapping,
+        idx_mapping_np,
+        input_ids,
+        expanded_local_pos,
+    )
+    sampler.sampling_states.apply_temperature(
+        processed_logits,
+        expanded_idx_mapping,
+        idx_mapping_np,
+    )
+    sampler.sampling_states.apply_min_p(
+        processed_logits,
+        expanded_idx_mapping,
+        idx_mapping_np,
+    )
+    return sampler.sampling_states.apply_top_k_top_p(
+        processed_logits,
+        expanded_idx_mapping,
+        idx_mapping_np,
     )
 
 
@@ -460,19 +531,22 @@ class AscendGpuRejectionBridge(GpuRejectionSampler):
         input_batch: GpuInputBatch,
         acceptance_uniform: torch.Tensor,
         recovery_gumbel: torch.Tensor,
+        preserve_original_logits: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.rejection_sample_method != "probabilistic":
             raise RuntimeError("fast sampling only supports probabilistic rejection")
 
         draft_tokens = input_batch.input_ids[input_batch.logits_indices]
         pos = input_batch.positions[input_batch.logits_indices]
-        processed_logits = self.sampler.apply_sampling_params(
+        processed_logits = apply_sampling_params(
+            self.sampler,
             logits,
             input_batch.expanded_idx_mapping,
             input_batch.idx_mapping_np,
             pos,
             draft_tokens,
             input_batch.expanded_local_pos,
+            preserve_original_logits,
         )
         return sample_with_rejection(
             processed_logits,
@@ -569,22 +643,26 @@ class SamplingBridge:
         logits: torch.Tensor,
         input_batch: GpuInputBatch,
         sampling_gumbel: torch.Tensor | None,
+        preserve_original_logits: bool = True,
     ) -> SamplerOutput:
         pos = input_batch.positions[input_batch.logits_indices]
         input_ids = input_batch.input_ids[input_batch.logits_indices]
-        processed_logits = self.sampler.apply_sampling_params(
+        processed_logits = apply_sampling_params(
+            self.sampler,
             logits,
             input_batch.expanded_idx_mapping,
             input_batch.idx_mapping_np,
             pos,
             input_ids,
             input_batch.expanded_local_pos,
+            preserve_original_logits,
         )
         sampled = sample_processed_logits(
             processed_logits,
             self.sampler.sampling_states.temperature.gpu,
             input_batch.expanded_idx_mapping,
             sampling_gumbel,
+            *self._get_regular_sampling_modes(input_batch.idx_mapping_np),
         )
         return SamplerOutput(
             sampled_token_ids=sampled.to(torch.int32).view(-1, 1),
@@ -597,6 +675,7 @@ class SamplingBridge:
         input_batch: GpuInputBatch,
         acceptance_uniform: torch.Tensor,
         recovery_gumbel: torch.Tensor,
+        preserve_original_logits: bool = True,
     ) -> SamplerOutput:
         if self.rejection_sampler is None:
             raise RuntimeError("rejection sampler is required for spec decoding")
@@ -605,8 +684,18 @@ class SamplingBridge:
             input_batch,
             acceptance_uniform,
             recovery_gumbel,
+            preserve_original_logits,
         )
         return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+
+    def _get_regular_sampling_modes(
+        self,
+        idx_mapping_np: np.ndarray,
+    ) -> tuple[bool, bool]:
+        temperature_np = self.sampler.sampling_states.temperature.np[idx_mapping_np]
+        all_random = bool(np.all(temperature_np >= _SAMPLING_EPS))
+        all_greedy = bool(np.all(temperature_np < _SAMPLING_EPS))
+        return all_random, all_greedy
 
     def _sync_request_states(
         self,

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +36,127 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm_ascend.sample.rejection_ops import sample_with_rejection
 
 _SAMPLING_EPS = 1e-5
+_NPU_BUFFER_OVERRIDES_INSTALLED = False
+
+
+class _DeviceBackedTensor:
+    _device: torch.device = torch.device("cpu")
+
+    def __init__(
+        self,
+        size: int | Sequence[int],
+        dtype: torch.dtype,
+        max_concurrency: int = 2,
+    ) -> None:
+        del max_concurrency
+        self.dtype = dtype
+        self.cpu = torch.zeros(size, dtype=dtype, device="cpu")
+        self.np = self.cpu.numpy()
+        self.gpu = torch.zeros(size, dtype=dtype, device=self._device)
+
+    @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        cls._device = device
+
+    def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
+        if n is None:
+            self.gpu.copy_(self.cpu, non_blocking=True)
+            return self.gpu
+
+        self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
+        return self.gpu[:n]
+
+
+class _DeviceStagedWriteTensor:
+    def __init__(
+        self,
+        size: int | Sequence[int],
+        dtype: torch.dtype,
+        device: torch.device,
+        max_concurrency: int = 2,
+        uva_instead_of_gpu: bool = False,
+    ) -> None:
+        del max_concurrency, uva_instead_of_gpu
+        self.num_rows = size if isinstance(size, int) else size[0]
+        self.dtype = dtype
+        self.device = device
+        self.gpu = torch.zeros(size, dtype=dtype, device=device)
+        self._staged_write_indices: list[int] = []
+        self._staged_write_starts: list[int] = []
+        self._staged_write_contents: list[int | float] = []
+        self._staged_write_cu_lens: list[int] = []
+
+    def stage_write(
+        self,
+        index: int,
+        start: int,
+        x: Iterable[int] | Iterable[float],
+    ) -> None:
+        assert index >= 0
+        assert start >= 0
+        values = list(x)
+        if not values:
+            return
+        self._staged_write_indices.append(index)
+        self._staged_write_starts.append(start)
+        self._staged_write_contents.extend(values)
+        self._staged_write_cu_lens.append(len(self._staged_write_contents))
+
+    def stage_write_elem(self, index: int, x: int) -> None:
+        assert index >= 0
+        self._staged_write_indices.append(index)
+        self._staged_write_starts.append(0)
+        self._staged_write_contents.append(x)
+        self._staged_write_cu_lens.append(len(self._staged_write_contents))
+
+    def apply_write(self) -> None:
+        cu_start = 0
+        for index, start, cu_end in zip(
+            self._staged_write_indices,
+            self._staged_write_starts,
+            self._staged_write_cu_lens,
+        ):
+            values = self._staged_write_contents[cu_start:cu_end]
+            value_tensor = torch.tensor(values, dtype=self.dtype, device=self.device)
+            if self.gpu.ndim == 1:
+                self.gpu[index : index + len(values)].copy_(value_tensor, non_blocking=True)
+            else:
+                end = start + len(values)
+                self.gpu[index, start:end].copy_(value_tensor, non_blocking=True)
+            cu_start = cu_end
+        self.clear_staged_writes()
+
+    def clear_staged_writes(self) -> None:
+        self._staged_write_indices.clear()
+        self._staged_write_starts.clear()
+        self._staged_write_contents.clear()
+        self._staged_write_cu_lens.clear()
+
+
+def _install_npu_sampling_buffer_overrides(device: torch.device) -> None:
+    global _NPU_BUFFER_OVERRIDES_INSTALLED
+    if device.type != "npu":
+        return
+
+    _DeviceBackedTensor.set_device(device)
+    if _NPU_BUFFER_OVERRIDES_INSTALLED:
+        return
+
+    from vllm.v1.worker.gpu import states as request_states_module
+    from vllm.v1.worker.gpu.sample import bad_words as bad_words_module
+    from vllm.v1.worker.gpu.sample import logit_bias as logit_bias_module
+    from vllm.v1.worker.gpu.sample import penalties as penalties_module
+    from vllm.v1.worker.gpu.sample import states as sampling_states_module
+
+    request_states_module.StagedWriteTensor = _DeviceStagedWriteTensor
+    request_states_module.UvaBackedTensor = _DeviceBackedTensor
+    sampling_states_module.UvaBackedTensor = _DeviceBackedTensor
+    penalties_module.UvaBackedTensor = _DeviceBackedTensor
+    bad_words_module.StagedWriteTensor = _DeviceStagedWriteTensor
+    bad_words_module.UvaBackedTensor = _DeviceBackedTensor
+    logit_bias_module.StagedWriteTensor = _DeviceStagedWriteTensor
+    logit_bias_module.UvaBackedTensor = _DeviceBackedTensor
+    _NPU_BUFFER_OVERRIDES_INSTALLED = True
 
 
 @dataclass
@@ -379,6 +501,7 @@ class SamplingBridge:
         logprobs_mode: str,
         speculative_config: Any | None,
     ) -> None:
+        _install_npu_sampling_buffer_overrides(device)
         num_speculative_steps = speculative_config.num_speculative_tokens if speculative_config is not None else 0
         self.req_states = RequestState(
             max_num_reqs=max_num_reqs,

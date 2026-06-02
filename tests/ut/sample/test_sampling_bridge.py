@@ -7,6 +7,8 @@ import torch
 
 from vllm_ascend.sample.sampling_bridge import (
     SamplingBridge,
+    _DeviceBackedTensor,
+    _DeviceStagedWriteTensor,
     sample_processed_logits,
 )
 
@@ -121,6 +123,29 @@ class TestSamplingBridge(unittest.TestCase):
             ],
         )
         self.assertEqual(gpu_input.idx_mapping_np.tolist(), [0, 1])
+
+    def test_device_backed_tensor_copies_cpu_mirror_to_device_tensor(self):
+        _DeviceBackedTensor.set_device(torch.device("cpu"))
+        tensor = _DeviceBackedTensor(4, torch.int32)
+        tensor.np[:] = [1, 2, 3, 4]
+
+        tensor.copy_to_uva(2)
+
+        self.assertEqual(tensor.gpu.tolist(), [1, 2, 0, 0])
+
+    def test_device_staged_write_tensor_applies_rows_on_device(self):
+        tensor = _DeviceStagedWriteTensor(
+            (2, 4),
+            torch.int32,
+            torch.device("cpu"),
+        )
+        tensor.stage_write(0, 1, (idx for idx in [3, 4]))
+        tensor.stage_write(1, 0, [5])
+
+        tensor.apply_write()
+
+        self.assertEqual(tensor.gpu.tolist(), [[0, 3, 4, 0], [5, 0, 0, 0]])
+        self.assertEqual(tensor._staged_write_indices, [])
 
 
 class _FakeSampler:

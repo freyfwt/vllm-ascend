@@ -153,16 +153,16 @@ from vllm_ascend.utils import (
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 from vllm_ascend.worker.v1.sample.adapter import (
-    V1SamplingRandomManager,
-    V1SamplingRandoms,
-    V1V2SamplingInputBuilder,
+    SamplingInputBuilder,
+    SamplingNoise,
+    SamplingNoiseManager,
     process_regular_logits,
-    process_spec_decode_logits,
-    sample_from_processed_logits,
+    process_spec_logits,
+    sample_processed_logits,
     temperature_for_sampling,
 )
-from vllm_ascend.worker.v1.sample.rejection_sampler_without_draft_probs import (
-    rejection_sample_without_draft_probs,
+from vllm_ascend.worker.v1.sample.target_rejection import (
+    sample_with_rejection,
 )
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
@@ -303,9 +303,9 @@ class NPUModelRunner(GPUModelRunner):
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
         self.sampler = AscendSampler()
-        self._v1_v2_sampling_builder = V1V2SamplingInputBuilder()
-        self._v1_v2_sampling_random_manager = V1SamplingRandomManager(device)
-        self._v1_v2_sampling_randoms: V1SamplingRandoms | None = None
+        self._sampling_builder = SamplingInputBuilder()
+        self._noise_manager = SamplingNoiseManager(device)
+        self._sampling_noise: SamplingNoise | None = None
         self.attn_state: AscendAttentionState | None = None
 
         # Ascend-specific configurations
@@ -1981,11 +1981,11 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False  # type: ignore[has-type]
-        self._v1_v2_sampling_randoms = None
-        if self._can_use_v1_v2_sampling_path(
+        self._sampling_noise = None
+        if self._supports_fast_sampling(
             self.input_batch.sampling_metadata, spec_decode_metadata
         ):
-            self._v1_v2_sampling_randoms = self._prepare_v1_v2_sampling_randoms(
+            self._sampling_noise = self._prepare_sampling_noise(
                 spec_decode_metadata, logits_indices
             )
         elif self.ascend_config.enable_async_exponential:
@@ -2329,7 +2329,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
-    def _can_use_v1_v2_sampling_path(
+    def _supports_fast_sampling(
         self,
         sampling_metadata: SamplingMetadata,
         spec_decode_metadata: SpecDecodeMetadata | None,
@@ -2351,20 +2351,20 @@ class NPUModelRunner(GPUModelRunner):
             and self.speculative_config.rejection_sample_method == "probabilistic"
         )
 
-    def _prepare_v1_v2_sampling_randoms(
+    def _prepare_sampling_noise(
         self,
         spec_decode_metadata: SpecDecodeMetadata | None,
         logits_indices: torch.Tensor,
-    ) -> V1SamplingRandoms:
+    ) -> SamplingNoise:
         sampling_metadata = self.input_batch.sampling_metadata
         vocab_size = self.model_config.get_vocab_size()
         if spec_decode_metadata is None:
-            return self._v1_v2_sampling_random_manager.prepare_regular(
+            return self._noise_manager.prepare_regular_noise(
                 int(logits_indices.shape[0]),
                 vocab_size,
                 sampling_metadata,
             )
-        return self._v1_v2_sampling_random_manager.prepare_spec_decode(
+        return self._noise_manager.prepare_spec_noise(
             int(spec_decode_metadata.logits_indices.shape[0]),
             self.input_batch.num_reqs,
             vocab_size,
@@ -2372,61 +2372,61 @@ class NPUModelRunner(GPUModelRunner):
             sampling_metadata,
         )
 
-    def _sample_with_v1_v2_sampling_path(
+    def _run_fast_sampling(
         self,
         logits: torch.Tensor,
         spec_decode_metadata: SpecDecodeMetadata | None,
         sampling_metadata: SamplingMetadata,
-        randoms: V1SamplingRandoms,
+        noise: SamplingNoise,
     ) -> SamplerOutput:
-        self._v1_v2_sampling_random_manager.wait(randoms)
+        self._noise_manager.wait(noise)
         if spec_decode_metadata is None:
-            processed_logits, greedy_sampled = process_regular_logits(
+            processed_logits, greedy_tokens = process_regular_logits(
                 self.sampler, logits, sampling_metadata
             )
-            sampled = sample_from_processed_logits(
+            sampled = sample_processed_logits(
                 processed_logits,
                 sampling_metadata,
-                randoms.sample_gumbel,
-                greedy_sampled,
+                noise.sampling_gumbel,
+                greedy_tokens,
             )
             return SamplerOutput(
                 sampled_token_ids=sampled.to(torch.int32).view(-1, 1),
                 logprobs_tensors=None,
             )
 
-        assert randoms.accept_uniform is not None
-        assert randoms.resample_gumbel is not None
+        assert noise.acceptance_uniform is not None
+        assert noise.recovery_gumbel is not None
         num_reqs = self.input_batch.num_reqs
         num_speculative_steps = self.speculative_config.num_speculative_tokens
         temperature = temperature_for_sampling(
             sampling_metadata, num_reqs, logits.device
         )
-        spec_inputs = self._v1_v2_sampling_builder.build_spec_decode_inputs(
+        spec_inputs = self._sampling_builder.build_spec_inputs(
             spec_decode_metadata,
             self.input_ids.gpu,
             self.positions,
             temperature,
             num_speculative_steps,
         )
-        processed_logits = process_spec_decode_logits(
+        processed_logits = process_spec_logits(
             self.sampler,
             self.rejection_sampler,
             logits,
             sampling_metadata,
             spec_decode_metadata,
         )
-        sampled, _ = rejection_sample_without_draft_probs(
+        sampled, _ = sample_with_rejection(
             processed_logits,
-            spec_inputs.draft_sampled,
+            spec_inputs.draft_tokens,
             spec_inputs.cu_num_logits,
             spec_inputs.positions,
             spec_inputs.idx_mapping,
             spec_inputs.expanded_idx_mapping,
             spec_inputs.expanded_local_pos,
             spec_inputs.temperature,
-            randoms.accept_uniform,
-            randoms.resample_gumbel,
+            noise.acceptance_uniform,
+            noise.recovery_gumbel,
             num_speculative_steps,
         )
         return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
@@ -2436,17 +2436,17 @@ class NPUModelRunner(GPUModelRunner):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         self.input_batch.update_async_output_token_ids()
-        randoms = getattr(self, "_v1_v2_sampling_randoms", None)
-        self._v1_v2_sampling_randoms = None
+        noise = getattr(self, "_sampling_noise", None)
+        self._sampling_noise = None
         if (
             logits is not None
-            and randoms is not None
-            and self._can_use_v1_v2_sampling_path(
+            and noise is not None
+            and self._supports_fast_sampling(
                 sampling_metadata, spec_decode_metadata
             )
         ):
-            return self._sample_with_v1_v2_sampling_path(
-                logits, spec_decode_metadata, sampling_metadata, randoms
+            return self._run_fast_sampling(
+                logits, spec_decode_metadata, sampling_metadata, noise
             )
 
         if spec_decode_metadata is None:

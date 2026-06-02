@@ -77,7 +77,7 @@ test used the following settings:
 - old path golden: the existing Ascend rejection sampler, with async random
   number generation simulated for fairness
 - new path: ModelRunnerV1 routes probabilistic rejection sampling through a
-  V2-style rejection sampler and uses external acceptance uniform and resample
+  V2-style rejection sampler and uses external acceptance uniform and recovery
   Gumbel tensors
 
 Test command:
@@ -88,7 +88,7 @@ python -m pytest -q -s tests/ut/sample/test_upstream_rejection_sampler_poc.py
 
 ### 4.2 Effective Prototype Result
 
-After removing candidate resampling, the dense vocab resample path produced the
+After removing candidate resampling, the dense vocab recovery path produced the
 following result:
 
 | Batch size | Old async random ms | New external random ms | Speedup |
@@ -112,14 +112,14 @@ Conclusions:
 ### 4.3 Current Implementation Puncture Result
 
 After implementing the ModelRunnerV1 bridge, the puncture benchmark compared
-three paths for both regular sampling and no-draft-probabilities speculative
+three paths for both regular sampling and draft-free speculative
 rejection sampling:
 
 1. `v1_original`: the current ModelRunnerV1 Ascend sampler or rejection
    sampler path;
 2. `v2_native`: the V1 bridge using the current V2 NPU native sampling helper;
 3. `our_optimized`: the V1 bridge using prefetched random tensors and the
-   optimized no-draft-probabilities operator.
+   optimized draft-free operator.
 
 The benchmark was run on a real NPU with NPU event timing, 5 warmup iterations,
 and 20 measured iterations. Timing covers the sampling critical path only. The
@@ -129,7 +129,7 @@ matches the intended ModelRunnerV1 overlap design.
 Test command:
 
 ```bash
-python benchmarks/ops/bench_v1_sampling_paths.py \
+python benchmarks/ops/bench_sampling_paths.py \
   --batch-size 128 --vocab-size <vocab_size> --spec-steps 3 \
   --warmups 5 --iterations 20
 ```
@@ -162,14 +162,14 @@ above:
 | Batch size | Vocab size | Prefetch tensor | Mean ms | Median ms | P90 ms |
 |---:|---:|---|---:|---:|---:|
 | 128 | 32000 | regular sampling Gumbel | 0.657 | 0.653 | 0.665 |
-| 128 | 32000 | rejection uniform + resample Gumbel | 0.761 | 0.758 | 0.773 |
+| 128 | 32000 | rejection uniform + recovery Gumbel | 0.761 | 0.758 | 0.773 |
 | 128 | 151936 | regular sampling Gumbel | 2.610 | 2.638 | 2.659 |
-| 128 | 151936 | rejection uniform + resample Gumbel | 2.716 | 2.719 | 2.769 |
+| 128 | 151936 | rejection uniform + recovery Gumbel | 2.716 | 2.719 | 2.769 |
 
 Additional batch sweep for vocab size `151936`:
 
 ```bash
-python benchmarks/ops/bench_v1_sampling_paths.py \
+python benchmarks/ops/bench_sampling_paths.py \
   --batch-size <batch_size> --vocab-size 151936 --spec-steps 3 \
   --warmups 5 --iterations 20
 ```
@@ -214,8 +214,8 @@ Conclusions:
 
 The prototype once tried to replace dense vocab resampling with candidate
 resampling. The idea was to run `topk` on processed logits first and then
-resample only inside the top-k candidate set. This direction should not be used
-in the formal implementation.
+sample only from the top-k candidate set. This direction should not be used in
+the formal implementation.
 
 The reason is that `torch.topk(processed_logits, k)` scans
 `num_logits * vocab`, while dense resampling only scans `num_reqs * vocab`.
@@ -254,8 +254,8 @@ The main reason is memory and copy overhead. Full draft logits have shape
 similar to `[max_reqs, num_spec_tokens, vocab_size]`. Storing and copying this
 tensor can easily offset the sampling benefit.
 
-The formal V1 path should instead use a new V1-specific rejection sampling
-operator that explicitly supports the no-draft-probabilities mode. This avoids
+The formal V1 path should instead use a new draft-free rejection sampling
+operator that explicitly supports the draft-free mode. This avoids
 changing the existing ModelRunnerV2 operator semantics.
 
 ## 5. Design Goals
@@ -322,16 +322,16 @@ The new design has four layers:
    sampler and rejection sampler.
 3. **Random prefetch**: random tensors are allocated or reused on the default
    stream before model graph execution, then filled on a separate NPU stream.
-4. **Sampling operators**: add V1-specific V2-style sampling and rejection
+4. **Sampling operators**: add draft-free V2-style sampling and rejection
    sampling operators. The rejection sampling operator explicitly supports the
-   no-draft-probabilities mode.
+   draft-free mode.
 
 Data flow:
 
 ```text
 execute_model
   ├─ allocate or reuse random buffers on the default stream
-  ├─ fill accept_uniform / sample_gumbel / resample_gumbel on random stream
+  ├─ fill acceptance_uniform / sampling_gumbel / recovery_gumbel on random stream
   ├─ run model graph on the default stream
   └─ _sample
        ├─ check whether the new branch is available
@@ -350,7 +350,7 @@ When speculative decoding is disabled, the input format is simple:
 - `target_logits`: `[num_reqs, vocab_size]`
 - `idx_mapping`: `[num_reqs]`
 - `temperature/top_k/top_p/...`: per-request tensors
-- `sample_gumbel`: `[num_reqs, vocab_size]`, or another layout required by the
+- `sampling_gumbel`: `[num_reqs, vocab_size]`, or another layout required by the
   operator
 
 Output:
@@ -367,14 +367,14 @@ For speculative decoding, ModelRunnerV1 `SpecDecodeMetadata` should be
 converted to:
 
 - `target_logits`: `[num_logits, vocab_size]`
-- `draft_sampled`: `[num_logits]`
+- `draft_tokens`: `[num_logits]`
 - `cu_num_logits`: `[num_reqs + 1]`
 - `idx_mapping`: `[num_reqs]`
 - `expanded_idx_mapping`: `[num_logits]`
 - `expanded_local_pos`: `[num_logits]`
 - `positions`: `[num_logits]`
-- `accept_uniform`: `[num_logits]`
-- `resample_gumbel`: `[num_reqs, vocab_size]`
+- `acceptance_uniform`: `[num_logits]`
+- `recovery_gumbel`: `[num_reqs, vocab_size]`
 
 Meanings:
 
@@ -383,7 +383,7 @@ Meanings:
 - `expanded_idx_mapping[row]` maps a logits row to the request index.
 - `expanded_local_pos[row]` maps a logits row to its speculative step inside
   the request.
-- `draft_sampled` is gathered from `input_ids[logits_indices]` and is used in
+- `draft_tokens` is gathered from `input_ids[logits_indices]` and is used in
   the acceptance test.
 
 The prototype verified that `cu_num_logits`, `idx_mapping`,
@@ -395,8 +395,8 @@ The formal implementation should keep this cache in a small helper, for
 example:
 
 ```python
-class V1V2SamplingInputBuilder:
-    def build_spec_decode_inputs(...)
+class SamplingInputBuilder:
+    def build_spec_inputs(...)
     def build_sampling_inputs(...)
 ```
 
@@ -418,9 +418,9 @@ Reasons:
 
 Implementation strategy:
 
-- add a V1-specific rejection sampling operator, for example
-  `rejection_sample_without_draft_probs`;
-- make the no-draft-probabilities mode explicit in the operator name or
+- add a draft-free rejection sampling operator, for example
+  `sample_with_rejection`;
+- make the draft-free mode explicit in the operator name or
   interface;
 - use target distribution and external Gumbel tensors for recovery sampling;
 - call this operator only from the ModelRunnerV1 new branch;
@@ -490,25 +490,25 @@ The required rule is:
 Pseudo-code:
 
 ```python
-def _prepare_sampling_randoms(self, num_logits, num_reqs, vocab_size):
-    accept_uniform = self._get_buffer("accept_uniform", (num_logits,), torch.float32)
-    sample_gumbel = self._get_buffer("sample_gumbel", (num_logits, vocab_size), torch.float32)
-    resample_gumbel = self._get_buffer("resample_gumbel", (num_reqs, vocab_size), torch.float32)
+def _prepare_sampling_noise(self, num_logits, num_reqs, vocab_size):
+    acceptance_uniform = self._get_buffer("acceptance_uniform", (num_logits,), torch.float32)
+    sampling_gumbel = self._get_buffer("sampling_gumbel", (num_logits, vocab_size), torch.float32)
+    recovery_gumbel = self._get_buffer("recovery_gumbel", (num_reqs, vocab_size), torch.float32)
 
     current_stream = torch.npu.current_stream()
     random_stream = self.v2_sampling_random_stream
     random_stream.wait_stream(current_stream)
 
     with torch.npu.stream(random_stream):
-        accept_uniform.uniform_()
-        accept_uniform.clamp_(min=1e-20)
-        sample_gumbel.exponential_()
-        sample_gumbel.log_().neg_()
-        resample_gumbel.exponential_()
-        resample_gumbel.log_().neg_()
+        acceptance_uniform.uniform_()
+        acceptance_uniform.clamp_(min=1e-20)
+        sampling_gumbel.exponential_()
+        sampling_gumbel.log_().neg_()
+        recovery_gumbel.exponential_()
+        recovery_gumbel.log_().neg_()
         self.v2_sampling_random_ready_event.record()
 
-    return accept_uniform, sample_gumbel, resample_gumbel
+    return acceptance_uniform, sampling_gumbel, recovery_gumbel
 ```
 
 Before sampling:
@@ -519,7 +519,7 @@ torch.npu.current_stream().wait_event(self.v2_sampling_random_ready_event)
 
 The implementation should generate only the random tensors needed by the
 current path. For example, do not unconditionally allocate a large
-`resample_gumbel` tensor for regular sampling.
+`recovery_gumbel` tensor for regular sampling.
 
 ## 12. Operator Design
 
@@ -529,15 +529,15 @@ ModelRunnerV2.
 Reasons:
 
 - the existing V2 functionality must not be affected by a V1 transition path;
-- ModelRunnerV1 needs the no-draft-probabilities mode first, which is not the
+- ModelRunnerV1 needs the draft-free mode first, which is not the
   same as the full V2 semantics;
-- a V1-specific operator can have fewer branches and a smaller interface.
+- a draft-free operator can have fewer branches and a smaller interface.
 
 Suggested files:
 
 ```text
-vllm_ascend/worker/v1/sample/v2_sampling_adapter.py
-vllm_ascend/worker/v1/sample/rejection_sampler_without_draft_probs.py
+vllm_ascend/worker/v1/sample/adapter.py
+vllm_ascend/worker/v1/sample/target_rejection.py
 ```
 
 If a new directory is not desired, place the helper near
@@ -547,17 +547,17 @@ input builders directly into `model_runner_v1.py`.
 Suggested rejection sampling interface:
 
 ```python
-def rejection_sample_without_draft_probs(
+def sample_with_rejection(
     target_logits: torch.Tensor,
-    draft_sampled: torch.Tensor,
+    draft_tokens: torch.Tensor,
     cu_num_logits: torch.Tensor,
     positions: torch.Tensor,
     idx_mapping: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
     expanded_local_pos: torch.Tensor,
     temperature: torch.Tensor,
-    accept_uniform: torch.Tensor,
-    resample_gumbel: torch.Tensor,
+    acceptance_uniform: torch.Tensor,
+    recovery_gumbel: torch.Tensor,
     num_speculative_steps: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ...
@@ -566,10 +566,10 @@ def rejection_sample_without_draft_probs(
 Suggested regular sampling interface:
 
 ```python
-def sample_from_processed_logits(
+def sample_processed_logits(
     processed_logits: torch.Tensor,
     temperature: torch.Tensor,
-    sample_gumbel: torch.Tensor,
+    sampling_gumbel: torch.Tensor,
 ) -> torch.Tensor:
     ...
 ```
@@ -601,7 +601,7 @@ by slicing them to the actual runtime shape.
 ### Step 3: Prefetch Random Numbers Before Model Execution
 
 Once the current step is known to be eligible for the new sampling path, call
-`_prepare_sampling_randoms` before model graph execution.
+`_prepare_sampling_noise` before model graph execution.
 
 This check cannot depend on model output logits. It can depend on
 `sampling_metadata`, `spec_decode_metadata`, batch size, vocab size, and
@@ -614,8 +614,8 @@ Inside `_sample`:
 1. check again whether the new path is available;
 2. wait for the random ready event;
 3. reuse the existing logits processing path to produce processed logits;
-4. call `sample_from_processed_logits` for regular sampling;
-5. call `rejection_sample_without_draft_probs` for speculative decoding;
+4. call `sample_processed_logits` for regular sampling;
+5. call `sample_with_rejection` for speculative decoding;
 6. return `SamplerOutput`.
 
 ### Step 5: Fallback
@@ -671,7 +671,7 @@ Compare with the old path using:
 - fixed random tensors;
 - fixed logits and draft tokens;
 - sampled token ids;
-- accepted length or `num_sampled`.
+- accepted length or `sample_counts`.
 
 For random sampling, do not compare a single random output unless the random
 tensors are fixed. Otherwise, verify distribution properties statistically.
@@ -697,7 +697,7 @@ as algorithmic speedup:
    rejection sampler. For fairness, both paths should have async random number
    generation capability.
 3. **Fix inputs and random tensor semantics**: target logits, draft tokens,
-   temperature, top-k, top-p, acceptance uniform, and resample Gumbel should
+   temperature, top-k, top-p, acceptance uniform, and recovery Gumbel should
    have the same shapes or equivalent semantics.
 4. **Check correctness before timing**: assert sampled tokens or accepted
    lengths before printing performance numbers.
@@ -739,7 +739,7 @@ Acceptance criteria:
 
 ## 16. Risks and Constraints
 
-1. **Mathematical semantics**: the no-draft-probabilities mode must be explicit
+1. **Mathematical semantics**: the draft-free mode must be explicit
    in the operator name and call condition. Do not present it as full
    probabilistic rejection sampling.
 2. **Random tensor lifetime**: allocate random tensors on the default stream
@@ -760,14 +760,14 @@ Acceptance criteria:
 - Do not skip resampling.
 - Do not support logprobs in the first stage.
 - Do not reimplement all logits processing.
-- Do not change the existing ModelRunnerV2 rejection sampler into a V1-specific
+- Do not change the existing ModelRunnerV2 rejection sampler into a draft-free
   operator.
 - Do not add a new user-facing switch.
 
 ## 18. Recommended Implementation Order
 
-1. Add the V1-specific sampling input builder.
-2. Add the V1-specific `draft_probs=None` rejection sampling operator.
+1. Add the draft-free sampling input builder.
+2. Add the draft-free `draft_probs=None` rejection sampling operator.
 3. Add external random tensors and validate correctness with synchronous
    generation first.
 4. Move random generation before model execution and add random stream overlap.

@@ -19,14 +19,14 @@ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.worker.v1.sample.adapter import (
-    V1V2SamplingInputBuilder,
+    SamplingInputBuilder,
     process_regular_logits,
-    process_spec_decode_logits,
-    sample_from_processed_logits,
+    process_spec_logits,
+    sample_processed_logits,
     temperature_for_sampling,
 )
-from vllm_ascend.worker.v1.sample.rejection_sampler_without_draft_probs import (
-    rejection_sample_without_draft_probs,
+from vllm_ascend.worker.v1.sample.target_rejection import (
+    sample_with_rejection,
 )
 from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
@@ -111,7 +111,7 @@ def make_spec_metadata(
 
 def boost_draft_logits(
     logits: torch.Tensor,
-    draft_sampled: torch.Tensor,
+    draft_tokens: torch.Tensor,
     num_speculative_steps: int,
     boost: float,
 ) -> None:
@@ -122,7 +122,7 @@ def boost_draft_logits(
         start = req_idx * (num_speculative_steps + 1)
         for step in range(num_speculative_steps):
             rows.append(start + step)
-            cols.append(int(draft_sampled[start + step + 1].item()))
+            cols.append(int(draft_tokens[start + step + 1].item()))
     logits[
         torch.tensor(rows, dtype=torch.int64, device=logits.device),
         torch.tensor(cols, dtype=torch.int64, device=logits.device),
@@ -202,12 +202,12 @@ def main() -> None:
     spec_metadata, input_ids, positions = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
     spec_logits = torch.randn(num_logits, vocab_size, dtype=torch.float32, device=device)
     boost_draft_logits(spec_logits, input_ids, spec_steps, boost=12.0)
-    builder = V1V2SamplingInputBuilder()
+    builder = SamplingInputBuilder()
     temperature = temperature_for_sampling(sampling_metadata, batch_size, device)
-    spec_inputs = builder.build_spec_decode_inputs(spec_metadata, input_ids, positions, temperature, spec_steps)
-    rejection_accept_uniform = torch.rand(num_logits, dtype=torch.float32, device=device)
-    rejection_accept_uniform.clamp_(min=1e-20)
-    rejection_resample_gumbel = make_gumbel((batch_size, vocab_size), device)
+    spec_inputs = builder.build_spec_inputs(spec_metadata, input_ids, positions, temperature, spec_steps)
+    rejection_acceptance_uniform = torch.rand(num_logits, dtype=torch.float32, device=device)
+    rejection_acceptance_uniform.clamp_(min=1e-20)
+    rejection_recovery_gumbel = make_gumbel((batch_size, vocab_size), device)
     rejection_seed = torch.arange(200000, 200000 + batch_size, dtype=torch.int64, device=device)
 
     def regular_v1_original() -> torch.Tensor:
@@ -225,20 +225,18 @@ def main() -> None:
         )
 
     def regular_our_optimized() -> torch.Tensor:
-        processed, greedy_sampled = process_regular_logits(sampler, regular_logits, sampling_metadata)
-        return sample_from_processed_logits(processed, sampling_metadata, regular_gumbel, greedy_sampled)
+        processed, greedy_tokens = process_regular_logits(sampler, regular_logits, sampling_metadata)
+        return sample_processed_logits(processed, sampling_metadata, regular_gumbel, greedy_tokens)
 
     def rejection_v1_original() -> torch.Tensor:
         return rejection_sampler(spec_metadata, None, spec_logits, sampling_metadata).sampled_token_ids
 
     def rejection_v2_native() -> torch.Tensor:
-        processed = process_spec_decode_logits(
-            sampler, rejection_sampler, spec_logits, sampling_metadata, spec_metadata
-        )
+        processed = process_spec_logits(sampler, rejection_sampler, spec_logits, sampling_metadata, spec_metadata)
         sampled, _ = v2_rejection_sample(
             processed,
             None,
-            spec_inputs.draft_sampled,
+            spec_inputs.draft_tokens,
             spec_inputs.cu_num_logits,
             spec_inputs.positions,
             spec_inputs.idx_mapping,
@@ -251,20 +249,18 @@ def main() -> None:
         return sampled
 
     def rejection_our_optimized() -> torch.Tensor:
-        processed = process_spec_decode_logits(
-            sampler, rejection_sampler, spec_logits, sampling_metadata, spec_metadata
-        )
-        sampled, _ = rejection_sample_without_draft_probs(
+        processed = process_spec_logits(sampler, rejection_sampler, spec_logits, sampling_metadata, spec_metadata)
+        sampled, _ = sample_with_rejection(
             processed,
-            spec_inputs.draft_sampled,
+            spec_inputs.draft_tokens,
             spec_inputs.cu_num_logits,
             spec_inputs.positions,
             spec_inputs.idx_mapping,
             spec_inputs.expanded_idx_mapping,
             spec_inputs.expanded_local_pos,
             spec_inputs.temperature,
-            rejection_accept_uniform,
-            rejection_resample_gumbel,
+            rejection_acceptance_uniform,
+            rejection_recovery_gumbel,
             spec_steps,
         )
         return sampled
@@ -276,13 +272,13 @@ def main() -> None:
         return gumbel
 
     def rejection_our_random_prefetch() -> torch.Tensor:
-        accept = torch.empty_like(rejection_accept_uniform)
+        accept = torch.empty_like(rejection_acceptance_uniform)
         accept.uniform_()
         accept.clamp_(min=1e-20)
-        resample = torch.empty_like(rejection_resample_gumbel)
-        resample.exponential_()
-        resample.log_().neg_()
-        return resample
+        recovery = torch.empty_like(rejection_recovery_gumbel)
+        recovery.exponential_()
+        recovery.log_().neg_()
+        return recovery
 
     cases: list[tuple[str, Callable[[], torch.Tensor]]] = [
         ("regular/v1_original", regular_v1_original),

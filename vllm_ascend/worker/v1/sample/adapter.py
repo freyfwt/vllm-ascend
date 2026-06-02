@@ -30,20 +30,20 @@ _SAMPLING_EPS = 1e-5
 
 
 @dataclass
-class V1SamplingRandoms:
-    accept_uniform: torch.Tensor | None = None
-    sample_gumbel: torch.Tensor | None = None
-    resample_gumbel: torch.Tensor | None = None
+class SamplingNoise:
+    acceptance_uniform: torch.Tensor | None = None
+    sampling_gumbel: torch.Tensor | None = None
+    recovery_gumbel: torch.Tensor | None = None
     ready_event: torch.npu.Event | None = None
 
 
 @dataclass
-class V1SpecDecodeSamplingInputs:
+class SpecSamplingInputs:
     cu_num_logits: torch.Tensor
     idx_mapping: torch.Tensor
     expanded_idx_mapping: torch.Tensor
     expanded_local_pos: torch.Tensor
-    draft_sampled: torch.Tensor
+    draft_tokens: torch.Tensor
     positions: torch.Tensor
     temperature: torch.Tensor
 
@@ -69,18 +69,18 @@ def _next_power_of_2(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
-class V1V2SamplingInputBuilder:
+class SamplingInputBuilder:
     def __init__(self) -> None:
         self._buffers: dict[str, torch.Tensor] = {}
 
-    def build_spec_decode_inputs(
+    def build_spec_inputs(
         self,
         metadata: SpecDecodeMetadata,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         temperature: torch.Tensor,
         num_speculative_steps: int,
-    ) -> V1SpecDecodeSamplingInputs:
+    ) -> SpecSamplingInputs:
         num_reqs = len(metadata.num_draft_tokens)
         num_logits = int(metadata.logits_indices.shape[0])
         device = input_ids.device
@@ -102,12 +102,12 @@ class V1V2SamplingInputBuilder:
         )
 
         logits_indices = metadata.logits_indices
-        return V1SpecDecodeSamplingInputs(
+        return SpecSamplingInputs(
             cu_num_logits=cu_num_logits,
             idx_mapping=idx_mapping,
             expanded_idx_mapping=expanded_idx_mapping,
             expanded_local_pos=expanded_local_pos,
-            draft_sampled=input_ids[logits_indices],
+            draft_tokens=input_ids[logits_indices],
             positions=positions[logits_indices],
             temperature=temperature,
         )
@@ -139,64 +139,64 @@ class V1V2SamplingInputBuilder:
         return buffer[:num_reqs]
 
 
-class V1SamplingRandomManager:
+class SamplingNoiseManager:
     def __init__(self, device: torch.device) -> None:
         self._device = device
         self._stream = torch.npu.Stream(device=device)
         self._event = torch.npu.Event()
         self._buffers: dict[str, torch.Tensor] = {}
 
-    def prepare_regular(
+    def prepare_regular_noise(
         self,
         num_reqs: int,
         vocab_size: int,
         sampling_metadata: SamplingMetadata,
-    ) -> V1SamplingRandoms:
+    ) -> SamplingNoise:
         if sampling_metadata.all_greedy:
-            return V1SamplingRandoms()
-        sample_gumbel = self._buffer("sample_gumbel", (num_reqs, vocab_size), torch.float32)
-        self._record_randoms(lambda: self._fill_gumbel(sample_gumbel, sampling_metadata.generators))
-        return V1SamplingRandoms(sample_gumbel=sample_gumbel, ready_event=self._event)
+            return SamplingNoise()
+        sampling_gumbel = self._buffer("sampling_gumbel", (num_reqs, vocab_size), torch.float32)
+        self._record_noise(lambda: self._fill_gumbel(sampling_gumbel, sampling_metadata.generators))
+        return SamplingNoise(sampling_gumbel=sampling_gumbel, ready_event=self._event)
 
-    def prepare_spec_decode(
+    def prepare_spec_noise(
         self,
         num_logits: int,
         num_reqs: int,
         vocab_size: int,
         num_draft_tokens: list[int],
         sampling_metadata: SamplingMetadata,
-    ) -> V1SamplingRandoms:
+    ) -> SamplingNoise:
         if sampling_metadata.all_greedy:
-            return V1SamplingRandoms(
-                accept_uniform=self._buffer("accept_uniform", (1,), torch.float32),
-                resample_gumbel=self._buffer("resample_gumbel", (1, 1), torch.float32),
+            return SamplingNoise(
+                acceptance_uniform=self._buffer("acceptance_uniform", (1,), torch.float32),
+                recovery_gumbel=self._buffer("recovery_gumbel", (1, 1), torch.float32),
             )
 
-        accept_uniform = self._buffer("accept_uniform", (num_logits,), torch.float32)
-        resample_gumbel = self._buffer("resample_gumbel", (num_reqs, vocab_size), torch.float32)
+        acceptance_uniform = self._buffer("acceptance_uniform", (num_logits,), torch.float32)
+        recovery_gumbel = self._buffer("recovery_gumbel", (num_reqs, vocab_size), torch.float32)
 
         def fill() -> None:
-            accept_uniform.uniform_()
+            acceptance_uniform.uniform_()
             offset = 0
             for req_idx, num_draft in enumerate(num_draft_tokens):
                 num_rows = num_draft + 1
                 generator = sampling_metadata.generators.get(req_idx)
                 if generator is not None:
-                    accept_uniform[offset : offset + num_draft].uniform_(generator=generator)
+                    acceptance_uniform[offset : offset + num_draft].uniform_(generator=generator)
                 offset += num_rows
-            accept_uniform.clamp_(min=1e-20)
-            self._fill_gumbel(resample_gumbel, sampling_metadata.generators)
+            acceptance_uniform.clamp_(min=1e-20)
+            self._fill_gumbel(recovery_gumbel, sampling_metadata.generators)
 
-        self._record_randoms(fill)
-        return V1SamplingRandoms(
-            accept_uniform=accept_uniform,
-            resample_gumbel=resample_gumbel,
+        self._record_noise(fill)
+        return SamplingNoise(
+            acceptance_uniform=acceptance_uniform,
+            recovery_gumbel=recovery_gumbel,
             ready_event=self._event,
         )
 
-    def wait(self, randoms: V1SamplingRandoms | None) -> None:
-        if randoms is not None and randoms.ready_event is not None:
-            torch.npu.current_stream().wait_event(randoms.ready_event)
+    def wait(self, noise: SamplingNoise | None) -> None:
+        if noise is not None and noise.ready_event is not None:
+            torch.npu.current_stream().wait_event(noise.ready_event)
 
     def _buffer(
         self,
@@ -215,7 +215,7 @@ class V1SamplingRandomManager:
             self._buffers[name] = buffer
         return buffer[tuple(slice(0, dim) for dim in shape)]
 
-    def _record_randoms(self, fill) -> None:
+    def _record_noise(self, fill) -> None:
         current_stream = torch.npu.current_stream()
         self._stream.wait_stream(current_stream)
         with torch.npu.stream(self._stream):
@@ -251,15 +251,15 @@ def process_regular_logits(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     logits = logits.to(torch.float32)
     logits = sampler.apply_logits_processors(logits, sampling_metadata, predict_bonus_token=False)
-    greedy_sampled = None
+    greedy_tokens = None
     if not sampling_metadata.all_random:
-        greedy_sampled = sampler.greedy_sample(logits)
+        greedy_tokens = sampler.greedy_sample(logits)
         if sampling_metadata.all_greedy:
-            return logits, greedy_sampled
-    return _apply_single_step_constraints(logits, sampling_metadata), greedy_sampled
+            return logits, greedy_tokens
+    return _apply_single_step_constraints(logits, sampling_metadata), greedy_tokens
 
 
-def process_spec_decode_logits(
+def process_spec_logits(
     sampler,
     rejection_sampler,
     logits: torch.Tensor,
@@ -282,28 +282,28 @@ def process_spec_decode_logits(
     return processed
 
 
-def sample_from_processed_logits(
+def sample_processed_logits(
     processed_logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
-    sample_gumbel: torch.Tensor | None,
-    greedy_sampled: torch.Tensor | None,
+    sampling_gumbel: torch.Tensor | None,
+    greedy_tokens: torch.Tensor | None,
 ) -> torch.Tensor:
     if sampling_metadata.all_greedy:
-        if greedy_sampled is None:
-            raise RuntimeError("greedy_sampled is required for greedy sampling")
-        return greedy_sampled
-    if sample_gumbel is None:
-        raise RuntimeError("sample_gumbel is required for random sampling")
-    sample_gumbel = sample_gumbel[: processed_logits.shape[0], : processed_logits.shape[1]]
-    random_sampled = (processed_logits + sample_gumbel).argmax(dim=-1).view(-1)
+        if greedy_tokens is None:
+            raise RuntimeError("greedy_tokens is required for greedy sampling")
+        return greedy_tokens
+    if sampling_gumbel is None:
+        raise RuntimeError("sampling_gumbel is required for random sampling")
+    sampling_gumbel = sampling_gumbel[: processed_logits.shape[0], : processed_logits.shape[1]]
+    random_tokens = (processed_logits + sampling_gumbel).argmax(dim=-1).view(-1)
     if sampling_metadata.all_random:
-        return random_sampled
-    if greedy_sampled is None or sampling_metadata.temperature is None:
+        return random_tokens
+    if greedy_tokens is None or sampling_metadata.temperature is None:
         raise RuntimeError("mixed sampling requires greedy tokens and temperature")
     return torch.where(
         sampling_metadata.temperature < _SAMPLING_EPS,
-        greedy_sampled,
-        random_sampled,
+        greedy_tokens,
+        random_tokens,
     )
 
 

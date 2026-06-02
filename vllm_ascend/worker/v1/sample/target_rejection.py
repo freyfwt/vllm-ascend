@@ -47,7 +47,7 @@ def _compute_global_lse(
 
 
 @triton.jit
-def _target_block_stats_kernel(
+def _target_stats_kernel(
     target_local_argmax_ptr,
     target_local_argmax_stride,
     target_local_max_ptr,
@@ -110,7 +110,7 @@ def _target_block_stats_kernel(
 def _probabilistic_rejection_kernel(
     sampled_ptr,
     sampled_stride,
-    num_sampled_ptr,
+    sample_counts_ptr,
     target_logits_ptr,
     target_logits_stride,
     target_local_argmax_ptr,
@@ -119,11 +119,11 @@ def _probabilistic_rejection_kernel(
     target_local_max_stride,
     target_local_sumexp_ptr,
     target_local_sumexp_stride,
-    draft_sampled_ptr,
+    draft_tokens_ptr,
     cu_num_logits_ptr,
     idx_mapping_ptr,
     temperature_ptr,
-    accept_uniform_ptr,
+    acceptance_uniform_ptr,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     NUM_SPECULATIVE_STEPS: tl.constexpr,
@@ -134,13 +134,13 @@ def _probabilistic_rejection_kernel(
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
 
-    num_sampled = 0
+    sample_counts = 0
     accepted = True
     num_draft_tokens = end_idx - start_idx - 1
     for i in range(NUM_SPECULATIVE_STEPS):
         if accepted and i < num_draft_tokens:
             logit_idx = start_idx + i
-            draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1)
+            draft_tokens = tl.load(draft_tokens_ptr + logit_idx + 1)
             if temperature == 0.0:
                 blocks = tl.arange(0, PADDED_VOCAB_NUM_BLOCKS)
                 mask = blocks < vocab_num_blocks
@@ -153,10 +153,10 @@ def _probabilistic_rejection_kernel(
                 target_argmax = tl.load(
                     target_local_argmax_ptr + logit_idx * target_local_argmax_stride + max_block_idx
                 )
-                accepted &= target_argmax == draft_sampled
+                accepted &= target_argmax == draft_tokens
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, target_argmax)
             else:
-                target_logit = tl.load(target_logits_ptr + logit_idx * target_logits_stride + draft_sampled).to(
+                target_logit = tl.load(target_logits_ptr + logit_idx * target_logits_stride + draft_tokens).to(
                     tl.float32
                 )
                 target_lse = _compute_global_lse(
@@ -168,39 +168,39 @@ def _probabilistic_rejection_kernel(
                     vocab_num_blocks,
                     PADDED_VOCAB_NUM_BLOCKS,
                 )
-                u = tl.load(accept_uniform_ptr + logit_idx).to(tl.float32)
+                u = tl.load(acceptance_uniform_ptr + logit_idx).to(tl.float32)
                 accepted &= target_logit - target_lse > tl.log(u)
-                tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
-            num_sampled += accepted
-    tl.store(num_sampled_ptr + req_idx, num_sampled)
+                tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_tokens)
+            sample_counts += accepted
+    tl.store(sample_counts_ptr + req_idx, sample_counts)
 
 
 @triton.jit
-def _resample_kernel(
-    resampled_local_argmax_ptr,
-    resampled_local_argmax_stride,
-    resampled_local_max_ptr,
-    resampled_local_max_stride,
+def _recovery_kernel(
+    recovery_local_argmax_ptr,
+    recovery_local_argmax_stride,
+    recovery_local_max_ptr,
+    recovery_local_max_stride,
     target_logits_ptr,
     target_logits_stride,
-    num_sampled_ptr,
+    sample_counts_ptr,
     cu_num_logits_ptr,
     expanded_idx_mapping_ptr,
-    draft_sampled_ptr,
+    draft_tokens_ptr,
     temperature_ptr,
-    resample_gumbel_ptr,
-    resample_gumbel_stride,
+    recovery_gumbel_ptr,
+    recovery_gumbel_stride,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
-    resample_idx = tl.load(num_sampled_ptr + req_idx)
+    recovery_idx = tl.load(sample_counts_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
-    resample_token_idx = start_idx + resample_idx
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx)
+    recovery_token_idx = start_idx + recovery_idx
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + recovery_token_idx)
     temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
-    is_bonus = resample_token_idx == end_idx - 1
+    is_bonus = recovery_token_idx == end_idx - 1
     if temperature == 0.0 and not is_bonus:
         return
 
@@ -208,81 +208,81 @@ def _resample_kernel(
     block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = block < vocab_size
     logits = tl.load(
-        target_logits_ptr + resample_token_idx * target_logits_stride + block,
+        target_logits_ptr + recovery_token_idx * target_logits_stride + block,
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
     if not is_bonus:
-        rejected_draft = tl.load(draft_sampled_ptr + resample_token_idx + 1)
+        rejected_draft = tl.load(draft_tokens_ptr + recovery_token_idx + 1)
         logits = tl.where(block != rejected_draft, logits, float("-inf"))
     if temperature != 0.0:
         logits += tl.load(
-            resample_gumbel_ptr + req_idx * resample_gumbel_stride + block,
+            recovery_gumbel_ptr + req_idx * recovery_gumbel_stride + block,
             mask=mask,
             other=float("-inf"),
         ).to(tl.float32)
 
     value, idx = tl.max(logits, axis=0, return_indices=True)
     tl.store(
-        resampled_local_argmax_ptr + req_idx * resampled_local_argmax_stride + block_idx,
+        recovery_local_argmax_ptr + req_idx * recovery_local_argmax_stride + block_idx,
         block_idx * BLOCK_SIZE + idx,
     )
     tl.store(
-        resampled_local_max_ptr + req_idx * resampled_local_max_stride + block_idx,
+        recovery_local_max_ptr + req_idx * recovery_local_max_stride + block_idx,
         value,
     )
 
 
 @triton.jit
-def _insert_resampled_kernel(
+def _insert_recovery_kernel(
     sampled_ptr,
     sampled_stride,
-    num_sampled_ptr,
-    resampled_local_argmax_ptr,
-    resampled_local_argmax_stride,
-    resampled_local_max_ptr,
-    resampled_local_max_stride,
-    resample_num_blocks,
+    sample_counts_ptr,
+    recovery_local_argmax_ptr,
+    recovery_local_argmax_stride,
+    recovery_local_max_ptr,
+    recovery_local_max_stride,
+    recovery_blocks,
     cu_num_logits_ptr,
     expanded_idx_mapping_ptr,
     temperature_ptr,
-    PADDED_RESAMPLE_NUM_BLOCKS: tl.constexpr,
+    PADDED_RECOVERY_BLOCKS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
-    num_sampled = tl.load(num_sampled_ptr + req_idx)
+    sample_counts = tl.load(sample_counts_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
-    resample_token_idx = start_idx + num_sampled
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx)
+    recovery_token_idx = start_idx + sample_counts
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + recovery_token_idx)
     temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
-    is_bonus = resample_token_idx == end_idx - 1
-    tl.store(num_sampled_ptr + req_idx, num_sampled + 1)
+    is_bonus = recovery_token_idx == end_idx - 1
+    tl.store(sample_counts_ptr + req_idx, sample_counts + 1)
     if temperature == 0.0 and not is_bonus:
         return
 
-    blocks = tl.arange(0, PADDED_RESAMPLE_NUM_BLOCKS)
-    mask = blocks < resample_num_blocks
+    blocks = tl.arange(0, PADDED_RECOVERY_BLOCKS)
+    mask = blocks < recovery_blocks
     local_max = tl.load(
-        resampled_local_max_ptr + req_idx * resampled_local_max_stride + blocks,
+        recovery_local_max_ptr + req_idx * recovery_local_max_stride + blocks,
         mask=mask,
         other=float("-inf"),
     )
     max_block_idx = tl.argmax(local_max, axis=0)
-    resampled = tl.load(resampled_local_argmax_ptr + req_idx * resampled_local_argmax_stride + max_block_idx)
-    tl.store(sampled_ptr + req_idx * sampled_stride + num_sampled, resampled)
+    recovery = tl.load(recovery_local_argmax_ptr + req_idx * recovery_local_argmax_stride + max_block_idx)
+    tl.store(sampled_ptr + req_idx * sampled_stride + sample_counts, recovery)
 
 
-def rejection_sample_without_draft_probs(
+def sample_with_rejection(
     target_logits: torch.Tensor,
-    draft_sampled: torch.Tensor,
+    draft_tokens: torch.Tensor,
     cu_num_logits: torch.Tensor,
     positions: torch.Tensor,
     idx_mapping: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
     expanded_local_pos: torch.Tensor,
     temperature: torch.Tensor,
-    accept_uniform: torch.Tensor,
-    resample_gumbel: torch.Tensor,
+    acceptance_uniform: torch.Tensor,
+    recovery_gumbel: torch.Tensor,
     num_speculative_steps: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del positions
@@ -295,7 +295,7 @@ def rejection_sample_without_draft_probs(
     target_local_argmax = torch.empty((num_logits, vocab_num_blocks), dtype=torch.int64, device=target_logits.device)
     target_local_max = torch.empty((num_logits, vocab_num_blocks), dtype=torch.float32, device=target_logits.device)
     target_local_sumexp = torch.empty_like(target_local_max)
-    _target_block_stats_kernel[(num_logits, vocab_num_blocks)](
+    _target_stats_kernel[(num_logits, vocab_num_blocks)](
         target_local_argmax,
         target_local_argmax.stride(0),
         target_local_max,
@@ -318,11 +318,11 @@ def rejection_sample_without_draft_probs(
         dtype=torch.int32,
         device=target_logits.device,
     )
-    num_sampled = torch.empty((num_reqs,), dtype=torch.int32, device=target_logits.device)
+    sample_counts = torch.empty((num_reqs,), dtype=torch.int32, device=target_logits.device)
     _probabilistic_rejection_kernel[(num_reqs,)](
         sampled,
         sampled.stride(0),
-        num_sampled,
+        sample_counts,
         target_logits,
         target_logits.stride(0),
         target_local_argmax,
@@ -331,53 +331,51 @@ def rejection_sample_without_draft_probs(
         target_local_max.stride(0),
         target_local_sumexp,
         target_local_sumexp.stride(0),
-        draft_sampled,
+        draft_tokens,
         cu_num_logits,
         idx_mapping,
         temperature,
-        accept_uniform,
+        acceptance_uniform,
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         NUM_SPECULATIVE_STEPS=num_speculative_steps,
         num_warps=1,
     )
 
-    resample_block_size = 1024
-    resample_num_blocks = triton.cdiv(vocab_size, resample_block_size)
-    padded_resample_num_blocks = triton.next_power_of_2(resample_num_blocks)
-    resampled_local_argmax = torch.empty(
-        (num_reqs, resample_num_blocks), dtype=torch.int64, device=target_logits.device
-    )
-    resampled_local_max = torch.empty((num_reqs, resample_num_blocks), dtype=torch.float32, device=target_logits.device)
-    _resample_kernel[(num_reqs, resample_num_blocks)](
-        resampled_local_argmax,
-        resampled_local_argmax.stride(0),
-        resampled_local_max,
-        resampled_local_max.stride(0),
+    recovery_block_size = 1024
+    recovery_blocks = triton.cdiv(vocab_size, recovery_block_size)
+    padded_recovery_blocks = triton.next_power_of_2(recovery_blocks)
+    recovery_local_argmax = torch.empty((num_reqs, recovery_blocks), dtype=torch.int64, device=target_logits.device)
+    recovery_local_max = torch.empty((num_reqs, recovery_blocks), dtype=torch.float32, device=target_logits.device)
+    _recovery_kernel[(num_reqs, recovery_blocks)](
+        recovery_local_argmax,
+        recovery_local_argmax.stride(0),
+        recovery_local_max,
+        recovery_local_max.stride(0),
         target_logits,
         target_logits.stride(0),
-        num_sampled,
+        sample_counts,
         cu_num_logits,
         expanded_idx_mapping,
-        draft_sampled,
+        draft_tokens,
         temperature,
-        resample_gumbel,
-        resample_gumbel.stride(0),
+        recovery_gumbel,
+        recovery_gumbel.stride(0),
         vocab_size,
-        BLOCK_SIZE=resample_block_size,
+        BLOCK_SIZE=recovery_block_size,
     )
-    _insert_resampled_kernel[(num_reqs,)](
+    _insert_recovery_kernel[(num_reqs,)](
         sampled,
         sampled.stride(0),
-        num_sampled,
-        resampled_local_argmax,
-        resampled_local_argmax.stride(0),
-        resampled_local_max,
-        resampled_local_max.stride(0),
-        resample_num_blocks,
+        sample_counts,
+        recovery_local_argmax,
+        recovery_local_argmax.stride(0),
+        recovery_local_max,
+        recovery_local_max.stride(0),
+        recovery_blocks,
         cu_num_logits,
         expanded_idx_mapping,
         temperature,
-        PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
+        PADDED_RECOVERY_BLOCKS=padded_recovery_blocks,
     )
-    return sampled, num_sampled
+    return sampled, sample_counts

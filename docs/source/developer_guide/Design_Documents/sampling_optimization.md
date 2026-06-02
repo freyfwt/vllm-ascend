@@ -156,6 +156,34 @@ Speculative rejection sampling without draft probabilities:
 | 151936 | v2 native | 153.445 | 153.437 | 153.553 | 0.07x |
 | 151936 | our optimized | 6.491 | 6.535 | 6.739 | 1.77x |
 
+Additional batch sweep for vocab size `151936`:
+
+```bash
+python benchmarks/ops/bench_v1_sampling_paths.py \
+  --batch-size <batch_size> --vocab-size 151936 --spec-steps 3 \
+  --warmups 5 --iterations 20
+```
+
+Regular sampling batch sweep:
+
+| Batch size | V1 original ms | V2 native ms | V2 native speedup | Our optimized ms | Our speedup |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.659 | 1.559 | 0.42x | 0.217 | 3.03x |
+| 8 | 0.647 | 9.856 | 0.07x | 0.223 | 2.90x |
+| 32 | 0.996 | 38.637 | 0.03x | 0.221 | 4.50x |
+| 64 | 1.650 | 76.697 | 0.02x | 0.249 | 6.62x |
+| 96 | 2.412 | 114.786 | 0.02x | 0.526 | 4.59x |
+
+Speculative rejection sampling batch sweep:
+
+| Batch size | V1 original ms | V2 native ms | V2 native speedup | Our optimized ms | Our speedup |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 2.627 | 2.872 | 0.91x | 1.854 | 1.42x |
+| 8 | 2.047 | 10.746 | 0.19x | 1.592 | 1.29x |
+| 32 | 3.371 | 39.028 | 0.09x | 1.962 | 1.72x |
+| 64 | 5.959 | 77.021 | 0.08x | 3.365 | 1.77x |
+| 96 | 8.848 | 115.378 | 0.08x | 5.209 | 1.70x |
+
 Standalone random prefetch cost, not included in the critical-path speedup
 above:
 

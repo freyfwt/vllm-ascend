@@ -2419,6 +2419,7 @@ class NPUModelRunner(GPUModelRunner):
         sampled, _ = sample_with_rejection(
             processed_logits,
             spec_inputs.draft_tokens,
+            None,
             spec_inputs.cu_num_logits,
             spec_inputs.positions,
             spec_inputs.idx_mapping,

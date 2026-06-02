@@ -550,6 +550,7 @@ Suggested rejection sampling interface:
 def sample_with_rejection(
     target_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
+    draft_probs: torch.Tensor | None,
     cu_num_logits: torch.Tensor,
     positions: torch.Tensor,
     idx_mapping: torch.Tensor,
@@ -562,6 +563,11 @@ def sample_with_rejection(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ...
 ```
+
+`draft_probs=None` is the ModelRunnerV1 path because MRv1 does not keep draft
+probabilities. A non-`None` `draft_probs` input is aligned with
+`target_logits` rows, kept for future reuse, and must follow the standard
+probabilistic rejection and residual recovery rules.
 
 Suggested regular sampling interface:
 

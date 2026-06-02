@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.rejection_sampler import GREEDY_TEMPERATURE
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.sample.rejection_sampler import expand_batch_to_tokens
@@ -272,7 +273,7 @@ def process_spec_logits(
     if int(target_indices.numel()) > 0:
         target_logits = logits[target_indices].to(torch.float32)
         target_logits = rejection_sampler.apply_logits_processors(target_logits, sampling_metadata, metadata)
-        target_logits = _apply_expanded_constraints(target_logits, metadata.cu_num_draft_tokens, sampling_metadata)
+        target_logits = _apply_target_constraints(target_logits, metadata.cu_num_draft_tokens, sampling_metadata)
         processed[target_indices] = target_logits
 
     bonus_indices = metadata.bonus_logits_indices
@@ -323,7 +324,7 @@ def _apply_single_step_constraints(
     return _apply_top_k_top_p(logits, sampling_metadata.top_k, sampling_metadata.top_p)
 
 
-def _apply_expanded_constraints(
+def _apply_target_constraints(
     logits: torch.Tensor,
     cu_num_tokens: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -336,12 +337,10 @@ def _apply_expanded_constraints(
         sampling_metadata.temperature,
         cu_num_tokens,
         num_tokens,
-        replace_from=0,
+        replace_from=GREEDY_TEMPERATURE,
         replace_to=1,
     )
     logits.div_(temperature.unsqueeze(-1))
-    for processor in sampling_metadata.logitsprocs.argmax_invariant:
-        logits = processor.apply(logits)
 
     top_k = None
     if sampling_metadata.top_k is not None:

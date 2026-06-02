@@ -136,25 +136,35 @@ python benchmarks/ops/bench_v1_sampling_paths.py \
 
 Regular sampling:
 
-| Vocab size | Path | Mean ms | Median ms | P90 ms | Speedup vs v1 |
-|---:|---|---:|---:|---:|---:|
-| 32000 | v1 original | 0.946 | 0.943 | 0.967 | 1.00x |
-| 32000 | v2 native | 33.316 | 33.260 | 33.535 | 0.03x |
-| 32000 | our optimized | 0.249 | 0.248 | 0.265 | 3.80x |
-| 151936 | v1 original | 3.120 | 3.106 | 3.129 | 1.00x |
-| 151936 | v2 native | 152.799 | 152.789 | 152.848 | 0.02x |
-| 151936 | our optimized | 0.755 | 0.754 | 0.762 | 4.13x |
+| Batch size | Vocab size | Path | Mean ms | Median ms | P90 ms | Speedup vs v1 |
+|---:|---:|---|---:|---:|---:|---:|
+| 128 | 32000 | v1 original | 0.946 | 0.943 | 0.967 | 1.00x |
+| 128 | 32000 | v2 native | 33.316 | 33.260 | 33.535 | 0.03x |
+| 128 | 32000 | our optimized | 0.249 | 0.248 | 0.265 | 3.80x |
+| 128 | 151936 | v1 original | 3.120 | 3.106 | 3.129 | 1.00x |
+| 128 | 151936 | v2 native | 152.799 | 152.789 | 152.848 | 0.02x |
+| 128 | 151936 | our optimized | 0.755 | 0.754 | 0.762 | 4.13x |
 
 Speculative rejection sampling without draft probabilities:
 
-| Vocab size | Path | Mean ms | Median ms | P90 ms | Speedup vs v1 |
-|---:|---|---:|---:|---:|---:|
-| 32000 | v1 original | 2.773 | 2.771 | 2.788 | 1.00x |
-| 32000 | v2 native | 33.809 | 33.798 | 33.849 | 0.08x |
-| 32000 | our optimized | 1.998 | 2.001 | 2.061 | 1.39x |
-| 151936 | v1 original | 11.462 | 11.460 | 11.484 | 1.00x |
-| 151936 | v2 native | 153.445 | 153.437 | 153.553 | 0.07x |
-| 151936 | our optimized | 6.491 | 6.535 | 6.739 | 1.77x |
+| Batch size | Vocab size | Path | Mean ms | Median ms | P90 ms | Speedup vs v1 |
+|---:|---:|---|---:|---:|---:|---:|
+| 128 | 32000 | v1 original | 2.773 | 2.771 | 2.788 | 1.00x |
+| 128 | 32000 | v2 native | 33.809 | 33.798 | 33.849 | 0.08x |
+| 128 | 32000 | our optimized | 1.998 | 2.001 | 2.061 | 1.39x |
+| 128 | 151936 | v1 original | 11.462 | 11.460 | 11.484 | 1.00x |
+| 128 | 151936 | v2 native | 153.445 | 153.437 | 153.553 | 0.07x |
+| 128 | 151936 | our optimized | 6.491 | 6.535 | 6.739 | 1.77x |
+
+Standalone random prefetch cost, not included in the critical-path speedup
+above:
+
+| Batch size | Vocab size | Prefetch tensor | Mean ms | Median ms | P90 ms |
+|---:|---:|---|---:|---:|---:|
+| 128 | 32000 | regular sampling Gumbel | 0.657 | 0.653 | 0.665 |
+| 128 | 32000 | rejection uniform + resample Gumbel | 0.761 | 0.758 | 0.773 |
+| 128 | 151936 | regular sampling Gumbel | 2.610 | 2.638 | 2.659 |
+| 128 | 151936 | rejection uniform + resample Gumbel | 2.716 | 2.719 | 2.769 |
 
 Additional batch sweep for vocab size `151936`:
 
@@ -183,16 +193,6 @@ Speculative rejection sampling batch sweep:
 | 32 | 3.371 | 39.028 | 0.09x | 1.962 | 1.72x |
 | 64 | 5.959 | 77.021 | 0.08x | 3.365 | 1.77x |
 | 96 | 8.848 | 115.378 | 0.08x | 5.209 | 1.70x |
-
-Standalone random prefetch cost, not included in the critical-path speedup
-above:
-
-| Vocab size | Prefetch tensor | Mean ms | Median ms | P90 ms |
-|---:|---|---:|---:|---:|
-| 32000 | regular sampling Gumbel | 0.657 | 0.653 | 0.665 |
-| 32000 | rejection uniform + resample Gumbel | 0.761 | 0.758 | 0.773 |
-| 151936 | regular sampling Gumbel | 2.610 | 2.638 | 2.659 |
-| 151936 | rejection uniform + resample Gumbel | 2.716 | 2.719 | 2.769 |
 
 Conclusions:
 

@@ -13,7 +13,7 @@ def _npu_available() -> bool:
 @pytest.mark.skipif(not _npu_available(), reason="requires NPU")
 def test_sample_with_rejection_accepts_and_recovers():
     from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
-    from vllm_ascend.worker.v1.sample.target_rejection import (
+    from vllm_ascend.sample.rejection_ops import (
         sample_with_rejection,
     )
 
@@ -54,7 +54,7 @@ def test_sample_with_rejection_accepts_and_recovers():
 @pytest.mark.skipif(not _npu_available(), reason="requires NPU")
 def test_sample_with_rejection_uses_draft_probs():
     from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
-    from vllm_ascend.worker.v1.sample.target_rejection import (
+    from vllm_ascend.sample.rejection_ops import (
         sample_with_rejection,
     )
 

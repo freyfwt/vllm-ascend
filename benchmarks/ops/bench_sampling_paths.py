@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import torch
 import torch_npu  # noqa: F401
+from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -18,15 +19,8 @@ import vllm_ascend.ascend_config as ascend_config_module
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.sample.sampler import AscendSampler
-from vllm_ascend.worker.v1.sample.adapter import (
-    SamplingInputBuilder,
-    process_regular_logits,
-    process_spec_logits,
-    sample_processed_logits,
-    temperature_for_sampling,
-)
-from vllm_ascend.worker.v1.sample.target_rejection import (
-    sample_with_rejection,
+from vllm_ascend.sample.sampling_bridge import (
+    SamplingBridge,
 )
 from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
@@ -136,6 +130,22 @@ def make_gumbel(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
     return gumbel
 
 
+def make_bridge_batch(batch_size: int) -> tuple[SimpleNamespace, dict[str, SimpleNamespace]]:
+    req_ids = [f"req_{idx}" for idx in range(batch_size)]
+    token_ids = torch.arange(batch_size, dtype=torch.int32).view(batch_size, 1)
+    input_batch = SimpleNamespace(
+        req_ids=req_ids,
+        req_id_to_index={req_id: idx for idx, req_id in enumerate(req_ids)},
+        num_prompt_tokens=torch.ones(batch_size, dtype=torch.int32).numpy(),
+        num_tokens_no_spec=torch.ones(batch_size, dtype=torch.int32).numpy(),
+        num_computed_tokens_cpu=torch.ones(batch_size, dtype=torch.int32).numpy(),
+        token_ids_cpu=token_ids.numpy(),
+        is_token_ids=torch.ones(batch_size, 1, dtype=torch.bool).numpy(),
+    )
+    requests = {req_id: SimpleNamespace(sampling_params=SamplingParams(temperature=1.0)) for req_id in req_ids}
+    return input_batch, requests
+
+
 def benchmark(
     name: str,
     fn: Callable[[], torch.Tensor],
@@ -194,17 +204,46 @@ def main() -> None:
     rejection_sampler = AscendRejectionSampler(sampler)
     sampling_metadata = make_sampling_metadata(batch_size, device)
     regular_logits = torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device)
-    regular_idx_mapping = torch.arange(batch_size, dtype=torch.int32, device=device)
     regular_seed = torch.arange(100000, 100000 + batch_size, dtype=torch.int64, device=device)
-    regular_pos = torch.arange(batch_size, dtype=torch.int64, device=device)
     regular_gumbel = make_gumbel((batch_size, vocab_size), device)
 
     spec_metadata, input_ids, positions = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
     spec_logits = torch.randn(num_logits, vocab_size, dtype=torch.float32, device=device)
     boost_draft_logits(spec_logits, input_ids, spec_steps, boost=12.0)
-    builder = SamplingInputBuilder()
-    temperature = temperature_for_sampling(sampling_metadata, batch_size, device)
-    spec_inputs = builder.build_spec_inputs(spec_metadata, input_ids, positions, temperature, spec_steps)
+    bridge = SamplingBridge(
+        max_num_reqs=batch_size,
+        max_model_len=spec_steps + 2,
+        max_num_batched_tokens=max(batch_size, num_logits),
+        vocab_size=vocab_size,
+        device=device,
+        logprobs_mode="raw_logprobs",
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=spec_steps,
+            rejection_sample_method="probabilistic",
+        ),
+    )
+    bridge_input_batch, bridge_requests = make_bridge_batch(batch_size)
+    regular_input_ids = torch.arange(batch_size, dtype=torch.int32, device=device)
+    regular_positions = torch.arange(batch_size, dtype=torch.int64, device=device)
+    regular_logits_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+    regular_inputs = bridge.prepare(
+        bridge_input_batch,
+        bridge_requests,
+        regular_input_ids,
+        regular_positions,
+        regular_logits_indices,
+        None,
+    )
+    assert regular_inputs is not None
+    spec_inputs = bridge.prepare(
+        bridge_input_batch,
+        bridge_requests,
+        input_ids,
+        positions,
+        spec_metadata.logits_indices,
+        spec_metadata,
+    )
+    assert spec_inputs is not None
     rejection_acceptance_uniform = torch.rand(num_logits, dtype=torch.float32, device=device)
     rejection_acceptance_uniform.clamp_(min=1e-20)
     rejection_recovery_gumbel = make_gumbel((batch_size, vocab_size), device)
@@ -214,57 +253,64 @@ def main() -> None:
         return sampler(regular_logits, sampling_metadata).sampled_token_ids
 
     def regular_v2_native() -> torch.Tensor:
-        processed, _ = process_regular_logits(sampler, regular_logits, sampling_metadata)
+        regular_pos = regular_inputs.positions[regular_inputs.logits_indices]
+        regular_token_ids = regular_inputs.input_ids[regular_inputs.logits_indices]
+        processed = bridge.sampler.apply_sampling_params(
+            regular_logits,
+            regular_inputs.expanded_idx_mapping,
+            regular_inputs.idx_mapping_np,
+            regular_pos,
+            regular_token_ids,
+            regular_inputs.expanded_local_pos,
+        )
         return gumbel_sample(
             processed,
-            regular_idx_mapping,
-            sampling_metadata.temperature,
+            regular_inputs.expanded_idx_mapping,
+            bridge.sampler.sampling_states.temperature.gpu,
             regular_seed,
             regular_pos,
             apply_temperature=False,
         )
 
     def regular_our_optimized() -> torch.Tensor:
-        processed, greedy_tokens = process_regular_logits(sampler, regular_logits, sampling_metadata)
-        return sample_processed_logits(processed, sampling_metadata, regular_gumbel, greedy_tokens)
+        return bridge.sample_regular(regular_logits, regular_inputs, regular_gumbel).sampled_token_ids
 
     def rejection_v1_original() -> torch.Tensor:
         return rejection_sampler(spec_metadata, None, spec_logits, sampling_metadata).sampled_token_ids
 
     def rejection_v2_native() -> torch.Tensor:
-        processed = process_spec_logits(sampler, rejection_sampler, spec_logits, sampling_metadata, spec_metadata)
+        draft_tokens = spec_inputs.input_ids[spec_inputs.logits_indices]
+        spec_pos = spec_inputs.positions[spec_inputs.logits_indices]
+        processed = bridge.sampler.apply_sampling_params(
+            spec_logits,
+            spec_inputs.expanded_idx_mapping,
+            spec_inputs.idx_mapping_np,
+            spec_pos,
+            draft_tokens,
+            spec_inputs.expanded_local_pos,
+        )
         sampled, _ = v2_rejection_sample(
             processed,
             None,
-            spec_inputs.draft_tokens,
+            draft_tokens,
             spec_inputs.cu_num_logits,
-            spec_inputs.positions,
+            spec_pos,
             spec_inputs.idx_mapping,
             spec_inputs.expanded_idx_mapping,
             spec_inputs.expanded_local_pos,
-            spec_inputs.temperature,
+            bridge.sampler.sampling_states.temperature.gpu,
             rejection_seed,
             spec_steps,
         )
         return sampled
 
     def rejection_our_optimized() -> torch.Tensor:
-        processed = process_spec_logits(sampler, rejection_sampler, spec_logits, sampling_metadata, spec_metadata)
-        sampled, _ = sample_with_rejection(
-            processed,
-            spec_inputs.draft_tokens,
-            None,
-            spec_inputs.cu_num_logits,
-            spec_inputs.positions,
-            spec_inputs.idx_mapping,
-            spec_inputs.expanded_idx_mapping,
-            spec_inputs.expanded_local_pos,
-            spec_inputs.temperature,
+        return bridge.sample_spec(
+            spec_logits,
+            spec_inputs,
             rejection_acceptance_uniform,
             rejection_recovery_gumbel,
-            spec_steps,
-        )
-        return sampled
+        ).sampled_token_ids
 
     def regular_our_random_prefetch() -> torch.Tensor:
         gumbel = torch.empty_like(regular_gumbel)

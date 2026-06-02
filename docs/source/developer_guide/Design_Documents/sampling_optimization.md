@@ -536,8 +536,8 @@ Reasons:
 Suggested files:
 
 ```text
-vllm_ascend/worker/v1/sample/adapter.py
-vllm_ascend/worker/v1/sample/target_rejection.py
+vllm_ascend/sample/sampling_bridge.py
+vllm_ascend/sample/rejection_ops.py
 ```
 
 If a new directory is not desired, place the helper near

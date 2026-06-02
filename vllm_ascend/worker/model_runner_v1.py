@@ -125,6 +125,11 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
+from vllm_ascend.sample.sampling_bridge import (
+    SamplingBridge,
+    SamplingNoise,
+    SamplingNoiseManager,
+)
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -152,18 +157,6 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
-from vllm_ascend.worker.v1.sample.adapter import (
-    SamplingInputBuilder,
-    SamplingNoise,
-    SamplingNoiseManager,
-    process_regular_logits,
-    process_spec_logits,
-    sample_processed_logits,
-    temperature_for_sampling,
-)
-from vllm_ascend.worker.v1.sample.target_rejection import (
-    sample_with_rejection,
-)
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -303,7 +296,17 @@ class NPUModelRunner(GPUModelRunner):
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
         self.sampler = AscendSampler()
-        self._sampling_builder = SamplingInputBuilder()
+        self.sampling_bridge: SamplingBridge | None = None
+        if get_pp_group().is_last_rank and not self.is_pooling_model:
+            self.sampling_bridge = SamplingBridge(
+                max_num_reqs=self.max_num_reqs,
+                max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),
+                max_num_batched_tokens=self.max_num_tokens,
+                vocab_size=self.model_config.get_vocab_size(),
+                device=device,
+                logprobs_mode=self.model_config.logprobs_mode,
+                speculative_config=self.vllm_config.speculative_config,
+            )
         self._noise_manager = SamplingNoiseManager(device)
         self._sampling_noise: SamplingNoise | None = None
         self.attn_state: AscendAttentionState | None = None
@@ -2334,6 +2337,8 @@ class NPUModelRunner(GPUModelRunner):
         sampling_metadata: SamplingMetadata,
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> bool:
+        if self.sampling_bridge is None:
+            return False
         if self.device.type != "npu":
             return False
         if sampling_metadata.max_num_logprobs is not None:
@@ -2349,6 +2354,7 @@ class NPUModelRunner(GPUModelRunner):
         return (
             self.speculative_config is not None
             and self.speculative_config.rejection_sample_method == "probabilistic"
+            and self.sampling_bridge.rejection_sampler is not None
         )
 
     def _prepare_sampling_noise(
@@ -2378,59 +2384,37 @@ class NPUModelRunner(GPUModelRunner):
         spec_decode_metadata: SpecDecodeMetadata | None,
         sampling_metadata: SamplingMetadata,
         noise: SamplingNoise,
-    ) -> SamplerOutput:
+    ) -> SamplerOutput | None:
+        assert self.sampling_bridge is not None
+        bridge_input = self.sampling_bridge.prepare(
+            self.input_batch,
+            self.requests,
+            self.input_ids.gpu,
+            self.positions,
+            self.logits_indices,
+            spec_decode_metadata,
+        )
+        if bridge_input is None:
+            return None
+
         self._noise_manager.wait(noise)
         if spec_decode_metadata is None:
-            processed_logits, greedy_tokens = process_regular_logits(
-                self.sampler, logits, sampling_metadata
-            )
-            sampled = sample_processed_logits(
-                processed_logits,
-                sampling_metadata,
+            del sampling_metadata
+            return self.sampling_bridge.sample_regular(
+                logits,
+                bridge_input,
                 noise.sampling_gumbel,
-                greedy_tokens,
-            )
-            return SamplerOutput(
-                sampled_token_ids=sampled.to(torch.int32).view(-1, 1),
-                logprobs_tensors=None,
             )
 
         assert noise.acceptance_uniform is not None
         assert noise.recovery_gumbel is not None
-        num_reqs = self.input_batch.num_reqs
-        num_speculative_steps = self.speculative_config.num_speculative_tokens
-        temperature = temperature_for_sampling(
-            sampling_metadata, num_reqs, logits.device
-        )
-        spec_inputs = self._sampling_builder.build_spec_inputs(
-            spec_decode_metadata,
-            self.input_ids.gpu,
-            self.positions,
-            temperature,
-            num_speculative_steps,
-        )
-        processed_logits = process_spec_logits(
-            self.sampler,
-            self.rejection_sampler,
+        del sampling_metadata
+        return self.sampling_bridge.sample_spec(
             logits,
-            sampling_metadata,
-            spec_decode_metadata,
-        )
-        sampled, _ = sample_with_rejection(
-            processed_logits,
-            spec_inputs.draft_tokens,
-            None,
-            spec_inputs.cu_num_logits,
-            spec_inputs.positions,
-            spec_inputs.idx_mapping,
-            spec_inputs.expanded_idx_mapping,
-            spec_inputs.expanded_local_pos,
-            spec_inputs.temperature,
+            bridge_input,
             noise.acceptance_uniform,
             noise.recovery_gumbel,
-            num_speculative_steps,
         )
-        return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
@@ -2446,9 +2430,11 @@ class NPUModelRunner(GPUModelRunner):
                 sampling_metadata, spec_decode_metadata
             )
         ):
-            return self._run_fast_sampling(
+            sampler_output = self._run_fast_sampling(
                 logits, spec_decode_metadata, sampling_metadata, noise
             )
+            if sampler_output is not None:
+                return sampler_output
 
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:

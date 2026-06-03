@@ -485,7 +485,7 @@ def main() -> None:
     }
     print(json.dumps(payload, indent=2))
 
-    print("\\n| batch | scenario | path | mean ms | median ms | p90 ms | speedup vs v1 |")
+    print("\n| batch | scenario | path | mean ms | median ms | p90 ms | speedup vs v1 |")
     print("|---:|---|---|---:|---:|---:|---:|")
     for result in results:
         speedup = result.get("speedup_vs_v1_native")

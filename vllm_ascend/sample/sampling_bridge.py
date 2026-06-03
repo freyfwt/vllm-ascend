@@ -178,6 +178,48 @@ class SamplingNoise:
     ready_event: torch.npu.Event | None = None
 
 
+class NPUSampler(GpuSampler):
+    def apply_sampling_params(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        self.logit_bias_state.apply_logit_bias(
+            logits, expanded_idx_mapping, idx_mapping_np, pos
+        )
+
+        self.penalties_state.apply_penalties(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            input_ids,
+            expanded_local_pos,
+            self.num_speculative_tokens,
+        )
+
+        self.bad_words_state.apply_bad_words(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+            input_ids,
+            expanded_local_pos,
+        )
+
+        self.sampling_states.apply_temperature(
+            logits, expanded_idx_mapping, idx_mapping_np
+        )
+
+        self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
+
+        return self.sampling_states.apply_top_k_top_p(
+            logits, expanded_idx_mapping, idx_mapping_np
+        )
+
+
 @triton.jit
 def _post_update_kernel(
     idx_mapping_ptr,
@@ -635,7 +677,7 @@ class SamplingBridge:
             vocab_size=vocab_size,
             device=device,
         )
-        self.sampler = GpuSampler(
+        self.sampler = NPUSampler(
             max_num_reqs=max_num_reqs,
             vocab_size=vocab_size,
             device=device,

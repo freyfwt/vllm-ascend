@@ -6,6 +6,7 @@ import torch
 
 from vllm_ascend.sample.sampling_bridge import (
     GpuBatchView,
+    NPUSampler,
     SamplingBridge,
     _DeviceBackedTensor,
     _NPUStagedWriteBuffer,
@@ -38,6 +39,32 @@ def test_sample_regular_uses_upstream_sampling_params():
     assert output.sampled_token_ids.tolist() == [[0], [1]]
     assert output.num_sampled.tolist() == [1, 1]
     assert len(bridge.sampler.apply_calls) == 1
+
+
+def test_npu_sampler_apply_sampling_params_reuses_logits():
+    sampler = NPUSampler.__new__(NPUSampler)
+    sampler.num_speculative_tokens = 1
+    sampler.logit_bias_state = SimpleNamespace(apply_logit_bias=lambda logits, *args: logits.add_(1.0))
+    sampler.penalties_state = SimpleNamespace(apply_penalties=lambda *args: None)
+    sampler.bad_words_state = SimpleNamespace(apply_bad_words=lambda *args: None)
+    sampler.sampling_states = SimpleNamespace(
+        apply_temperature=lambda *args: None,
+        apply_min_p=lambda *args: None,
+        apply_top_k_top_p=lambda logits, *args: logits,
+    )
+    logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
+
+    processed = sampler.apply_sampling_params(
+        logits,
+        torch.tensor([0, 1], dtype=torch.int32),
+        np.array([0, 1], dtype=np.int32),
+        torch.tensor([0, 1], dtype=torch.int64),
+        torch.tensor([3, 4], dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32),
+    )
+
+    assert processed is logits
+    assert logits.tolist() == [[1.0, 2.0], [4.0, 1.0]]
 
 
 def test_update_requests_is_incremental_and_removes_departed_requests():
@@ -118,7 +145,7 @@ def _patched_bridge_deps():
     return patch.multiple(
         "vllm_ascend.sample.sampling_bridge",
         RequestState=_FakeRequestState,
-        GpuSampler=_FakeGpuSampler,
+        NPUSampler=_FakeGpuSampler,
     )
 
 

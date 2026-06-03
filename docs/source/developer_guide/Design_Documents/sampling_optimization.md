@@ -171,28 +171,32 @@ Additional batch sweep for vocab size `151936`:
 ```bash
 python benchmarks/ops/bench_sampling_paths.py \
   --batch-size <batch_size> --vocab-size 151936 --spec-steps 3 \
-  --warmups 5 --iterations 20
+  --warmups 3 --iterations 20
 ```
+
+This sweep uses the formal continuous-flow timing: every row includes stable
+`update_requests`, `bind_batch`, sampling, and `post_update` on the same request
+batch.
 
 Regular sampling batch sweep:
 
-| Batch size | V1 original ms | V2 native ms | V2 native speedup | Our optimized ms | Our speedup |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 0.659 | 1.559 | 0.42x | 0.217 | 3.03x |
-| 8 | 0.647 | 9.856 | 0.07x | 0.223 | 2.90x |
-| 32 | 0.996 | 38.637 | 0.03x | 0.221 | 4.50x |
-| 64 | 1.650 | 76.697 | 0.02x | 0.249 | 6.62x |
-| 96 | 2.412 | 114.786 | 0.02x | 0.526 | 4.59x |
+| Batch size | V1 native mean ms | V2 native mean ms | V2 optimized mean ms |
+|---:|---:|---:|---:|
+| 1 | 1.080 | 1.965 | 0.886 |
+| 8 | 1.025 | 10.315 | 0.937 |
+| 32 | 1.207 | 39.117 | 0.883 |
+| 64 | 1.855 | 77.141 | 0.890 |
+| 96 | 2.591 | 115.234 | 0.909 |
 
 Speculative rejection sampling batch sweep:
 
-| Batch size | V1 original ms | V2 native ms | V2 native speedup | Our optimized ms | Our speedup |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 2.627 | 2.872 | 0.91x | 1.854 | 1.42x |
-| 8 | 2.047 | 10.746 | 0.19x | 1.592 | 1.29x |
-| 32 | 3.371 | 39.028 | 0.09x | 1.962 | 1.72x |
-| 64 | 5.959 | 77.021 | 0.08x | 3.365 | 1.77x |
-| 96 | 8.848 | 115.378 | 0.08x | 5.209 | 1.70x |
+| Batch size | V1 native mean ms | V2 native mean ms | V2 optimized mean ms |
+|---:|---:|---:|---:|
+| 1 | 2.722 | 2.505 | 1.506 |
+| 8 | 3.020 | 10.690 | 1.569 |
+| 32 | 3.644 | 38.818 | 1.675 |
+| 64 | 6.272 | 76.176 | 2.430 |
+| 96 | 9.101 | 113.981 | 3.343 |
 
 Conclusions:
 

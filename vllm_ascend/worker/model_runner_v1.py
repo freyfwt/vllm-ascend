@@ -297,6 +297,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.sampling_bridge: SamplingBridge | None = None
+        self._noise_manager: NoiseManager | None = None
         if get_pp_group().is_last_rank and not self.is_pooling_model:
             self.sampling_bridge = SamplingBridge(
                 max_num_reqs=self.max_num_reqs,
@@ -307,8 +308,8 @@ class NPUModelRunner(GPUModelRunner):
                 logprobs_mode=self.model_config.logprobs_mode,
                 speculative_config=self.vllm_config.speculative_config,
             )
-        self._noise_manager = NoiseManager(device)
-        self._sample_batch = None
+            self._noise_manager = NoiseManager(device)
+        self._sampling_batch = None
         self._sampling_noise: SamplingNoise | None = None
         self.attn_state: AscendAttentionState | None = None
 
@@ -1985,21 +1986,15 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False  # type: ignore[has-type]
-        self._sample_batch = None
+        self._sampling_batch = None
         self._sampling_noise = None
-        preserve_original_logits = self._needs_raw_logits(self.input_batch.sampling_metadata)
         sampling_bridge = self.sampling_bridge
         if (
             sampling_bridge is not None
-            and self._can_fast_sample(spec_decode_metadata, preserve_original_logits)
+            and self._can_fast_sample(spec_decode_metadata)
             and sampling_bridge.update_requests(self.input_batch, self.requests)
         ):
-            dcp_local_seq_lens = (
-                self.dcp_local_seq_lens.gpu[:num_reqs]
-                if self.dcp_world_size > 1
-                else None
-            )
-            self._sample_batch = sampling_bridge.bind_batch(
+            self._sampling_batch = sampling_bridge.bind_batch(
                 self.input_batch,
                 self.input_ids.gpu,
                 self.positions,
@@ -2009,7 +2004,6 @@ class NPUModelRunner(GPUModelRunner):
                 query_start_loc_np=self.query_start_loc.np[: num_reqs + 1],
                 seq_lens=self.seq_lens[:num_reqs],
                 seq_lens_cpu_upper_bound=self.optimistic_seq_lens_cpu[:num_reqs],
-                dcp_local_seq_lens=dcp_local_seq_lens,
             )
             self._sampling_noise = self._make_noise(
                 spec_decode_metadata,
@@ -2018,7 +2012,12 @@ class NPUModelRunner(GPUModelRunner):
         else:
             if sampling_bridge is not None:
                 sampling_bridge.reset()
-            self._start_legacy_async_noise(logits_indices)
+            if self.ascend_config.enable_async_exponential:
+                self.sampler.do_async_exponential(
+                    b_s=logits_indices.shape[0],
+                    head_dim=self.model_config.get_vocab_size(),
+                    generators=self.input_batch.sampling_metadata.generators,
+                )
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
@@ -2212,7 +2211,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
-        self._update_sample_state(sampler_output)
+        self._update_sampling_state(sampler_output)
 
         (
             logprobs_lists,
@@ -2359,18 +2358,24 @@ class NPUModelRunner(GPUModelRunner):
     def _can_fast_sample(
         self,
         spec_decode_metadata: SpecDecodeMetadata | None,
-        needs_raw_logits: bool,
     ) -> bool:
         sampling_bridge = getattr(self, "sampling_bridge", None)
         if sampling_bridge is None:
             return False
         if self.device.type != "npu":
             return False
-        if needs_raw_logits:
+        sampling_metadata = self.input_batch.sampling_metadata
+        if sampling_metadata.max_num_logprobs is not None:
+            return False
+        if getattr(sampling_metadata, "logprob_token_ids", None):
+            return False
+        if sampling_bridge.sampler.compute_nans:
             return False
         if lmhead_tp_enable():
             return False
         if self.ascend_config.enable_reduce_sample:
+            return False
+        if self.ascend_config.enable_async_exponential:
             return False
         num_reqs = self.input_batch.num_reqs
         if np.any(self.discard_request_mask.np[:num_reqs]):
@@ -2383,24 +2388,12 @@ class NPUModelRunner(GPUModelRunner):
             and sampling_bridge.rejection_sampler is not None
         )
 
-    def _needs_raw_logits(
-        self,
-        sampling_metadata: SamplingMetadata,
-    ) -> bool:
-        if sampling_metadata.max_num_logprobs is not None:
-            return True
-        if getattr(sampling_metadata, "logprob_token_ids", None):
-            return True
-        return (
-            (sampling_bridge := getattr(self, "sampling_bridge", None)) is not None
-            and sampling_bridge.sampler.compute_nans
-        )
-
     def _make_noise(
         self,
         spec_decode_metadata: SpecDecodeMetadata | None,
         logits_indices: torch.Tensor,
     ) -> SamplingNoise:
+        assert self._noise_manager is not None
         sampling_metadata = self.input_batch.sampling_metadata
         vocab_size = self.model_config.get_vocab_size()
         if spec_decode_metadata is None:
@@ -2417,41 +2410,30 @@ class NPUModelRunner(GPUModelRunner):
             sampling_metadata,
         )
 
-    def _start_legacy_async_noise(self, logits_indices: torch.Tensor) -> None:
-        if not self.ascend_config.enable_async_exponential:
-            return
-        self.sampler.do_async_exponential(
-            b_s=logits_indices.shape[0],
-            head_dim=self.model_config.get_vocab_size(),
-            generators=self.input_batch.sampling_metadata.generators,
-        )
-
     def _fast_sample(
         self,
         logits: torch.Tensor,
         spec_decode_metadata: SpecDecodeMetadata | None,
-        sample_batch: Any,
+        sampling_batch: Any,
         noise: SamplingNoise,
-        needs_raw_logits: bool,
     ) -> SamplerOutput:
         assert self.sampling_bridge is not None
+        assert self._noise_manager is not None
         self._noise_manager.wait(noise)
         if spec_decode_metadata is None:
             return self.sampling_bridge.sample_regular(
                 logits,
-                sample_batch,
+                sampling_batch,
                 noise.sampling_gumbel,
-                needs_raw_logits,
             )
 
         assert noise.acceptance_uniform is not None
         assert noise.recovery_gumbel is not None
         return self.sampling_bridge.sample_spec(
             logits,
-            sample_batch,
+            sampling_batch,
             noise.acceptance_uniform,
             noise.recovery_gumbel,
-            needs_raw_logits,
         )
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -2460,27 +2442,17 @@ class NPUModelRunner(GPUModelRunner):
         sampling_metadata = self.input_batch.sampling_metadata
         self.input_batch.update_async_output_token_ids()
         noise = getattr(self, "_sampling_noise", None)
-        sample_batch = getattr(self, "_sample_batch", None)
+        sampling_batch = getattr(self, "_sampling_batch", None)
         self._sampling_noise = None
-        self._sample_batch = None
-        needs_raw_logits = self._needs_raw_logits(sampling_metadata)
-        if (
-            logits is not None
-            and noise is not None
-            and sample_batch is not None
-            and self._can_fast_sample(
-                spec_decode_metadata,
-                needs_raw_logits,
-            )
-        ):
+        self._sampling_batch = None
+        if logits is not None and noise is not None and sampling_batch is not None:
             sampler_output = self._fast_sample(
                 logits,
                 spec_decode_metadata,
-                sample_batch,
+                sampling_batch,
                 noise,
-                needs_raw_logits,
             )
-            self._sample_batch = sample_batch
+            self._sampling_batch = sampling_batch
             return sampler_output
         elif (sampling_bridge := getattr(self, "sampling_bridge", None)) is not None:
             sampling_bridge.reset()
@@ -2509,18 +2481,18 @@ class NPUModelRunner(GPUModelRunner):
         )
         return sampler_output
 
-    def _update_sample_state(self, sampler_output: SamplerOutput) -> None:
-        sample_batch = getattr(self, "_sample_batch", None)
-        self._sample_batch = None
+    def _update_sampling_state(self, sampler_output: SamplerOutput) -> None:
+        sampling_batch = getattr(self, "_sampling_batch", None)
+        self._sampling_batch = None
         num_sampled = getattr(sampler_output, "num_sampled", None)
         if (
-            sample_batch is None
+            sampling_batch is None
             or num_sampled is None
             or (sampling_bridge := getattr(self, "sampling_bridge", None)) is None
         ):
             return
         sampling_bridge.post_update(
-            sample_batch,
+            sampling_batch,
             sampler_output.sampled_token_ids,
             num_sampled,
         )

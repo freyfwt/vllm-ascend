@@ -76,7 +76,7 @@ class _DeviceBackedTensor:
         return self.gpu[:n]
 
 
-class _DeviceStagedWriteTensor:
+class _NPUStagedWriteBuffer:
     def __init__(
         self,
         size: int | Sequence[int],
@@ -158,7 +158,7 @@ def _install_npu_sampling_buffer_overrides(device: torch.device) -> None:
     from vllm.v1.worker.gpu.sample import states as sampling_states_module
 
     for module in (request_states_module, bad_words_module, logit_bias_module):
-        module.StagedWriteTensor = _DeviceStagedWriteTensor
+        module.StagedWriteTensor = _NPUStagedWriteBuffer
     for module in (
         request_states_module,
         sampling_states_module,
@@ -268,7 +268,6 @@ class GpuBatchView:
         query_start_loc_np: np.ndarray,
         seq_lens: torch.Tensor,
         seq_lens_cpu_upper_bound: torch.Tensor,
-        dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> GpuInputBatch:
         num_reqs = len(req_ids)
         cu_num_logits = self._arange_buffer("regular_cu_num_logits", num_reqs + 1)
@@ -287,7 +286,6 @@ class GpuBatchView:
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            dcp_local_seq_lens=dcp_local_seq_lens,
             input_ids=input_ids,
             positions=positions,
             logits_indices=logits_indices,
@@ -309,7 +307,6 @@ class GpuBatchView:
         seq_lens: torch.Tensor,
         seq_lens_cpu_upper_bound: torch.Tensor,
         num_speculative_steps: int,
-        dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> GpuInputBatch:
         num_reqs = len(metadata.num_draft_tokens)
         num_logits = int(metadata.logits_indices.shape[0])
@@ -342,7 +339,6 @@ class GpuBatchView:
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            dcp_local_seq_lens=dcp_local_seq_lens,
             input_ids=input_ids,
             positions=positions,
             logits_indices=metadata.logits_indices,
@@ -369,7 +365,6 @@ class GpuBatchView:
         query_start_loc_np: np.ndarray,
         seq_lens: torch.Tensor,
         seq_lens_cpu_upper_bound: torch.Tensor,
-        dcp_local_seq_lens: torch.Tensor | None,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         logits_indices: torch.Tensor,
@@ -392,7 +387,7 @@ class GpuBatchView:
         batch.query_start_loc_np = query_start_loc_np
         batch.seq_lens = seq_lens
         batch.seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound
-        batch.dcp_local_seq_lens = dcp_local_seq_lens
+        batch.dcp_local_seq_lens = None
         batch.input_ids = input_ids
         batch.positions = positions
         batch.logits_indices = logits_indices
@@ -531,6 +526,8 @@ class NoiseManager:
 
     def _record_noise(self, fill) -> None:
         current_stream = torch.npu.current_stream()
+        # Noise buffers are reused across iterations; do not overwrite them
+        # while the current stream may still be reading the previous contents.
         self._stream.wait_stream(current_stream)
         with torch.npu.stream(self._stream):
             fill()
@@ -576,71 +573,6 @@ def sample_logits(
     )
 
 
-def apply_params(
-    sampler: GpuSampler,
-    logits: torch.Tensor,
-    expanded_idx_mapping: torch.Tensor,
-    idx_mapping_np: np.ndarray,
-    pos: torch.Tensor,
-    input_ids: torch.Tensor,
-    expanded_local_pos: torch.Tensor,
-    preserve_original_logits: bool,
-) -> torch.Tensor:
-    if preserve_original_logits:
-        # Delegate to the upstream implementation when raw logits must remain
-        # available for later consumers such as raw logprobs.
-        return sampler.apply_sampling_params(
-            logits,
-            expanded_idx_mapping,
-            idx_mapping_np,
-            pos,
-            input_ids,
-            expanded_local_pos,
-        )
-
-    if logits.dtype == torch.float32:
-        processed_logits = logits
-    else:
-        processed_logits = logits.to(torch.float32)
-
-    sampler.logit_bias_state.apply_logit_bias(
-        processed_logits,
-        expanded_idx_mapping,
-        idx_mapping_np,
-        pos,
-    )
-    sampler.penalties_state.apply_penalties(
-        processed_logits,
-        expanded_idx_mapping,
-        idx_mapping_np,
-        input_ids,
-        expanded_local_pos,
-        sampler.num_speculative_tokens,
-    )
-    sampler.bad_words_state.apply_bad_words(
-        processed_logits,
-        expanded_idx_mapping,
-        idx_mapping_np,
-        input_ids,
-        expanded_local_pos,
-    )
-    sampler.sampling_states.apply_temperature(
-        processed_logits,
-        expanded_idx_mapping,
-        idx_mapping_np,
-    )
-    sampler.sampling_states.apply_min_p(
-        processed_logits,
-        expanded_idx_mapping,
-        idx_mapping_np,
-    )
-    return sampler.sampling_states.apply_top_k_top_p(
-        processed_logits,
-        expanded_idx_mapping,
-        idx_mapping_np,
-    )
-
-
 class NPURejectionSampler(GpuRejectionSampler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -652,22 +584,19 @@ class NPURejectionSampler(GpuRejectionSampler):
         input_batch: GpuInputBatch,
         acceptance_uniform: torch.Tensor,
         recovery_gumbel: torch.Tensor,
-        preserve_original_logits: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.rejection_sample_method != "probabilistic":
             raise RuntimeError("fast sampling only supports probabilistic rejection")
 
         draft_tokens = input_batch.input_ids[input_batch.logits_indices]
         pos = input_batch.positions[input_batch.logits_indices]
-        processed_logits = apply_params(
-            self.sampler,
+        processed_logits = self.sampler.apply_sampling_params(
             logits,
             input_batch.expanded_idx_mapping,
             input_batch.idx_mapping_np,
             pos,
             draft_tokens,
             input_batch.expanded_local_pos,
-            preserve_original_logits,
         )
         return rejection_sample(
             processed_logits,
@@ -737,7 +666,6 @@ class SamplingBridge:
         query_start_loc_np: np.ndarray | None = None,
         seq_lens: torch.Tensor | None = None,
         seq_lens_cpu_upper_bound: torch.Tensor | None = None,
-        dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> GpuInputBatch:
         req_ids = list(input_batch.req_ids)
         num_reqs = len(req_ids)
@@ -771,7 +699,6 @@ class SamplingBridge:
                 query_start_loc_np,
                 seq_lens,
                 seq_lens_cpu_upper_bound,
-                dcp_local_seq_lens,
             )
 
         return self._batch_view.bind_spec(
@@ -786,7 +713,6 @@ class SamplingBridge:
             seq_lens,
             seq_lens_cpu_upper_bound,
             self.req_states.num_speculative_steps,
-            dcp_local_seq_lens,
         )
 
     def sample_regular(
@@ -794,19 +720,16 @@ class SamplingBridge:
         logits: torch.Tensor,
         input_batch: GpuInputBatch,
         sampling_gumbel: torch.Tensor | None,
-        preserve_original_logits: bool = True,
     ) -> SamplerOutput:
         pos = input_batch.positions[input_batch.logits_indices]
         input_ids = input_batch.input_ids[input_batch.logits_indices]
-        processed_logits = apply_params(
-            self.sampler,
+        processed_logits = self.sampler.apply_sampling_params(
             logits,
             input_batch.expanded_idx_mapping,
             input_batch.idx_mapping_np,
             pos,
             input_ids,
             input_batch.expanded_local_pos,
-            preserve_original_logits,
         )
         sampled = sample_logits(
             processed_logits,
@@ -828,7 +751,6 @@ class SamplingBridge:
         input_batch: GpuInputBatch,
         acceptance_uniform: torch.Tensor,
         recovery_gumbel: torch.Tensor,
-        preserve_original_logits: bool = True,
     ) -> SamplerOutput:
         if self.rejection_sampler is None:
             raise RuntimeError("rejection sampler is required for spec decoding")
@@ -837,7 +759,6 @@ class SamplingBridge:
             input_batch,
             acceptance_uniform,
             recovery_gumbel,
-            preserve_original_logits,
         )
         return SamplerOutput(
             sampled_token_ids=sampled,

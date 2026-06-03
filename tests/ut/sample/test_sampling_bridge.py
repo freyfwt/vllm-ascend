@@ -8,7 +8,7 @@ from vllm_ascend.sample.sampling_bridge import (
     GpuBatchView,
     SamplingBridge,
     _DeviceBackedTensor,
-    _DeviceStagedWriteTensor,
+    _NPUStagedWriteBuffer,
     sample_logits,
 )
 
@@ -23,7 +23,7 @@ def test_sample_logits_modes():
     assert sample_logits(logits, torch.empty(0), mapping, gumbel, all_random=True).tolist() == [0, 1]
 
 
-def test_sample_regular_can_reuse_or_mutate_logits():
+def test_sample_regular_uses_upstream_sampling_params():
     bridge = SamplingBridge.__new__(SamplingBridge)
     bridge._batch_view = GpuBatchView(2, torch.device("cpu"))
     bridge.sampler = _FakeSampler(torch.ones(2))
@@ -38,11 +38,6 @@ def test_sample_regular_can_reuse_or_mutate_logits():
     assert output.sampled_token_ids.tolist() == [[0], [1]]
     assert output.num_sampled.tolist() == [1, 1]
     assert len(bridge.sampler.apply_calls) == 1
-
-    bridge.sampler = _FakeInplaceSampler(torch.ones(2))
-    logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
-    bridge.sample_regular(logits, input_batch, torch.zeros_like(logits), preserve_original_logits=False)
-    assert logits.tolist() == [[1.0, 2.0], [4.0, 1.0]]
 
 
 def test_update_requests_is_incremental_and_removes_departed_requests():
@@ -111,7 +106,7 @@ def test_device_backed_and_staged_tensors_copy_to_device():
     backed.copy_to_uva(2)
     assert backed.gpu.tolist() == [1, 2, 0, 0]
 
-    staged = _DeviceStagedWriteTensor((2, 4), torch.int32, torch.device("cpu"))
+    staged = _NPUStagedWriteBuffer((2, 4), torch.int32, torch.device("cpu"))
     staged.stage_write(0, 1, (idx for idx in [3, 4]))
     staged.stage_write(1, 0, [5])
     staged.apply_write()
@@ -159,20 +154,6 @@ class _FakeSampler:
     def apply_sampling_params(self, *args):
         self.apply_calls.append(args)
         return args[0].to(torch.float32)
-
-
-class _FakeInplaceSampler:
-    def __init__(self, temperature):
-        self.num_speculative_tokens = 1
-        self.logit_bias_state = SimpleNamespace(apply_logit_bias=lambda logits, *args: logits.add_(1.0))
-        self.penalties_state = SimpleNamespace(apply_penalties=lambda *args: None)
-        self.bad_words_state = SimpleNamespace(apply_bad_words=lambda *args: None)
-        self.sampling_states = SimpleNamespace(
-            temperature=_FakeTemperature(temperature),
-            apply_temperature=lambda *args: None,
-            apply_min_p=lambda *args: None,
-            apply_top_k_top_p=lambda logits, *args: logits,
-        )
 
 
 class _FakeRequestState:

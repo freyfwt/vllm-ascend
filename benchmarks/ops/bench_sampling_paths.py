@@ -326,7 +326,6 @@ def run_batch_size(
                 regular_logits,
                 sample_batch,
                 regular_gumbel,
-                preserve_original_logits=False,
             )
             regular_v2_optimized_flow.bridge.post_update(
                 sample_batch,
@@ -440,7 +439,6 @@ def run_batch_size(
                 sample_batch,
                 rejection_acceptance_uniform,
                 rejection_recovery_gumbel,
-                preserve_original_logits=False,
             )
             spec_v2_optimized_flow.bridge.post_update(
                 sample_batch,

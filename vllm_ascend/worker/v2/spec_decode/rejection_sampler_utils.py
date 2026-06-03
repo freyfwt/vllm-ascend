@@ -19,43 +19,11 @@
 
 import torch
 from vllm.triton_utils import tl, triton
-
-
-@triton.jit
-def _compute_block_max_and_sumexp(logits):
-    block_max = tl.max(logits, axis=0)
-    block_sumexp = tl.where(
-        block_max > float("-inf"),
-        tl.sum(tl.exp(logits - block_max)),
-        0.0,
-    )
-    return block_max, block_sumexp
-
-
-@triton.jit
-def _compute_global_lse(
-    local_max_ptr,
-    local_max_stride,
-    local_sumexp_ptr,
-    local_sumexp_stride,
-    logit_idx,
-    vocab_num_blocks,
-    PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
-):
-    blocks = tl.arange(0, PADDED_VOCAB_NUM_BLOCKS)
-    mask = blocks < vocab_num_blocks
-    maxes = tl.load(
-        local_max_ptr + logit_idx * local_max_stride + blocks,
-        mask=mask,
-        other=float("-inf"),
-    )
-    sumexps = tl.load(
-        local_sumexp_ptr + logit_idx * local_sumexp_stride + blocks,
-        mask=mask,
-        other=0.0,
-    )
-    global_max = tl.max(maxes, axis=0)
-    return global_max + tl.log(tl.sum(sumexps * tl.exp(maxes - global_max)))
+from vllm.v1.worker.gpu.spec_decode.probabilistic_rejection_sampler_utils import (
+    _compute_block_max_and_sumexp,
+    _compute_global_lse,
+    _insert_resampled_kernel,
+)
 
 
 @triton.jit
@@ -135,46 +103,6 @@ def _compute_block_stats_kernel(
             draft_local_sumexp_ptr + logit_idx * draft_local_sumexp_stride + block_idx,
             draft_sumexp,
         )
-
-
-@triton.jit
-def _insert_resampled_kernel(
-    sampled_ptr,
-    sampled_stride,
-    num_sampled_ptr,
-    resampled_local_argmax_ptr,
-    resampled_local_argmax_stride,
-    resampled_local_max_ptr,
-    resampled_local_max_stride,
-    resample_num_blocks,
-    cu_num_logits_ptr,
-    expanded_idx_mapping_ptr,
-    temperature_ptr,
-    PADDED_RESAMPLE_NUM_BLOCKS: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    num_sampled = tl.load(num_sampled_ptr + req_idx)
-    start_idx = tl.load(cu_num_logits_ptr + req_idx)
-    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
-    resample_token_idx = start_idx + num_sampled
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx)
-    temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
-    is_bonus = resample_token_idx == end_idx - 1
-
-    tl.store(num_sampled_ptr + req_idx, num_sampled + 1)
-    if temperature == 0.0 and not is_bonus:
-        return
-
-    blocks = tl.arange(0, PADDED_RESAMPLE_NUM_BLOCKS)
-    mask = blocks < resample_num_blocks
-    local_max = tl.load(
-        resampled_local_max_ptr + req_idx * resampled_local_max_stride + blocks,
-        mask=mask,
-        other=float("-inf"),
-    )
-    max_block_idx = tl.argmax(local_max, axis=0)
-    resampled = tl.load(resampled_local_argmax_ptr + req_idx * resampled_local_argmax_stride + max_block_idx)
-    tl.store(sampled_ptr + req_idx * sampled_stride + num_sampled, resampled)
 
 
 @triton.jit

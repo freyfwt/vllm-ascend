@@ -1,18 +1,4 @@
-#
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# This file is a part of the vllm-ascend project.
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -26,6 +12,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu.input_batch import InputBatch as GpuInputBatch
+from vllm.v1.worker.gpu.input_batch import expand_idx_mapping
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler as GpuSampler
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
@@ -40,6 +27,25 @@ from vllm_ascend.sample.rejection_ops import (
 
 _SAMPLING_EPS = 1e-5
 _NPU_BUFFER_OVERRIDES_INSTALLED = False
+
+
+def _buffer_slice(
+    buffers: dict[str, torch.Tensor],
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    buffer = buffers.get(name)
+    if (
+        buffer is None
+        or buffer.dtype != dtype
+        or buffer.device != device
+        or any(buffer.shape[i] < shape[i] for i in range(len(shape)))
+    ):
+        buffer = torch.empty(shape, dtype=dtype, device=device)
+        buffers[name] = buffer
+    return buffer[tuple(slice(0, dim) for dim in shape)]
 
 
 class _DeviceBackedTensor:
@@ -151,14 +157,16 @@ def _install_npu_sampling_buffer_overrides(device: torch.device) -> None:
     from vllm.v1.worker.gpu.sample import penalties as penalties_module
     from vllm.v1.worker.gpu.sample import states as sampling_states_module
 
-    request_states_module.StagedWriteTensor = _DeviceStagedWriteTensor
-    request_states_module.UvaBackedTensor = _DeviceBackedTensor
-    sampling_states_module.UvaBackedTensor = _DeviceBackedTensor
-    penalties_module.UvaBackedTensor = _DeviceBackedTensor
-    bad_words_module.StagedWriteTensor = _DeviceStagedWriteTensor
-    bad_words_module.UvaBackedTensor = _DeviceBackedTensor
-    logit_bias_module.StagedWriteTensor = _DeviceStagedWriteTensor
-    logit_bias_module.UvaBackedTensor = _DeviceBackedTensor
+    for module in (request_states_module, bad_words_module, logit_bias_module):
+        module.StagedWriteTensor = _DeviceStagedWriteTensor
+    for module in (
+        request_states_module,
+        sampling_states_module,
+        penalties_module,
+        bad_words_module,
+        logit_bias_module,
+    ):
+        module.UvaBackedTensor = _DeviceBackedTensor
     _NPU_BUFFER_OVERRIDES_INSTALLED = True
 
 
@@ -168,25 +176,6 @@ class SamplingNoise:
     sampling_gumbel: torch.Tensor | None = None
     recovery_gumbel: torch.Tensor | None = None
     ready_event: torch.npu.Event | None = None
-
-
-@triton.jit
-def _fill_spec_decode_mapping_kernel(
-    cu_num_logits_ptr,
-    idx_mapping_ptr,
-    expanded_idx_mapping_ptr,
-    expanded_local_pos_ptr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
-    start_idx = tl.load(cu_num_logits_ptr + req_idx)
-    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
-    local_pos = tl.arange(0, BLOCK_SIZE)
-    offset = start_idx + local_pos
-    mask = offset < end_idx
-    tl.store(expanded_idx_mapping_ptr + offset, req_state_idx, mask=mask)
-    tl.store(expanded_local_pos_ptr + offset, local_pos, mask=mask)
 
 
 @triton.jit
@@ -232,10 +221,6 @@ def _post_update_kernel(
     tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + num_sampled)
 
 
-def _next_power_of_2(value: int) -> int:
-    return 1 << (value - 1).bit_length()
-
-
 class GpuBatchView:
     def __init__(self, max_num_reqs: int, device: torch.device) -> None:
         self._max_num_reqs = max_num_reqs
@@ -243,7 +228,6 @@ class GpuBatchView:
         self._buffers: dict[str, torch.Tensor] = {}
         self._np_buffers: dict[str, np.ndarray] = {}
         self._regular_num_scheduled_tokens = np.ones(max_num_reqs, dtype=np.int32)
-        self._spec_mapping_cache_key: tuple[int, tuple[int, ...], int] | None = None
         self._empty_np = np.empty(0, dtype=np.int32)
         empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
         empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
@@ -326,43 +310,24 @@ class GpuBatchView:
         seq_lens_cpu_upper_bound: torch.Tensor,
         num_speculative_steps: int,
         dcp_local_seq_lens: torch.Tensor | None = None,
-        mapping_generation: int | None = None,
     ) -> GpuInputBatch:
         num_reqs = len(metadata.num_draft_tokens)
         num_logits = int(metadata.logits_indices.shape[0])
-        draft_token_key = tuple(int(num_draft) for num_draft in metadata.num_draft_tokens)
-        cache_key = None if mapping_generation is None else (mapping_generation, draft_token_key, num_logits)
-
         cu_num_logits = self._buffer("spec_cu_num_logits", (num_reqs + 1,), torch.int32)
         num_logits_per_req = self._np_buffer("spec_num_logits_per_req", num_reqs)
         cu_num_logits_np = self._np_buffer("spec_cu_num_logits_np", num_reqs + 1)
 
-        expanded_idx_mapping = self._buffer(
-            "spec_expanded_idx_mapping",
-            (num_logits,),
-            torch.int32,
+        cu_num_logits[0] = 0
+        cu_num_logits[1:].copy_(metadata.cu_num_sampled_tokens, non_blocking=True)
+        num_logits_per_req[:] = np.asarray(metadata.num_draft_tokens, dtype=np.int32) + 1
+        cu_num_logits_np[0] = 0
+        np.cumsum(num_logits_per_req, out=cu_num_logits_np[1:])
+        expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+            idx_mapping,
+            num_logits,
+            cu_num_logits,
+            num_speculative_steps + 1,
         )
-        expanded_local_pos = self._buffer(
-            "spec_expanded_local_pos",
-            (num_logits,),
-            torch.int32,
-        )
-        if cache_key is None or cache_key != self._spec_mapping_cache_key:
-            cu_num_logits[0] = 0
-            cu_num_logits[1:].copy_(metadata.cu_num_sampled_tokens, non_blocking=True)
-            num_logits_per_req[:] = np.asarray(metadata.num_draft_tokens, dtype=np.int32) + 1
-            cu_num_logits_np[0] = 0
-            np.cumsum(num_logits_per_req, out=cu_num_logits_np[1:])
-            block_size = _next_power_of_2(num_speculative_steps + 1)
-            _fill_spec_decode_mapping_kernel[(num_reqs,)](
-                cu_num_logits,
-                idx_mapping,
-                expanded_idx_mapping,
-                expanded_local_pos,
-                BLOCK_SIZE=block_size,
-                num_warps=1,
-            )
-            self._spec_mapping_cache_key = cache_key
 
         self._set_common_fields(
             req_ids=req_ids,
@@ -441,16 +406,7 @@ class GpuBatchView:
         shape: tuple[int, ...],
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        buffer = self._buffers.get(name)
-        if (
-            buffer is None
-            or buffer.dtype != dtype
-            or buffer.device != self._device
-            or any(buffer.shape[i] < shape[i] for i in range(len(shape)))
-        ):
-            buffer = torch.empty(shape, dtype=dtype, device=self._device)
-            self._buffers[name] = buffer
-        return buffer[tuple(slice(0, dim) for dim in shape)]
+        return _buffer_slice(self._buffers, name, shape, dtype, self._device)
 
     def _zero_buffer(
         self,
@@ -503,79 +459,6 @@ class GpuBatchView:
         if getattr(self, cached_size_name, 0) < size:
             out[:] = np.arange(size, dtype=np.int32)
             setattr(self, cached_size_name, size)
-        return out
-
-
-class SamplingInputBuilder(GpuBatchView):
-    def build_regular_inputs(
-        self,
-        req_ids: list[str],
-        idx_mapping_np: np.ndarray,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        logits_indices: torch.Tensor,
-    ) -> GpuInputBatch:
-        idx_mapping = self._copy_idx_mapping(idx_mapping_np)
-        query_start_loc = self._arange_buffer("compat_regular_query_start_loc", len(req_ids) + 1)
-        query_start_loc_np = self._arange_np("compat_regular_query_start_loc_np", len(req_ids) + 1)
-        seq_lens = self._zero_buffer("compat_regular_seq_lens", len(req_ids))
-        seq_lens_cpu_upper_bound = torch.from_numpy(self._regular_num_scheduled_tokens[: len(req_ids)])
-        return self.bind_regular(
-            req_ids,
-            idx_mapping,
-            idx_mapping_np,
-            input_ids,
-            positions,
-            logits_indices,
-            query_start_loc,
-            query_start_loc_np,
-            seq_lens,
-            seq_lens_cpu_upper_bound,
-        )
-
-    def build_spec_inputs(
-        self,
-        req_ids: list[str],
-        idx_mapping_np: np.ndarray,
-        metadata: SpecDecodeMetadata,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        num_speculative_steps: int,
-    ) -> GpuInputBatch:
-        idx_mapping = self._copy_idx_mapping(idx_mapping_np)
-        query_start_loc = self._buffer(
-            "compat_spec_query_start_loc",
-            (len(req_ids) + 1,),
-            torch.int32,
-        )
-        query_start_loc[0] = 0
-        query_start_loc[1:].copy_(metadata.cu_num_sampled_tokens, non_blocking=True)
-        query_start_loc_np = self._np_buffer("compat_spec_query_start_loc_np", len(req_ids) + 1)
-        query_start_loc_np[0] = 0
-        np.cumsum(
-            np.asarray(metadata.num_draft_tokens, dtype=np.int32) + 1,
-            out=query_start_loc_np[1:],
-        )
-        seq_lens = self._zero_buffer("compat_spec_seq_lens", len(req_ids))
-        seq_lens_cpu_upper_bound = torch.from_numpy(query_start_loc_np[1:].copy())
-        return self.bind_spec(
-            req_ids,
-            idx_mapping,
-            idx_mapping_np,
-            metadata,
-            input_ids,
-            positions,
-            query_start_loc,
-            query_start_loc_np,
-            seq_lens,
-            seq_lens_cpu_upper_bound,
-            num_speculative_steps,
-        )
-
-    def _copy_idx_mapping(self, idx_mapping_np: np.ndarray) -> torch.Tensor:
-        values = idx_mapping_np.astype(np.int32, copy=False)
-        out = self._buffer("compat_idx_mapping", (int(values.shape[0]),), torch.int32)
-        out.copy_(torch.from_numpy(values), non_blocking=True)
         return out
 
 
@@ -644,16 +527,7 @@ class NoiseManager:
         shape: tuple[int, ...],
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        buffer = self._buffers.get(name)
-        if (
-            buffer is None
-            or buffer.dtype != dtype
-            or buffer.device != self._device
-            or any(buffer.shape[i] < shape[i] for i in range(len(shape)))
-        ):
-            buffer = torch.empty(shape, dtype=dtype, device=self._device)
-            self._buffers[name] = buffer
-        return buffer[tuple(slice(0, dim) for dim in shape)]
+        return _buffer_slice(self._buffers, name, shape, dtype, self._device)
 
     def _record_noise(self, fill) -> None:
         current_stream = torch.npu.current_stream()
@@ -672,9 +546,6 @@ class NoiseManager:
             if req_idx < gumbel.shape[0]:
                 gumbel[req_idx].exponential_(generator=generator)
         gumbel.log_().neg_()
-
-
-SamplingNoiseManager = NoiseManager
 
 
 def sample_logits(
@@ -703,9 +574,6 @@ def sample_logits(
         greedy_tokens,
         random_tokens,
     )
-
-
-sample_processed_logits = sample_logits
 
 
 def apply_params(
@@ -773,9 +641,6 @@ def apply_params(
     )
 
 
-apply_sampling_params = apply_params
-
-
 class NPURejectionSampler(GpuRejectionSampler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -809,7 +674,6 @@ class NPURejectionSampler(GpuRejectionSampler):
             draft_tokens,
             None,
             input_batch.cu_num_logits,
-            pos,
             input_batch.idx_mapping,
             input_batch.expanded_idx_mapping,
             input_batch.expanded_local_pos,
@@ -819,9 +683,6 @@ class NPURejectionSampler(GpuRejectionSampler):
             self.num_speculative_steps,
             workspace=self._workspace,
         )
-
-
-AscendGpuRejectionBridge = NPURejectionSampler
 
 
 class SamplingBridge:
@@ -861,43 +722,9 @@ class SamplingBridge:
                 device,
             )
         self._batch_view = GpuBatchView(max_num_reqs, device)
-        self._compat_builder = SamplingInputBuilder(max_num_reqs, device)
         self._idx_mapping = torch.empty(max_num_reqs, dtype=torch.int32, device=device)
         self._idx_mapping_np_storage = np.empty(max_num_reqs, dtype=np.int32)
         self._idx_mapping_req_ids: tuple[str, ...] = ()
-        self._idx_mapping_generation = 0
-
-    def prepare(
-        self,
-        input_batch: Any,
-        requests: dict[str, Any],
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        logits_indices: torch.Tensor,
-        spec_decode_metadata: SpecDecodeMetadata | None,
-    ) -> GpuInputBatch | None:
-        if not self.update_requests(input_batch, requests):
-            return None
-
-        req_ids = list(input_batch.req_ids)
-        idx_mapping_np = self._idx_mapping_np_storage[: len(req_ids)]
-        if spec_decode_metadata is None:
-            return self._compat_builder.build_regular_inputs(
-                req_ids,
-                idx_mapping_np,
-                input_ids,
-                positions,
-                logits_indices,
-            )
-
-        return self._compat_builder.build_spec_inputs(
-            req_ids,
-            idx_mapping_np,
-            spec_decode_metadata,
-            input_ids,
-            positions,
-            self.req_states.num_speculative_steps,
-        )
 
     def bind_batch(
         self,
@@ -960,7 +787,6 @@ class SamplingBridge:
             seq_lens_cpu_upper_bound,
             self.req_states.num_speculative_steps,
             dcp_local_seq_lens,
-            mapping_generation=self._idx_mapping_generation,
         )
 
     def sample_regular(
@@ -989,16 +815,11 @@ class SamplingBridge:
             sampling_gumbel,
             *self._get_regular_sampling_modes(input_batch.idx_mapping_np),
         )
-        num_sampled = (
-            self._batch_view.num_sampled_ones(input_batch.num_reqs)
-            if hasattr(self, "_batch_view")
-            else sampled.new_ones(sampled.shape[0], dtype=torch.int32)
-        )
         return SamplerOutput(
             sampled_token_ids=sampled.to(torch.int32).view(-1, 1),
             logprobs_tensors=None,
             num_nans=None,
-            num_sampled=num_sampled,
+            num_sampled=self._batch_view.num_sampled_ones(input_batch.num_reqs),
         )
 
     def sample_spec(
@@ -1053,7 +874,6 @@ class SamplingBridge:
         for req_id in list(self.req_states.req_id_to_index):
             self.req_states.remove_request(req_id)
         self._idx_mapping_req_ids = ()
-        self._idx_mapping_generation += 1
 
     def _get_regular_sampling_modes(
         self,
@@ -1116,13 +936,6 @@ class SamplingBridge:
         self._refresh_idx_mapping(active_req_ids)
         return True
 
-    def _sync_request_states(
-        self,
-        input_batch: Any,
-        requests: dict[str, Any],
-    ) -> bool:
-        return self.update_requests(input_batch, requests)
-
     def _refresh_idx_mapping(self, req_ids: tuple[str, ...]) -> None:
         if req_ids == self._idx_mapping_req_ids:
             return
@@ -1135,7 +948,6 @@ class SamplingBridge:
                 non_blocking=True,
             )
         self._idx_mapping_req_ids = req_ids
-        self._idx_mapping_generation += 1
 
     @staticmethod
     def _has_all_token_ids(

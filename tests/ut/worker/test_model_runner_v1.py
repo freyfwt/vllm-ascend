@@ -156,41 +156,19 @@ class TestNPUModelRunnerOriginalLogits(unittest.TestCase):
         runner.sampling_bridge = SimpleNamespace(sampler=SimpleNamespace(compute_nans=compute_nans))
         return runner
 
-    def test_preserves_original_logits_for_generation_logprobs(self):
-        runner = self._build_runner()
-        sampling_metadata = SimpleNamespace(
-            max_num_logprobs=1,
-            logprob_token_ids=None,
-        )
-
-        self.assertTrue(runner._should_preserve_original_logits(sampling_metadata, None))
-
-    def test_preserves_original_logits_for_requested_logprob_token_ids(self):
-        runner = self._build_runner()
-        sampling_metadata = SimpleNamespace(
-            max_num_logprobs=None,
-            logprob_token_ids={"req0": [1]},
-        )
-
-        self.assertTrue(runner._should_preserve_original_logits(sampling_metadata, None))
-
-    def test_preserves_original_logits_for_nan_diagnostics(self):
-        runner = self._build_runner(compute_nans=True)
-        sampling_metadata = SimpleNamespace(
-            max_num_logprobs=None,
-            logprob_token_ids=None,
-        )
-
-        self.assertTrue(runner._should_preserve_original_logits(sampling_metadata, None))
-
-    def test_does_not_preserve_original_logits_for_plain_sampling(self):
-        runner = self._build_runner()
-        sampling_metadata = SimpleNamespace(
-            max_num_logprobs=None,
-            logprob_token_ids=None,
-        )
-
-        self.assertFalse(runner._should_preserve_original_logits(sampling_metadata, None))
+    def test_needs_raw_logits_only_for_downstream_consumers(self):
+        cases = [
+            (SimpleNamespace(max_num_logprobs=1, logprob_token_ids=None), False, True),
+            (SimpleNamespace(max_num_logprobs=None, logprob_token_ids={"req0": [1]}), False, True),
+            (SimpleNamespace(max_num_logprobs=None, logprob_token_ids=None), True, True),
+            (SimpleNamespace(max_num_logprobs=None, logprob_token_ids=None), False, False),
+        ]
+        for sampling_metadata, compute_nans, expected in cases:
+            with self.subTest(sampling_metadata=sampling_metadata, compute_nans=compute_nans):
+                self.assertEqual(
+                    self._build_runner(compute_nans)._needs_raw_logits(sampling_metadata),
+                    expected,
+                )
 
 
 class TestNPUModelRunnerSampleState(unittest.TestCase):

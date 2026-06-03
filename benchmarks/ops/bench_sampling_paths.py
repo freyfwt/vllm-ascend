@@ -252,15 +252,7 @@ def run_batch_size(
                 enable_spec=False,
             )
             input_batch, requests = make_bridge_batch(batch_size)
-            inputs = bridge.prepare(
-                input_batch,
-                requests,
-                regular_input_ids,
-                regular_positions,
-                regular_logits_indices,
-                None,
-            )
-            assert inputs is not None
+            assert bridge.update_requests(input_batch, requests)
             return SimpleNamespace(
                 bridge=bridge,
                 input_batch=input_batch,
@@ -377,15 +369,7 @@ def run_batch_size(
                 enable_spec=True,
             )
             input_batch, requests = make_bridge_batch(batch_size)
-            inputs = bridge.prepare(
-                input_batch,
-                requests,
-                input_ids,
-                positions,
-                spec_metadata.logits_indices,
-                spec_metadata,
-            )
-            assert inputs is not None
+            assert bridge.update_requests(input_batch, requests)
             return SimpleNamespace(
                 bridge=bridge,
                 input_batch=input_batch,

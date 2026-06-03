@@ -166,7 +166,7 @@ above:
 | 128 | 151936 | regular sampling Gumbel | 2.610 | 2.638 | 2.659 |
 | 128 | 151936 | rejection uniform + recovery Gumbel | 2.716 | 2.719 | 2.769 |
 
-Additional batch sweep for vocab size `151936`:
+The benchmark script also supports batch sweeps for vocab size `151936`:
 
 ```bash
 python benchmarks/ops/bench_sampling_paths.py \
@@ -174,29 +174,10 @@ python benchmarks/ops/bench_sampling_paths.py \
   --warmups 3 --iterations 20
 ```
 
-This sweep uses the formal continuous-flow timing: every row includes stable
+This sweep uses continuous-flow timing: every row includes stable
 `update_requests`, `bind_batch`, sampling, and `post_update` on the same request
-batch.
-
-Regular sampling batch sweep:
-
-| Batch size | V1 native mean ms | V2 native mean ms | V2 optimized mean ms |
-|---:|---:|---:|---:|
-| 1 | 1.080 | 1.965 | 0.886 |
-| 8 | 1.025 | 10.315 | 0.937 |
-| 32 | 1.207 | 39.117 | 0.883 |
-| 64 | 1.855 | 77.141 | 0.890 |
-| 96 | 2.591 | 115.234 | 0.909 |
-
-Speculative rejection sampling batch sweep:
-
-| Batch size | V1 native mean ms | V2 native mean ms | V2 optimized mean ms |
-|---:|---:|---:|---:|
-| 1 | 2.722 | 2.505 | 1.506 |
-| 8 | 3.020 | 10.690 | 1.569 |
-| 32 | 3.644 | 38.818 | 1.675 |
-| 64 | 6.272 | 76.176 | 2.430 |
-| 96 | 9.101 | 113.981 | 3.343 |
+batch. Keep generated sweep data in benchmark output or PR notes instead of
+duplicating every row in this design document.
 
 Conclusions:
 
@@ -226,16 +207,6 @@ The reason is that `torch.topk(processed_logits, k)` scans
 When the number of speculative tokens is 4, `num_logits` is roughly
 `5 * num_reqs`. The extra top-k cost is larger than the resampling cost it
 saves, especially for batch sizes 64 and 128.
-
-Candidate resampling result:
-
-| Batch size | Old async random ms | Candidate new ms | Speedup |
-|---:|---:|---:|---:|
-| 1 | 3.019 | 2.410 | 1.253x |
-| 4 | 3.009 | 2.399 | 1.254x |
-| 16 | 5.643 | 4.469 | 1.263x |
-| 64 | 19.668 | 18.122 | 1.085x |
-| 128 | 38.443 | 35.907 | 1.071x |
 
 Future work should only revisit candidate resampling if the candidate set can
 be reused from logits processing without an extra dense top-k, or if candidate
@@ -299,21 +270,9 @@ The new path can be used only when:
 
 If any condition is not satisfied, fallback to the old path.
 
-Suggested shape of the helper:
-
-```python
-def _can_use_v2_sampling_path(self, sampling_metadata, spec_decode_metadata) -> bool:
-    if sampling_metadata.max_num_logprobs is not None:
-        return False
-    if self.input_batch.sampling_metadata.logprobs is not None:
-        return False
-    if spec_decode_metadata is not None:
-        return self.speculative_config.rejection_sample_method == "probabilistic"
-    return True
-```
-
-The exact field names should be adjusted to the current `SamplingMetadata`
-definition. Keep the function short.
+Keep this helper short and conservative. The implementation is intentionally
+checked again in `_sample`, because request state may change between noise
+prefetch and sampling.
 
 ## 7. Overall Architecture
 
@@ -390,22 +349,10 @@ Meanings:
 - `draft_tokens` is gathered from `input_ids[logits_indices]` and is used in
   the acceptance test.
 
-The prototype verified that `cu_num_logits`, `idx_mapping`,
-`expanded_idx_mapping`, and `expanded_local_pos` can be preallocated and reused.
-This avoids repeated `arange`, `repeat_interleave`, and `empty` calls on the
-hot path.
-
-The formal implementation should keep this cache in a small helper, for
-example:
-
-```python
-class SamplingInputBuilder:
-    def build_spec_inputs(...)
-    def build_sampling_inputs(...)
-```
-
-Avoid scattering temporary sampling state across the main `NPUModelRunner`
-class.
+The implementation keeps this adaptation inside `SamplingBridge.bind_batch`.
+It reuses the ModelRunnerV1 tensors that are already available on the hot path
+and delegates `expanded_idx_mapping`/`expanded_local_pos` construction to the
+upstream V2 helper instead of carrying another copy of that kernel.
 
 ## 9. Draft Probabilities Strategy
 
@@ -422,12 +369,11 @@ Reasons:
 
 Implementation strategy:
 
-- add a draft-free rejection sampling operator, for example
-  `sample_with_rejection`;
-- make the draft-free mode explicit in the operator name or
-  interface;
+- add a draft-free path in `vllm_ascend.sample.rejection_ops.rejection_sample`;
+- keep `draft_probs=None` as the explicit ModelRunnerV1 no-draft-probability
+  mode;
 - use target distribution and external Gumbel tensors for recovery sampling;
-- call this operator only from the ModelRunnerV1 new branch;
+- call this operator only through the ModelRunnerV1 sampling bridge;
 - do not change the existing ModelRunnerV2 rejection sampler.
 
 If full draft probabilities are needed later, they should be added in a
@@ -491,35 +437,9 @@ The required rule is:
 3. fill tensor values on the random stream;
 4. make the default stream wait for a ready event before sampling.
 
-Pseudo-code:
-
-```python
-def _prepare_sampling_noise(self, num_logits, num_reqs, vocab_size):
-    acceptance_uniform = self._get_buffer("acceptance_uniform", (num_logits,), torch.float32)
-    sampling_gumbel = self._get_buffer("sampling_gumbel", (num_logits, vocab_size), torch.float32)
-    recovery_gumbel = self._get_buffer("recovery_gumbel", (num_reqs, vocab_size), torch.float32)
-
-    current_stream = torch.npu.current_stream()
-    random_stream = self.v2_sampling_random_stream
-    random_stream.wait_stream(current_stream)
-
-    with torch.npu.stream(random_stream):
-        acceptance_uniform.uniform_()
-        acceptance_uniform.clamp_(min=1e-20)
-        sampling_gumbel.exponential_()
-        sampling_gumbel.log_().neg_()
-        recovery_gumbel.exponential_()
-        recovery_gumbel.log_().neg_()
-        self.v2_sampling_random_ready_event.record()
-
-    return acceptance_uniform, sampling_gumbel, recovery_gumbel
-```
-
-Before sampling:
-
-```python
-torch.npu.current_stream().wait_event(self.v2_sampling_random_ready_event)
-```
+`NoiseManager` owns this stream/event protocol and exposes separate regular
+and speculative noise preparation methods. Before sampling, the current stream
+waits on the recorded event.
 
 The implementation should generate only the random tensors needed by the
 current path. For example, do not unconditionally allocate a large
@@ -546,17 +466,16 @@ vllm_ascend/sample/rejection_ops.py
 
 If a new directory is not desired, place the helper near
 `vllm_ascend/worker/model_runner_v1.py`, but avoid putting long kernels and
-input builders directly into `model_runner_v1.py`.
+bridge logic directly into `model_runner_v1.py`.
 
-Suggested rejection sampling interface:
+Rejection sampling interface:
 
 ```python
-def sample_with_rejection(
+def rejection_sample(
     target_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
     draft_probs: torch.Tensor | None,
     cu_num_logits: torch.Tensor,
-    positions: torch.Tensor,
     idx_mapping: torch.Tensor,
     expanded_idx_mapping: torch.Tensor,
     expanded_local_pos: torch.Tensor,
@@ -573,12 +492,13 @@ probabilities. A non-`None` `draft_probs` input is aligned with
 `target_logits` rows, kept for future reuse, and must follow the standard
 probabilistic rejection and residual recovery rules.
 
-Suggested regular sampling interface:
+Regular sampling interface:
 
 ```python
-def sample_processed_logits(
+def sample_logits(
     processed_logits: torch.Tensor,
     temperature: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
     sampling_gumbel: torch.Tensor,
 ) -> torch.Tensor:
     ...
@@ -586,16 +506,17 @@ def sample_processed_logits(
 
 ## 13. ModelRunnerV1 Integration Steps
 
-### Step 1: Add an Input Builder
+### Step 1: Add a Sampling Bridge
 
-The input builder should:
+The sampling bridge should:
 
 - build `cu_num_logits` from `SpecDecodeMetadata`;
 - reuse `idx_mapping`;
 - fill `expanded_idx_mapping` and `expanded_local_pos`;
-- return a lightweight `SimpleNamespace` or dataclass.
+- bind a V2-compatible `GpuInputBatch`.
 
-Keep this state local to the builder and avoid polluting `NPUModelRunner`.
+Keep this state local to `SamplingBridge` and avoid polluting
+`NPUModelRunner`.
 
 ### Step 2: Add Random Buffers and Stream State
 
@@ -611,7 +532,7 @@ by slicing them to the actual runtime shape.
 ### Step 3: Prefetch Random Numbers Before Model Execution
 
 Once the current step is known to be eligible for the new sampling path, call
-`_prepare_sampling_noise` before model graph execution.
+the `NoiseManager` through `_make_noise` before model graph execution.
 
 This check cannot depend on model output logits. It can depend on
 `sampling_metadata`, `spec_decode_metadata`, batch size, vocab size, and
@@ -624,8 +545,8 @@ Inside `_sample`:
 1. check again whether the new path is available;
 2. wait for the random ready event;
 3. reuse the existing logits processing path to produce processed logits;
-4. call `sample_processed_logits` for regular sampling;
-5. call `sample_with_rejection` for speculative decoding;
+4. call `sample_logits` for regular sampling;
+5. call `rejection_sample` for speculative decoding;
 6. return `SamplerOutput`.
 
 ### Step 5: Fallback
@@ -671,7 +592,7 @@ Add or extend unit tests for:
   `draft_probs`;
 - fallback: logprobs, unsupported parameters, and unsupported speculative
   methods;
-- input builder: different batch sizes, different speculative token counts,
+- sampling bridge: different batch sizes, different speculative token counts,
   and different `cu_num_sampled_tokens`.
 
 ### 15.2 Correctness Tests
@@ -696,35 +617,10 @@ Keep the core settings from the prototype performance UT:
 - measurement iterations: `20`
 - the old path golden should also simulate async random number generation
 
-The performance comparison method must be fixed so that random generation,
-first-time compilation, or synchronization details are not incorrectly counted
-as algorithmic speedup:
-
-1. **Compare in one process**: construct fixed logits, draft tokens, and
-   sampling metadata in one pytest case, then run old and new paths in the same
-   process.
-2. **Use old path as golden**: the old path should use the existing Ascend
-   rejection sampler. For fairness, both paths should have async random number
-   generation capability.
-3. **Fix inputs and random tensor semantics**: target logits, draft tokens,
-   temperature, top-k, top-p, acceptance uniform, and recovery Gumbel should
-   have the same shapes or equivalent semantics.
-4. **Check correctness before timing**: assert sampled tokens or accepted
-   lengths before printing performance numbers.
-5. **Warm up before timing**: warm up each path 5 times and call
-   `torch.npu.synchronize()` before starting the timer.
-6. **Use clear timing boundaries**: measure only the target sampling or
-   rejection sampling path. Do not include test data construction, first-time
-   tensor allocation, or logging.
-7. **Report averages and speedup**: run 20 measured iterations and print
-   `old_ms`, `new_ms`, and `old_ms / new_ms`. For PR data, repeat at least
-   three rounds and report both average and worst round.
-8. **Cover representative batch sizes**: at least cover `1, 4, 16, 64, 128`.
-   The prototype showed that some ideas look good for small batches but regress
-   for large batches.
-9. **Separate regular sampling and speculative sampling**: do not reuse
-   speculative sampling data as regular sampling evidence. Speculative sampling
-   should also report different speculative token counts.
+The performance comparison must use fixed inputs, run old and new paths in one
+process, warm up before timing, synchronize around the measured region, and
+report mean/median/p90 plus speedup. Correctness checks should run before
+timing. Regular sampling and speculative sampling must be reported separately.
 
 Suggested output format:
 
@@ -733,12 +629,6 @@ sampling_optimization batch_size=64 vocab_size=151936
 warmup_iters=5 num_iters=20 old_async_random=True new_async_random=True
 old_ms=19.672 new_ms=17.125 speedup=1.149x
 ```
-
-Add regular sampling performance tests for:
-
-- no speculative decoding;
-- no top-k, only temperature/top-p;
-- both top-k and top-p enabled.
 
 Acceptance criteria:
 
@@ -776,7 +666,7 @@ Acceptance criteria:
 
 ## 18. Recommended Implementation Order
 
-1. Add the draft-free sampling input builder.
+1. Add the draft-free sampling bridge.
 2. Add the draft-free `draft_probs=None` rejection sampling operator.
 3. Add external random tensors and validate correctness with synchronous
    generation first.
@@ -789,7 +679,7 @@ Acceptance criteria:
 
 ## 19. Code Style Requirements
 
-- Keep the path cohesive: input builder, random manager, and sampling kernel
+- Keep the path cohesive: sampling bridge, random manager, and sampling kernel
   should be separated. `NPUModelRunner` should only orchestrate them.
 - Do not write long defensive code. Fallback when conditions are not met, and
   raise an error for broken internal invariants.

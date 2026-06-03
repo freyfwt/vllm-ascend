@@ -201,8 +201,6 @@ def _post_update_kernel(
     sampled_tokens_stride,
     num_rows,
     num_sampled_ptr,
-    num_rejected_ptr,
-    query_start_loc_ptr,
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
@@ -230,11 +228,8 @@ def _post_update_kernel(
             token_id,
         )
 
-    query_start = tl.load(query_start_loc_ptr + row_idx)
-    query_end = tl.load(query_start_loc_ptr + row_idx + 1)
-    num_rejected = tl.load(num_rejected_ptr + row_idx)
     num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
-    tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + query_end - query_start - num_rejected)
+    tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + num_sampled)
 
 
 def _next_power_of_2(value: int) -> int:
@@ -294,7 +289,7 @@ class GpuBatchView:
         num_reqs = len(req_ids)
         cu_num_logits = self._arange_buffer("regular_cu_num_logits", num_reqs + 1)
         cu_num_logits_np = self._arange_np("regular_cu_num_logits_np", num_reqs + 1)
-        expanded_local_pos = self._zero_buffer("regular_expanded_local_pos", num_reqs)
+        expanded_local_pos = self._filled_buffer("regular_expanded_local_pos", num_reqs, 0)
         self._set_common_fields(
             req_ids=req_ids,
             idx_mapping=idx_mapping,
@@ -392,12 +387,7 @@ class GpuBatchView:
         return self.input_batch
 
     def num_sampled_ones(self, num_reqs: int) -> torch.Tensor:
-        out = self._buffer("num_sampled_ones", (num_reqs,), torch.int32)
-        out.fill_(1)
-        return out
-
-    def num_rejected_buffer(self, num_reqs: int) -> torch.Tensor:
-        return self._buffer("num_rejected", (num_reqs,), torch.int32)
+        return self._filled_buffer("num_sampled_ones", num_reqs, 1)
 
     def _set_common_fields(
         self,
@@ -469,6 +459,27 @@ class GpuBatchView:
     ) -> torch.Tensor:
         out = self._buffer(name, (size,), torch.int32)
         out.zero_()
+        return out
+
+    def _filled_buffer(
+        self,
+        name: str,
+        size: int,
+        value: int,
+    ) -> torch.Tensor:
+        buffer = self._buffers.get(name)
+        needs_init = (
+            buffer is None or buffer.dtype != torch.int32 or buffer.device != self._device or buffer.shape[0] < size
+        )
+        out = self._buffer(name, (size,), torch.int32)
+        cached_size_name = f"{name}_filled_size"
+        cached_size = getattr(self, cached_size_name, 0)
+        if needs_init:
+            out.fill_(value)
+            setattr(self, cached_size_name, size)
+        elif cached_size < size:
+            out[cached_size:size].fill_(value)
+            setattr(self, cached_size_name, size)
         return out
 
     def _arange_buffer(self, name: str, size: int) -> torch.Tensor:
@@ -1021,14 +1032,6 @@ class SamplingBridge:
         num_sampled: torch.Tensor,
     ) -> None:
         num_reqs = input_batch.num_reqs
-        num_rejected = self._batch_view.num_rejected_buffer(num_reqs)
-        torch.sub(
-            input_batch.query_start_loc[1 : num_reqs + 1],
-            input_batch.query_start_loc[:num_reqs],
-            out=num_rejected,
-        )
-        num_rejected.sub_(num_sampled[:num_reqs].to(dtype=torch.int32))
-
         _post_update_kernel[(num_reqs,)](
             input_batch.idx_mapping,
             input_batch.idx_mapping.stride(0),
@@ -1040,8 +1043,6 @@ class SamplingBridge:
             sampled_token_ids.stride(0),
             num_reqs,
             num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
             self.req_states.all_token_ids.gpu,
             self.req_states.all_token_ids.gpu.stride(0),
             self.req_states.total_len.gpu,

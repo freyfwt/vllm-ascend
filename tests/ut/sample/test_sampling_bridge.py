@@ -258,6 +258,18 @@ class TestSamplingBridge(unittest.TestCase):
         self.assertEqual(batch.expanded_local_pos.tolist(), [0, 0])
         self.assertEqual(batch.cu_num_logits.tolist(), [0, 1, 2])
 
+    def test_filled_buffer_reuses_stable_contents(self):
+        view = GpuBatchView(max_num_reqs=4, device=torch.device("cpu"))
+        first = view._filled_buffer("cached_ones", 4, 1)
+        first[0] = 7
+
+        stable = view._filled_buffer("cached_ones", 2, 1)
+        grown = view._filled_buffer("cached_ones", 4, 1)
+
+        self.assertEqual(stable.tolist(), [7, 1])
+        self.assertEqual(grown.tolist(), [7, 1, 1, 1])
+        self.assertEqual(first.data_ptr(), stable.data_ptr())
+
     def test_bind_batch_spec_uses_metadata_and_kernel_mapping(self):
         view = GpuBatchView(max_num_reqs=4, device=torch.device("cpu"))
         metadata = SimpleNamespace(

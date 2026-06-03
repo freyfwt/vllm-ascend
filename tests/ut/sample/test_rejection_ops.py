@@ -11,10 +11,10 @@ def _npu_available() -> bool:
 
 
 @pytest.mark.skipif(not _npu_available(), reason="requires NPU")
-def test_sample_with_rejection_accepts_and_recovers():
+def test_rejection_sample_accepts_and_recovers():
     from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
     from vllm_ascend.sample.rejection_ops import (
-        sample_with_rejection,
+        rejection_sample,
     )
 
     torch.npu.set_device(0)
@@ -31,7 +31,7 @@ def test_sample_with_rejection_accepts_and_recovers():
         dtype=torch.float32,
         device=device,
     )
-    sampled, sample_counts = sample_with_rejection(
+    sampled, num_sampled = rejection_sample(
         target_logits=target_logits,
         draft_tokens=torch.tensor([0, 1, 0, 2], dtype=torch.int32, device=device),
         draft_probs=None,
@@ -48,14 +48,14 @@ def test_sample_with_rejection_accepts_and_recovers():
 
     torch.npu.synchronize()
     assert sampled.cpu().tolist() == [[1, 2], [3, -1]]
-    assert sample_counts.cpu().tolist() == [2, 1]
+    assert num_sampled.cpu().tolist() == [2, 1]
 
 
 @pytest.mark.skipif(not _npu_available(), reason="requires NPU")
-def test_sample_with_rejection_uses_draft_probs():
+def test_rejection_sample_uses_draft_probs():
     from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
     from vllm_ascend.sample.rejection_ops import (
-        sample_with_rejection,
+        rejection_sample,
     )
 
     torch.npu.set_device(0)
@@ -63,7 +63,7 @@ def test_sample_with_rejection_uses_draft_probs():
     device = torch.device("npu:0")
 
     target_logits = torch.zeros((2, 4), dtype=torch.float32, device=device)
-    sampled, sample_counts = sample_with_rejection(
+    sampled, num_sampled = rejection_sample(
         target_logits=target_logits,
         draft_tokens=torch.tensor([0, 1], dtype=torch.int32, device=device),
         draft_probs=torch.tensor(
@@ -87,4 +87,4 @@ def test_sample_with_rejection_uses_draft_probs():
 
     torch.npu.synchronize()
     assert sampled.cpu().tolist() == [[2, -1]]
-    assert sample_counts.cpu().tolist() == [1]
+    assert num_sampled.cpu().tolist() == [1]

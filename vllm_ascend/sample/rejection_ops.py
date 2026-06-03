@@ -20,6 +20,99 @@ from vllm.triton_utils import tl, triton
 PLACEHOLDER_TOKEN_ID = -1
 
 
+class RejectionWorkspace:
+    def __init__(self) -> None:
+        self._buffers: dict[str, torch.Tensor] = {}
+
+    def prepare(
+        self,
+        target_logits: torch.Tensor,
+        num_reqs: int,
+        num_logits: int,
+        vocab_num_blocks: int,
+        recovery_blocks: int,
+        num_speculative_steps: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        target_local_argmax = self._buffer(
+            "target_local_argmax",
+            (num_logits, vocab_num_blocks),
+            torch.int64,
+            target_logits.device,
+        )
+        target_local_max = self._buffer(
+            "target_local_max",
+            (num_logits, vocab_num_blocks),
+            torch.float32,
+            target_logits.device,
+        )
+        target_local_sumexp = self._buffer(
+            "target_local_sumexp",
+            (num_logits, vocab_num_blocks),
+            torch.float32,
+            target_logits.device,
+        )
+        sampled = self._buffer(
+            "sampled",
+            (num_reqs, num_speculative_steps + 1),
+            torch.int32,
+            target_logits.device,
+        )
+        sampled.fill_(PLACEHOLDER_TOKEN_ID)
+        num_sampled = self._buffer(
+            "num_sampled",
+            (num_reqs,),
+            torch.int32,
+            target_logits.device,
+        )
+        recovery_local_argmax = self._buffer(
+            "recovery_local_argmax",
+            (num_reqs, recovery_blocks),
+            torch.int64,
+            target_logits.device,
+        )
+        recovery_local_max = self._buffer(
+            "recovery_local_max",
+            (num_reqs, recovery_blocks),
+            torch.float32,
+            target_logits.device,
+        )
+        return (
+            target_local_argmax,
+            target_local_max,
+            target_local_sumexp,
+            sampled,
+            num_sampled,
+            recovery_local_argmax,
+            recovery_local_max,
+        )
+
+    def _buffer(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        buffer = self._buffers.get(name)
+        if (
+            buffer is None
+            or buffer.dtype != dtype
+            or buffer.device != device
+            or any(buffer.shape[i] < shape[i] for i in range(len(shape)))
+        ):
+            buffer = torch.empty(shape, dtype=dtype, device=device)
+            self._buffers[name] = buffer
+        return buffer[tuple(slice(0, dim) for dim in shape)]
+
+
 @triton.jit
 def _compute_global_lse(
     local_max_ptr,
@@ -110,7 +203,7 @@ def _target_stats_kernel(
 def _probabilistic_rejection_kernel(
     sampled_ptr,
     sampled_stride,
-    sample_counts_ptr,
+    num_sampled_ptr,
     target_logits_ptr,
     target_logits_stride,
     target_local_argmax_ptr,
@@ -137,7 +230,7 @@ def _probabilistic_rejection_kernel(
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
 
-    sample_counts = 0
+    num_sampled = 0
     accepted = True
     num_draft_tokens = end_idx - start_idx - 1
     for i in range(NUM_SPECULATIVE_STEPS):
@@ -179,8 +272,8 @@ def _probabilistic_rejection_kernel(
                 else:
                     accepted &= target_log_prob > tl.log(u)
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_tokens)
-            sample_counts += accepted
-    tl.store(sample_counts_ptr + req_idx, sample_counts)
+            num_sampled += accepted
+    tl.store(num_sampled_ptr + req_idx, num_sampled)
 
 
 @triton.jit
@@ -195,7 +288,7 @@ def _recovery_kernel(
     target_local_max_stride,
     target_local_sumexp_ptr,
     target_local_sumexp_stride,
-    sample_counts_ptr,
+    num_sampled_ptr,
     cu_num_logits_ptr,
     expanded_idx_mapping_ptr,
     draft_tokens_ptr,
@@ -211,7 +304,7 @@ def _recovery_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
-    recovery_idx = tl.load(sample_counts_ptr + req_idx)
+    recovery_idx = tl.load(num_sampled_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     recovery_token_idx = start_idx + recovery_idx
@@ -278,7 +371,7 @@ def _recovery_kernel(
 def _insert_recovery_kernel(
     sampled_ptr,
     sampled_stride,
-    sample_counts_ptr,
+    num_sampled_ptr,
     recovery_local_argmax_ptr,
     recovery_local_argmax_stride,
     recovery_local_max_ptr,
@@ -290,14 +383,14 @@ def _insert_recovery_kernel(
     PADDED_RECOVERY_BLOCKS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
-    sample_counts = tl.load(sample_counts_ptr + req_idx)
+    num_sampled = tl.load(num_sampled_ptr + req_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
-    recovery_token_idx = start_idx + sample_counts
+    recovery_token_idx = start_idx + num_sampled
     req_state_idx = tl.load(expanded_idx_mapping_ptr + recovery_token_idx)
     temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
     is_bonus = recovery_token_idx == end_idx - 1
-    tl.store(sample_counts_ptr + req_idx, sample_counts + 1)
+    tl.store(num_sampled_ptr + req_idx, num_sampled + 1)
     if temperature == 0.0 and not is_bonus:
         return
 
@@ -310,10 +403,10 @@ def _insert_recovery_kernel(
     )
     max_block_idx = tl.argmax(local_max, axis=0)
     recovery = tl.load(recovery_local_argmax_ptr + req_idx * recovery_local_argmax_stride + max_block_idx)
-    tl.store(sampled_ptr + req_idx * sampled_stride + sample_counts, recovery)
+    tl.store(sampled_ptr + req_idx * sampled_stride + num_sampled, recovery)
 
 
-def sample_with_rejection(
+def rejection_sample(
     target_logits: torch.Tensor,
     draft_tokens: torch.Tensor,
     draft_probs: torch.Tensor | None,
@@ -326,6 +419,7 @@ def sample_with_rejection(
     acceptance_uniform: torch.Tensor,
     recovery_gumbel: torch.Tensor,
     num_speculative_steps: int,
+    workspace: RejectionWorkspace | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del positions
     assert draft_probs is None or draft_probs.is_contiguous()
@@ -336,9 +430,27 @@ def sample_with_rejection(
     vocab_block_size = 8192
     vocab_num_blocks = triton.cdiv(vocab_size, vocab_block_size)
     padded_vocab_num_blocks = triton.next_power_of_2(vocab_num_blocks)
-    target_local_argmax = torch.empty((num_logits, vocab_num_blocks), dtype=torch.int64, device=target_logits.device)
-    target_local_max = torch.empty((num_logits, vocab_num_blocks), dtype=torch.float32, device=target_logits.device)
-    target_local_sumexp = torch.empty_like(target_local_max)
+    recovery_block_size = 1024
+    recovery_blocks = triton.cdiv(vocab_size, recovery_block_size)
+    padded_recovery_blocks = triton.next_power_of_2(recovery_blocks)
+    if workspace is None:
+        workspace = RejectionWorkspace()
+    (
+        target_local_argmax,
+        target_local_max,
+        target_local_sumexp,
+        sampled,
+        num_sampled,
+        recovery_local_argmax,
+        recovery_local_max,
+    ) = workspace.prepare(
+        target_logits,
+        num_reqs,
+        num_logits,
+        vocab_num_blocks,
+        recovery_blocks,
+        num_speculative_steps,
+    )
     _target_stats_kernel[(num_logits, vocab_num_blocks)](
         target_local_argmax,
         target_local_argmax.stride(0),
@@ -356,17 +468,10 @@ def sample_with_rejection(
         BLOCK_SIZE=vocab_block_size,
     )
 
-    sampled = torch.full(
-        (num_reqs, num_speculative_steps + 1),
-        PLACEHOLDER_TOKEN_ID,
-        dtype=torch.int32,
-        device=target_logits.device,
-    )
-    sample_counts = torch.empty((num_reqs,), dtype=torch.int32, device=target_logits.device)
     _probabilistic_rejection_kernel[(num_reqs,)](
         sampled,
         sampled.stride(0),
-        sample_counts,
+        num_sampled,
         target_logits,
         target_logits.stride(0),
         target_local_argmax,
@@ -389,11 +494,6 @@ def sample_with_rejection(
         num_warps=1,
     )
 
-    recovery_block_size = 1024
-    recovery_blocks = triton.cdiv(vocab_size, recovery_block_size)
-    padded_recovery_blocks = triton.next_power_of_2(recovery_blocks)
-    recovery_local_argmax = torch.empty((num_reqs, recovery_blocks), dtype=torch.int64, device=target_logits.device)
-    recovery_local_max = torch.empty((num_reqs, recovery_blocks), dtype=torch.float32, device=target_logits.device)
     _recovery_kernel[(num_reqs, recovery_blocks)](
         recovery_local_argmax,
         recovery_local_argmax.stride(0),
@@ -405,7 +505,7 @@ def sample_with_rejection(
         target_local_max.stride(0),
         target_local_sumexp,
         target_local_sumexp.stride(0),
-        sample_counts,
+        num_sampled,
         cu_num_logits,
         expanded_idx_mapping,
         draft_tokens,
@@ -423,7 +523,7 @@ def sample_with_rejection(
     _insert_recovery_kernel[(num_reqs,)](
         sampled,
         sampled.stride(0),
-        sample_counts,
+        num_sampled,
         recovery_local_argmax,
         recovery_local_argmax.stride(0),
         recovery_local_max,
@@ -434,4 +534,7 @@ def sample_with_rejection(
         temperature,
         PADDED_RECOVERY_BLOCKS=padded_recovery_blocks,
     )
-    return sampled, sample_counts
+    return sampled, num_sampled
+
+
+sample_with_rejection = rejection_sample

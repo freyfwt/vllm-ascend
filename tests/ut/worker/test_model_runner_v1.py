@@ -193,6 +193,40 @@ class TestNPUModelRunnerOriginalLogits(unittest.TestCase):
         self.assertFalse(runner._should_preserve_original_logits(sampling_metadata, None))
 
 
+class TestNPUModelRunnerSampleState(unittest.TestCase):
+    def test_update_sample_state_passes_num_sampled_to_bridge(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        sample_batch = SimpleNamespace(name="batch")
+        runner._sample_batch = sample_batch
+        runner.sampling_bridge = MagicMock()
+        sampler_output = SimpleNamespace(
+            sampled_token_ids=torch.tensor([[7, -1]], dtype=torch.int32),
+            num_sampled=torch.tensor([1], dtype=torch.int32),
+        )
+
+        runner._update_sample_state(sampler_output)
+
+        runner.sampling_bridge.post_update.assert_called_once_with(
+            sample_batch,
+            sampler_output.sampled_token_ids,
+            sampler_output.num_sampled,
+        )
+        self.assertIsNone(runner._sample_batch)
+
+    def test_update_sample_state_ignores_legacy_sampler_output(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._sample_batch = SimpleNamespace(name="batch")
+        runner.sampling_bridge = MagicMock()
+        sampler_output = SimpleNamespace(
+            sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
+        )
+
+        runner._update_sample_state(sampler_output)
+
+        runner.sampling_bridge.post_update.assert_not_called()
+        self.assertIsNone(runner._sample_batch)
+
+
 class TestNPUModelRunnerDebugger(unittest.TestCase):
     def _build_runner(self, debugger=None):
         runner = NPUModelRunner.__new__(NPUModelRunner)

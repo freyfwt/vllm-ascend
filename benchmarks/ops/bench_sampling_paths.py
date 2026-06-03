@@ -233,61 +233,50 @@ def run_batch_size(
         regular_logits = torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device)
         regular_seed = torch.arange(100000, 100000 + batch_size, dtype=torch.int64, device=device)
         regular_gumbel = make_gumbel((batch_size, vocab_size), device)
-        regular_bridge = make_sampling_bridge(
-            batch_size=batch_size,
-            max_model_len=max_model_len,
-            max_num_batched_tokens=batch_size,
-            vocab_size=vocab_size,
-            spec_steps=spec_steps,
-            device=device,
-            enable_spec=False,
-        )
-        regular_input_batch, regular_requests = make_bridge_batch(batch_size)
         regular_input_ids = torch.arange(batch_size, dtype=torch.int32, device=device)
         regular_positions = torch.arange(batch_size, dtype=torch.int64, device=device)
         regular_logits_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-        regular_inputs = regular_bridge.prepare(
-            regular_input_batch,
-            regular_requests,
-            regular_input_ids,
-            regular_positions,
-            regular_logits_indices,
-            None,
-        )
-        assert regular_inputs is not None
         regular_query_start_loc = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
         regular_query_start_loc_np = np.arange(batch_size + 1, dtype=np.int32)
         regular_seq_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
         regular_seq_lens_cpu_upper_bound = torch.ones(batch_size, dtype=torch.int32)
 
-        def regular_v1_native() -> torch.Tensor:
-            return sampler(regular_logits, sampling_metadata).sampled_token_ids
-
-        def regular_v2_native() -> torch.Tensor:
-            regular_pos = regular_inputs.positions[regular_inputs.logits_indices]
-            regular_token_ids = regular_inputs.input_ids[regular_inputs.logits_indices]
-            processed = regular_bridge.sampler.apply_sampling_params(
-                regular_logits,
-                regular_inputs.expanded_idx_mapping,
-                regular_inputs.idx_mapping_np,
-                regular_pos,
-                regular_token_ids,
-                regular_inputs.expanded_local_pos,
+        def make_regular_flow() -> SimpleNamespace:
+            bridge = make_sampling_bridge(
+                batch_size=batch_size,
+                max_model_len=max_model_len,
+                max_num_batched_tokens=batch_size,
+                vocab_size=vocab_size,
+                spec_steps=spec_steps,
+                device=device,
+                enable_spec=False,
             )
-            return gumbel_sample(
-                processed,
-                regular_inputs.expanded_idx_mapping,
-                regular_bridge.sampler.sampling_states.temperature.gpu,
-                regular_seed,
-                regular_pos,
-                apply_temperature=False,
+            input_batch, requests = make_bridge_batch(batch_size)
+            inputs = bridge.prepare(
+                input_batch,
+                requests,
+                regular_input_ids,
+                regular_positions,
+                regular_logits_indices,
+                None,
+            )
+            assert inputs is not None
+            return SimpleNamespace(
+                bridge=bridge,
+                input_batch=input_batch,
+                requests=requests,
+                num_sampled=bridge._batch_view.num_sampled_ones(batch_size),
             )
 
-        def regular_v2_optimized() -> torch.Tensor:
-            if not regular_bridge.update_requests(regular_input_batch, regular_requests):
+        regular_v1_flow = make_regular_flow()
+        regular_v2_flow = make_regular_flow()
+        regular_v2_optimized_flow = make_regular_flow()
+
+        def bind_regular_flow(flow: SimpleNamespace):
+            if not flow.bridge.update_requests(flow.input_batch, flow.requests):
                 raise RuntimeError("failed to update regular bridge requests")
-            sample_batch = regular_bridge.bind_batch(
-                regular_input_batch,
+            return flow.bridge.bind_batch(
+                flow.input_batch,
                 regular_input_ids,
                 regular_positions,
                 regular_logits_indices,
@@ -297,13 +286,57 @@ def run_batch_size(
                 seq_lens=regular_seq_lens,
                 seq_lens_cpu_upper_bound=regular_seq_lens_cpu_upper_bound,
             )
-            output = regular_bridge.sample_regular(
+
+        def regular_v1_native() -> torch.Tensor:
+            sample_batch = bind_regular_flow(regular_v1_flow)
+            sampled = sampler(regular_logits, sampling_metadata).sampled_token_ids
+            regular_v1_flow.bridge.post_update(
+                sample_batch,
+                sampled,
+                regular_v1_flow.num_sampled,
+            )
+            return sampled
+
+        def regular_v2_native() -> torch.Tensor:
+            sample_batch = bind_regular_flow(regular_v2_flow)
+            regular_pos = sample_batch.positions[sample_batch.logits_indices]
+            regular_token_ids = sample_batch.input_ids[sample_batch.logits_indices]
+            processed = regular_v2_flow.bridge.sampler.apply_sampling_params(
+                regular_logits,
+                sample_batch.expanded_idx_mapping,
+                sample_batch.idx_mapping_np,
+                regular_pos,
+                regular_token_ids,
+                sample_batch.expanded_local_pos,
+            )
+            sampled = (
+                gumbel_sample(
+                    processed,
+                    sample_batch.expanded_idx_mapping,
+                    regular_v2_flow.bridge.sampler.sampling_states.temperature.gpu,
+                    regular_seed,
+                    regular_pos,
+                    apply_temperature=False,
+                )
+                .to(torch.int32)
+                .view(-1, 1)
+            )
+            regular_v2_flow.bridge.post_update(
+                sample_batch,
+                sampled,
+                regular_v2_flow.num_sampled,
+            )
+            return sampled
+
+        def regular_v2_optimized() -> torch.Tensor:
+            sample_batch = bind_regular_flow(regular_v2_optimized_flow)
+            output = regular_v2_optimized_flow.bridge.sample_regular(
                 regular_logits,
                 sample_batch,
                 regular_gumbel,
                 preserve_original_logits=False,
             )
-            regular_bridge.post_update(
+            regular_v2_optimized_flow.bridge.post_update(
                 sample_batch,
                 output.sampled_token_ids,
                 output.num_sampled,
@@ -322,25 +355,6 @@ def run_batch_size(
         spec_metadata, input_ids, positions = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
         spec_logits = torch.randn(num_logits, vocab_size, dtype=torch.float32, device=device)
         boost_draft_logits(spec_logits, input_ids, spec_steps, boost=12.0)
-        spec_bridge = make_sampling_bridge(
-            batch_size=batch_size,
-            max_model_len=max_model_len,
-            max_num_batched_tokens=num_logits,
-            vocab_size=vocab_size,
-            spec_steps=spec_steps,
-            device=device,
-            enable_spec=True,
-        )
-        spec_input_batch, spec_requests = make_bridge_batch(batch_size)
-        spec_inputs = spec_bridge.prepare(
-            spec_input_batch,
-            spec_requests,
-            input_ids,
-            positions,
-            spec_metadata.logits_indices,
-            spec_metadata,
-        )
-        assert spec_inputs is not None
         tokens_per_req = spec_steps + 1
         spec_query_start_loc = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
         spec_query_start_loc.mul_(tokens_per_req)
@@ -352,40 +366,41 @@ def run_batch_size(
         rejection_recovery_gumbel = make_gumbel((batch_size, vocab_size), device)
         rejection_seed = torch.arange(200000, 200000 + batch_size, dtype=torch.int64, device=device)
 
-        def spec_v1_native() -> torch.Tensor:
-            return rejection_sampler(spec_metadata, None, spec_logits, sampling_metadata).sampled_token_ids
-
-        def spec_v2_native() -> torch.Tensor:
-            draft_tokens = spec_inputs.input_ids[spec_inputs.logits_indices]
-            spec_pos = spec_inputs.positions[spec_inputs.logits_indices]
-            processed = spec_bridge.sampler.apply_sampling_params(
-                spec_logits,
-                spec_inputs.expanded_idx_mapping,
-                spec_inputs.idx_mapping_np,
-                spec_pos,
-                draft_tokens,
-                spec_inputs.expanded_local_pos,
+        def make_spec_flow() -> SimpleNamespace:
+            bridge = make_sampling_bridge(
+                batch_size=batch_size,
+                max_model_len=max_model_len,
+                max_num_batched_tokens=num_logits,
+                vocab_size=vocab_size,
+                spec_steps=spec_steps,
+                device=device,
+                enable_spec=True,
             )
-            sampled, _ = v2_rejection_sample(
-                processed,
-                None,
-                draft_tokens,
-                spec_inputs.cu_num_logits,
-                spec_pos,
-                spec_inputs.idx_mapping,
-                spec_inputs.expanded_idx_mapping,
-                spec_inputs.expanded_local_pos,
-                spec_bridge.sampler.sampling_states.temperature.gpu,
-                rejection_seed,
-                spec_steps,
+            input_batch, requests = make_bridge_batch(batch_size)
+            inputs = bridge.prepare(
+                input_batch,
+                requests,
+                input_ids,
+                positions,
+                spec_metadata.logits_indices,
+                spec_metadata,
             )
-            return sampled
+            assert inputs is not None
+            return SimpleNamespace(
+                bridge=bridge,
+                input_batch=input_batch,
+                requests=requests,
+            )
 
-        def spec_v2_optimized() -> torch.Tensor:
-            if not spec_bridge.update_requests(spec_input_batch, spec_requests):
+        spec_v1_flow = make_spec_flow()
+        spec_v2_flow = make_spec_flow()
+        spec_v2_optimized_flow = make_spec_flow()
+
+        def bind_spec_flow(flow: SimpleNamespace):
+            if not flow.bridge.update_requests(flow.input_batch, flow.requests):
                 raise RuntimeError("failed to update spec bridge requests")
-            sample_batch = spec_bridge.bind_batch(
-                spec_input_batch,
+            return flow.bridge.bind_batch(
+                flow.input_batch,
                 input_ids,
                 positions,
                 spec_metadata.logits_indices,
@@ -395,14 +410,55 @@ def run_batch_size(
                 seq_lens=spec_seq_lens,
                 seq_lens_cpu_upper_bound=spec_seq_lens_cpu_upper_bound,
             )
-            output = spec_bridge.sample_spec(
+
+        def infer_num_sampled(sampled: torch.Tensor) -> torch.Tensor:
+            return sampled.ne(-1).sum(dim=1).to(torch.int32)
+
+        def spec_v1_native() -> torch.Tensor:
+            sample_batch = bind_spec_flow(spec_v1_flow)
+            sampled = rejection_sampler(spec_metadata, None, spec_logits, sampling_metadata).sampled_token_ids
+            num_sampled = infer_num_sampled(sampled)
+            spec_v1_flow.bridge.post_update(sample_batch, sampled, num_sampled)
+            return sampled
+
+        def spec_v2_native() -> torch.Tensor:
+            sample_batch = bind_spec_flow(spec_v2_flow)
+            draft_tokens = sample_batch.input_ids[sample_batch.logits_indices]
+            spec_pos = sample_batch.positions[sample_batch.logits_indices]
+            processed = spec_v2_flow.bridge.sampler.apply_sampling_params(
+                spec_logits,
+                sample_batch.expanded_idx_mapping,
+                sample_batch.idx_mapping_np,
+                spec_pos,
+                draft_tokens,
+                sample_batch.expanded_local_pos,
+            )
+            sampled, num_sampled = v2_rejection_sample(
+                processed,
+                None,
+                draft_tokens,
+                sample_batch.cu_num_logits,
+                spec_pos,
+                sample_batch.idx_mapping,
+                sample_batch.expanded_idx_mapping,
+                sample_batch.expanded_local_pos,
+                spec_v2_flow.bridge.sampler.sampling_states.temperature.gpu,
+                rejection_seed,
+                spec_steps,
+            )
+            spec_v2_flow.bridge.post_update(sample_batch, sampled, num_sampled)
+            return sampled
+
+        def spec_v2_optimized() -> torch.Tensor:
+            sample_batch = bind_spec_flow(spec_v2_optimized_flow)
+            output = spec_v2_optimized_flow.bridge.sample_spec(
                 spec_logits,
                 sample_batch,
                 rejection_acceptance_uniform,
                 rejection_recovery_gumbel,
                 preserve_original_logits=False,
             )
-            spec_bridge.post_update(
+            spec_v2_optimized_flow.bridge.post_update(
                 sample_batch,
                 output.sampled_token_ids,
                 output.num_sampled,
@@ -477,7 +533,8 @@ def main() -> None:
         "notes": [
             "Measured with wall-clock time and NPU synchronization so host-side batch binding is included.",
             "Warmup iterations run first; measured iterations keep the same request batch in continuous decode state.",
-            "v2_optimized includes stable update_requests, bind_batch, sampling, and post_update.",
+            "All rows include stable update_requests, bind_batch, sampling, and post_update.",
+            "Each path owns independent bridge/request state so benchmark cases do not mutate one another.",
             "v2_optimized uses prefetched random tensors, matching the model_runner overlap design.",
             "spec/v2_native uses the current v2 NPU no-draft-logits helper.",
         ],

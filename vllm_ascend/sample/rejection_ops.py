@@ -3,12 +3,9 @@
 import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.spec_decode.probabilistic_rejection_sampler_utils import (
+    _compute_block_max_and_sumexp,
     _compute_global_lse,
     _insert_resampled_kernel,
-)
-
-from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
-    _compute_block_stats_kernel,
 )
 
 PLACEHOLDER_TOKEN_ID = -1
@@ -105,6 +102,85 @@ class RejectionWorkspace:
             buffer = torch.empty(shape, dtype=dtype, device=device)
             self._buffers[name] = buffer
         return buffer[tuple(slice(0, dim) for dim in shape)]
+
+
+@triton.jit
+def _compute_block_stats_kernel(
+    target_local_argmax_ptr,
+    target_local_argmax_stride,
+    target_local_max_ptr,
+    target_local_max_stride,
+    target_local_sumexp_ptr,
+    target_local_sumexp_stride,
+    draft_local_max_ptr,
+    draft_local_max_stride,
+    draft_local_sumexp_ptr,
+    draft_local_sumexp_stride,
+    target_logits_ptr,
+    target_logits_stride,
+    draft_logits_ptr,
+    draft_logits_stride_0,
+    draft_logits_stride_1,
+    expanded_idx_mapping_ptr,
+    expanded_local_pos_ptr,
+    temperature_ptr,
+    vocab_size,
+    num_speculative_steps,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_DRAFT_LOGITS: tl.constexpr,
+):
+    logit_idx = tl.program_id(0)
+    draft_step_idx = tl.load(expanded_local_pos_ptr + logit_idx)
+    if draft_step_idx >= num_speculative_steps:
+        return
+
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + logit_idx)
+    temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
+    block_idx = tl.program_id(1)
+    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = block < vocab_size
+
+    target_logits = tl.load(
+        target_logits_ptr + logit_idx * target_logits_stride + block,
+        mask=mask,
+        other=float("-inf"),
+    ).to(tl.float32)
+    if temperature == 0.0:
+        value, idx = tl.max(target_logits, axis=0, return_indices=True)
+        tl.store(
+            target_local_argmax_ptr + logit_idx * target_local_argmax_stride + block_idx,
+            block_idx * BLOCK_SIZE + idx,
+        )
+        tl.store(
+            target_local_max_ptr + logit_idx * target_local_max_stride + block_idx,
+            value,
+        )
+        return
+
+    target_max, target_sumexp = _compute_block_max_and_sumexp(target_logits)
+    tl.store(
+        target_local_max_ptr + logit_idx * target_local_max_stride + block_idx,
+        target_max,
+    )
+    tl.store(
+        target_local_sumexp_ptr + logit_idx * target_local_sumexp_stride + block_idx,
+        target_sumexp,
+    )
+    if HAS_DRAFT_LOGITS:
+        draft_logits = tl.load(
+            draft_logits_ptr + req_state_idx * draft_logits_stride_0 + draft_step_idx * draft_logits_stride_1 + block,
+            mask=mask,
+            other=float("-inf"),
+        ).to(tl.float32)
+        draft_max, draft_sumexp = _compute_block_max_and_sumexp(draft_logits)
+        tl.store(
+            draft_local_max_ptr + logit_idx * draft_local_max_stride + block_idx,
+            draft_max,
+        )
+        tl.store(
+            draft_local_sumexp_ptr + logit_idx * draft_local_sumexp_stride + block_idx,
+            draft_sumexp,
+        )
 
 
 @triton.jit

@@ -72,7 +72,15 @@ def test_npu_sampler_apply_sampling_params_reuses_logits():
     sampler.sampling_states = SimpleNamespace(
         apply_temperature=lambda *args: None,
         apply_min_p=lambda *args: None,
-        apply_top_k_top_p=lambda logits, *args: logits,
+        vocab_size=2,
+        top_k=SimpleNamespace(
+            np=np.array([2, 2], dtype=np.int32),
+            gpu=torch.tensor([2, 2], dtype=torch.int32),
+        ),
+        top_p=SimpleNamespace(
+            np=np.array([1.0, 1.0], dtype=np.float32),
+            gpu=torch.tensor([1.0, 1.0], dtype=torch.float32),
+        ),
     )
     logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
 
@@ -87,6 +95,40 @@ def test_npu_sampler_apply_sampling_params_reuses_logits():
 
     assert processed is logits
     assert logits.tolist() == [[1.0, 2.0], [4.0, 1.0]]
+
+
+def test_npu_sampler_apply_top_k_top_p_uses_npu_helper():
+    sampler = NPUSampler.__new__(NPUSampler)
+    sampler.sampling_states = SimpleNamespace(
+        vocab_size=8,
+        top_k=SimpleNamespace(
+            np=np.array([8, 3], dtype=np.int32),
+            gpu=torch.tensor([8, 3], dtype=torch.int32),
+        ),
+        top_p=SimpleNamespace(
+            np=np.array([1.0, 0.9], dtype=np.float32),
+            gpu=torch.tensor([1.0, 0.9], dtype=torch.float32),
+        ),
+    )
+    logits = torch.zeros(2, 8)
+    expanded_idx_mapping = torch.tensor([0, 1], dtype=torch.int64)
+    idx_mapping_np = np.array([0, 1], dtype=np.int32)
+
+    with patch(
+        "vllm_ascend.sample.sampling_bridge.npu_apply_top_k_top_p",
+        side_effect=lambda logits, k, p: logits,
+    ) as apply_top_k_top_p:
+        processed = sampler.apply_top_k_top_p(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping_np,
+        )
+
+    assert processed is logits
+    apply_top_k_top_p.assert_called_once()
+    _, top_k, top_p = apply_top_k_top_p.call_args.args
+    assert top_k.tolist() == [8, 3]
+    assert top_p.tolist() == [1.0, 0.8999999761581421]
 
 
 def test_update_requests_is_incremental_and_removes_departed_requests():

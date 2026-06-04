@@ -24,6 +24,7 @@ from vllm_ascend.sample.rejection_ops import (
     RejectionWorkspace,
     rejection_sample,
 )
+from vllm_ascend.sample.sampler import apply_top_k_top_p as npu_apply_top_k_top_p
 
 _SAMPLING_EPS = 1e-5
 _NPU_BUFFER_OVERRIDES_INSTALLED = False
@@ -179,6 +180,28 @@ class SamplingNoise:
 
 
 class NPUSampler(GpuSampler):
+    def apply_top_k_top_p(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+    ) -> torch.Tensor:
+        do_top_k = np.any(
+            self.sampling_states.top_k.np[idx_mapping_np]
+            != self.sampling_states.vocab_size
+        )
+        do_top_p = np.any(self.sampling_states.top_p.np[idx_mapping_np] != 1.0)
+        if not (do_top_k or do_top_p):
+            return logits
+
+        top_k = (
+            self.sampling_states.top_k.gpu[expanded_idx_mapping] if do_top_k else None
+        )
+        top_p = (
+            self.sampling_states.top_p.gpu[expanded_idx_mapping] if do_top_p else None
+        )
+        return npu_apply_top_k_top_p(logits, top_k, top_p)
+
     def apply_sampling_params(
         self,
         logits: torch.Tensor,
@@ -215,9 +238,7 @@ class NPUSampler(GpuSampler):
 
         self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
 
-        return self.sampling_states.apply_top_k_top_p(
-            logits, expanded_idx_mapping, idx_mapping_np
-        )
+        return self.apply_top_k_top_p(logits, expanded_idx_mapping, idx_mapping_np)
 
 
 @triton.jit

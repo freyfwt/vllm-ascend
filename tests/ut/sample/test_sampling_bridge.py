@@ -24,6 +24,28 @@ def test_sample_logits_modes():
     assert sample_logits(logits, torch.empty(0), mapping, gumbel, all_random=True).tolist() == [0, 1]
 
 
+def test_sample_logits_inplace_gumbel_is_opt_in():
+    logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
+    original = logits.clone()
+    gumbel = torch.tensor([[2.0, 0.0], [0.0, 4.0]])
+    mapping = torch.tensor([0, 1], dtype=torch.int32)
+
+    out = sample_logits(logits, torch.empty(0), mapping, gumbel, all_random=True)
+    assert out.tolist() == [0, 1]
+    assert logits.tolist() == original.tolist()
+
+    out = sample_logits(
+        logits,
+        torch.empty(0),
+        mapping,
+        gumbel,
+        all_random=True,
+        add_gumbel_inplace=True,
+    )
+    assert out.tolist() == [0, 1]
+    assert logits.tolist() == (original + gumbel).tolist()
+
+
 def test_sample_regular_uses_upstream_sampling_params():
     bridge = SamplingBridge.__new__(SamplingBridge)
     bridge._batch_view = GpuBatchView(2, torch.device("cpu"))

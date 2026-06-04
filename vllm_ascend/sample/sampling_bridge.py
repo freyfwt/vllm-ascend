@@ -594,6 +594,7 @@ def sample_logits(
     sampling_gumbel: torch.Tensor | None,
     all_random: bool = False,
     all_greedy: bool = False,
+    add_gumbel_inplace: bool = False,
 ) -> torch.Tensor:
     if sampling_gumbel is not None:
         sampling_gumbel = sampling_gumbel[
@@ -601,12 +602,17 @@ def sample_logits(
             : processed_logits.shape[1],
         ]
     if sampling_gumbel is not None and all_random:
+        if add_gumbel_inplace and processed_logits.dtype == sampling_gumbel.dtype:
+            return processed_logits.add_(sampling_gumbel).argmax(dim=-1).view(-1)
         return (processed_logits + sampling_gumbel).argmax(dim=-1).view(-1)
 
     greedy_tokens = processed_logits.argmax(dim=-1).view(-1)
     if sampling_gumbel is None or all_greedy:
         return greedy_tokens
-    random_tokens = (processed_logits + sampling_gumbel).argmax(dim=-1).view(-1)
+    if add_gumbel_inplace and processed_logits.dtype == sampling_gumbel.dtype:
+        random_tokens = processed_logits.add_(sampling_gumbel).argmax(dim=-1).view(-1)
+    else:
+        random_tokens = (processed_logits + sampling_gumbel).argmax(dim=-1).view(-1)
     row_temperature = temperature[expanded_idx_mapping].to(dtype=torch.float32)
     return torch.where(
         row_temperature < _SAMPLING_EPS,
@@ -779,6 +785,7 @@ class SamplingBridge:
             input_batch.expanded_idx_mapping,
             sampling_gumbel,
             *self._get_regular_sampling_modes(input_batch.idx_mapping_np),
+            add_gumbel_inplace=True,
         )
         return SamplerOutput(
             sampled_token_ids=sampled.to(torch.int32).view(-1, 1),

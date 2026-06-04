@@ -2387,11 +2387,7 @@ class NPUModelRunner(GPUModelRunner):
             return False
         if spec_decode_metadata is None:
             return True
-        return (
-            self.speculative_config is not None
-            and self.speculative_config.rejection_sample_method == "probabilistic"
-            and sampling_bridge.rejection_sampler is not None
-        )
+        return self.speculative_config is not None and sampling_bridge.rejection_sampler is not None
 
     def _make_noise(
         self,

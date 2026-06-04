@@ -643,9 +643,6 @@ class NPURejectionSampler(GpuRejectionSampler):
         acceptance_uniform: torch.Tensor,
         recovery_gumbel: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.rejection_sample_method != "probabilistic":
-            raise RuntimeError("fast sampling only supports probabilistic rejection")
-
         draft_tokens = input_batch.input_ids[input_batch.logits_indices]
         pos = input_batch.positions[input_batch.logits_indices]
         processed_logits = self.sampler.apply_sampling_params(
@@ -702,7 +699,7 @@ class SamplingBridge:
             num_speculative_tokens=num_speculative_steps + 1,
         )
         self.rejection_sampler: NPURejectionSampler | None = None
-        if speculative_config is not None and speculative_config.rejection_sample_method == "probabilistic":
+        if speculative_config is not None:
             self.rejection_sampler = NPURejectionSampler(
                 self.sampler,
                 speculative_config,
@@ -876,11 +873,7 @@ class SamplingBridge:
             if req_id not in active_req_id_set:
                 changed |= self.req_states.remove_request(req_id)
 
-        new_req_ids = [
-            req_id
-            for req_id in active_req_ids
-            if req_id not in self.req_states.req_id_to_index
-        ]
+        new_req_ids = [req_id for req_id in active_req_ids if req_id not in self.req_states.req_id_to_index]
         if new_req_ids and hasattr(input_batch, "update_async_output_token_ids"):
             input_batch.update_async_output_token_ids()
 
@@ -944,13 +937,8 @@ class SamplingBridge:
         for i, req_id in enumerate(req_ids):
             self._idx_mapping_np_storage[i] = self.req_states.req_id_to_index[req_id]
         idx_mapping_np = self._idx_mapping_np_storage[:num_reqs]
-        if np.any(
-            (idx_mapping_np < 0) | (idx_mapping_np >= self.req_states.max_num_reqs)
-        ):
-            raise RuntimeError(
-                "SamplingBridge produced invalid request-state indices: "
-                f"{idx_mapping_np.tolist()}"
-            )
+        if np.any((idx_mapping_np < 0) | (idx_mapping_np >= self.req_states.max_num_reqs)):
+            raise RuntimeError(f"SamplingBridge produced invalid request-state indices: {idx_mapping_np.tolist()}")
         if num_reqs:
             self._idx_mapping[:num_reqs].copy_(
                 torch.from_numpy(idx_mapping_np),
@@ -995,7 +983,7 @@ class SamplingBridge:
                 output_token_ids.extend(
                     input_batch.token_ids_cpu[
                         req_index,
-                        prompt_len + len(output_token_ids):total_len,
+                        prompt_len + len(output_token_ids) : total_len,
                     ].tolist()
                 )
         return prompt_token_ids + output_token_ids

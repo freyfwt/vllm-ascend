@@ -220,7 +220,6 @@ def make_sampling_bridge(
     if enable_spec:
         speculative_config = SimpleNamespace(
             num_speculative_tokens=spec_steps,
-            rejection_sample_method="probabilistic",
         )
     return SamplingBridge(
         max_num_reqs=batch_size,

@@ -32,6 +32,10 @@ SINK = None
 DEFAULT_BATCH_SIZES = (1, 8, 32, 64, 96)
 DEFAULT_SCENARIOS = ("regular", "spec")
 DEFAULT_PATHS = ("v1_native", "v2_native", "v2_optimized")
+DEFAULT_TEMPERATURE = 0.8
+DEFAULT_TOP_K = 20
+DEFAULT_TOP_P = 0.95
+_SAMPLING_EPS = 1e-5
 
 
 def install_fake_ascend_config() -> None:
@@ -43,13 +47,20 @@ def install_fake_ascend_config() -> None:
     )
 
 
-def make_sampling_metadata(num_reqs: int, device: torch.device) -> SamplingMetadata:
+def make_sampling_metadata(
+    num_reqs: int,
+    device: torch.device,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+) -> SamplingMetadata:
+    all_greedy = temperature < _SAMPLING_EPS
     return SamplingMetadata(
-        temperature=torch.ones(num_reqs, device=device, dtype=torch.float32),
-        all_greedy=False,
-        all_random=True,
-        top_p=None,
-        top_k=None,
+        temperature=torch.full((num_reqs,), temperature, device=device, dtype=torch.float32),
+        all_greedy=all_greedy,
+        all_random=not all_greedy,
+        top_p=torch.full((num_reqs,), top_p, device=device, dtype=torch.float32),
+        top_k=torch.full((num_reqs,), top_k, device=device, dtype=torch.int32),
         generators={},
         max_num_logprobs=None,
         no_penalties=True,
@@ -134,7 +145,12 @@ def make_gumbel(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
     return gumbel
 
 
-def make_bridge_batch(batch_size: int) -> tuple[SimpleNamespace, dict[str, SimpleNamespace]]:
+def make_bridge_batch(
+    batch_size: int,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+) -> tuple[SimpleNamespace, dict[str, SimpleNamespace]]:
     req_ids = [f"req_{idx}" for idx in range(batch_size)]
     token_ids = torch.arange(batch_size, dtype=torch.int32).view(batch_size, 1)
     input_batch = SimpleNamespace(
@@ -146,7 +162,16 @@ def make_bridge_batch(batch_size: int) -> tuple[SimpleNamespace, dict[str, Simpl
         token_ids_cpu=token_ids.numpy(),
         is_token_ids=torch.ones(batch_size, 1, dtype=torch.bool).numpy(),
     )
-    requests = {req_id: SimpleNamespace(sampling_params=SamplingParams(temperature=1.0)) for req_id in req_ids}
+    requests = {
+        req_id: SimpleNamespace(
+            sampling_params=SamplingParams(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+        )
+        for req_id in req_ids
+    }
     return input_batch, requests
 
 
@@ -226,7 +251,13 @@ def run_batch_size(
     max_model_len = 1 + (args.warmups + args.iterations + 4) * (spec_steps + 1)
 
     sampler = AscendSampler()
-    sampling_metadata = make_sampling_metadata(batch_size, device)
+    sampling_metadata = make_sampling_metadata(
+        batch_size,
+        device,
+        args.temperature,
+        args.top_k,
+        args.top_p,
+    )
     cases: list[tuple[str, str, Callable[[], torch.Tensor]]] = []
 
     if "regular" in args.scenarios:
@@ -251,7 +282,12 @@ def run_batch_size(
                 device=device,
                 enable_spec=False,
             )
-            input_batch, requests = make_bridge_batch(batch_size)
+            input_batch, requests = make_bridge_batch(
+                batch_size,
+                args.temperature,
+                args.top_k,
+                args.top_p,
+            )
             assert bridge.update_requests(input_batch, requests)
             return SimpleNamespace(
                 bridge=bridge,
@@ -367,7 +403,12 @@ def run_batch_size(
                 device=device,
                 enable_spec=True,
             )
-            input_batch, requests = make_bridge_batch(batch_size)
+            input_batch, requests = make_bridge_batch(
+                batch_size,
+                args.temperature,
+                args.top_k,
+                args.top_p,
+            )
             assert bridge.update_requests(input_batch, requests)
             return SimpleNamespace(
                 bridge=bridge,
@@ -473,6 +514,9 @@ def main() -> None:
     parser.add_argument("--spec-steps", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument("--top-p", type=float, default=DEFAULT_TOP_P)
     parser.add_argument("--scenarios", choices=DEFAULT_SCENARIOS, nargs="+", default=list(DEFAULT_SCENARIOS))
     parser.add_argument("--paths", choices=DEFAULT_PATHS, nargs="+", default=list(DEFAULT_PATHS))
     parser.add_argument("--device", default="npu:0")
@@ -507,6 +551,11 @@ def main() -> None:
         "batch_sizes": batch_sizes,
         "vocab_size": args.vocab_size,
         "spec_steps": args.spec_steps,
+        "sampling_params": {
+            "temperature": args.temperature,
+            "top_k": args.top_k,
+            "top_p": args.top_p,
+        },
         "scenarios": args.scenarios,
         "paths": args.paths,
         "warmups": args.warmups,

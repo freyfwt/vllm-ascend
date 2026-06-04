@@ -193,6 +193,55 @@ Conclusions:
   generation cost should be accounted for separately. The design depends on
   moving this work before sampling and overlapping it with model forward.
 
+Latest batch sweep with non-default sampling parameters:
+
+```bash
+python benchmarks/ops/bench_sampling_paths.py \
+  --batch-sizes 1 8 32 64 96 \
+  --vocab-size 151936 --spec-steps 3 \
+  --warmups 5 --iterations 20 \
+  --temperature 0.8 --top-k 20 --top-p 0.95 \
+  --device npu:1
+```
+
+The run was measured on 2026-06-04 with wall-clock timing and NPU
+synchronization. A process-local compatibility shim was used only for the
+benchmark process because the current upstream checkout no longer exports the
+old `vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils` module name.
+
+| Batch size | Scenario | Path | Mean ms | Median ms | P90 ms | Speedup vs v1 |
+|---:|---|---|---:|---:|---:|---:|
+| 1 | regular | v1_native | 1.088 | 1.074 | 1.133 | 1.00x |
+| 1 | regular | v2_native | 2.313 | 2.309 | 2.331 | 0.47x |
+| 1 | regular | v2_optimized | 1.226 | 1.221 | 1.238 | 0.89x |
+| 1 | spec | v1_native | 3.466 | 3.470 | 3.509 | 1.00x |
+| 1 | spec | v2_native | 3.268 | 3.266 | 3.293 | 1.06x |
+| 1 | spec | v2_optimized | 2.412 | 2.411 | 2.429 | 1.44x |
+| 8 | regular | v1_native | 1.174 | 1.172 | 1.191 | 1.00x |
+| 8 | regular | v2_native | 10.700 | 10.693 | 10.725 | 0.11x |
+| 8 | regular | v2_optimized | 1.330 | 1.328 | 1.343 | 0.88x |
+| 8 | spec | v1_native | 3.874 | 3.873 | 3.898 | 1.00x |
+| 8 | spec | v2_native | 11.431 | 11.425 | 11.473 | 0.34x |
+| 8 | spec | v2_optimized | 2.349 | 2.347 | 2.370 | 1.65x |
+| 32 | regular | v1_native | 1.307 | 1.298 | 1.354 | 1.00x |
+| 32 | regular | v2_native | 39.785 | 39.773 | 39.827 | 0.03x |
+| 32 | regular | v2_optimized | 1.478 | 1.477 | 1.501 | 0.88x |
+| 32 | spec | v1_native | 6.252 | 6.251 | 6.302 | 1.00x |
+| 32 | spec | v2_native | 42.416 | 42.402 | 42.580 | 0.15x |
+| 32 | spec | v2_optimized | 5.398 | 5.391 | 5.656 | 1.16x |
+| 64 | regular | v1_native | 2.151 | 2.152 | 2.176 | 1.00x |
+| 64 | regular | v2_native | 78.828 | 78.895 | 78.969 | 0.03x |
+| 64 | regular | v2_optimized | 2.230 | 2.230 | 2.238 | 0.96x |
+| 64 | spec | v1_native | 11.530 | 11.323 | 12.042 | 1.00x |
+| 64 | spec | v2_native | 82.395 | 82.360 | 82.619 | 0.14x |
+| 64 | spec | v2_optimized | 8.164 | 8.099 | 8.625 | 1.41x |
+| 96 | regular | v1_native | 3.780 | 3.743 | 3.826 | 1.00x |
+| 96 | regular | v2_native | 117.613 | 117.598 | 117.776 | 0.03x |
+| 96 | regular | v2_optimized | 3.266 | 3.188 | 3.461 | 1.16x |
+| 96 | spec | v1_native | 17.385 | 17.180 | 17.873 | 1.00x |
+| 96 | spec | v2_native | 122.120 | 122.104 | 122.354 | 0.14x |
+| 96 | spec | v2_optimized | 11.692 | 11.620 | 12.031 | 1.49x |
+
 ### 4.4 Experiments That Should Not Be Productized
 
 #### Candidate resampling

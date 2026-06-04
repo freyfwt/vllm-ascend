@@ -186,20 +186,13 @@ class NPUSampler(GpuSampler):
         expanded_idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
     ) -> torch.Tensor:
-        do_top_k = np.any(
-            self.sampling_states.top_k.np[idx_mapping_np]
-            != self.sampling_states.vocab_size
-        )
+        do_top_k = np.any(self.sampling_states.top_k.np[idx_mapping_np] != self.sampling_states.vocab_size)
         do_top_p = np.any(self.sampling_states.top_p.np[idx_mapping_np] != 1.0)
         if not (do_top_k or do_top_p):
             return logits
 
-        top_k = (
-            self.sampling_states.top_k.gpu[expanded_idx_mapping] if do_top_k else None
-        )
-        top_p = (
-            self.sampling_states.top_p.gpu[expanded_idx_mapping] if do_top_p else None
-        )
+        top_k = self.sampling_states.top_k.gpu[expanded_idx_mapping] if do_top_k else None
+        top_p = self.sampling_states.top_p.gpu[expanded_idx_mapping] if do_top_p else None
         return npu_apply_top_k_top_p(logits, top_k, top_p)
 
     def apply_sampling_params(
@@ -211,9 +204,7 @@ class NPUSampler(GpuSampler):
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
     ) -> torch.Tensor:
-        self.logit_bias_state.apply_logit_bias(
-            logits, expanded_idx_mapping, idx_mapping_np, pos
-        )
+        self.logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
 
         self.penalties_state.apply_penalties(
             logits,
@@ -232,9 +223,7 @@ class NPUSampler(GpuSampler):
             expanded_local_pos,
         )
 
-        self.sampling_states.apply_temperature(
-            logits, expanded_idx_mapping, idx_mapping_np
-        )
+        self.sampling_states.apply_temperature(logits, expanded_idx_mapping, idx_mapping_np)
 
         self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
 

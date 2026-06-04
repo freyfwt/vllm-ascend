@@ -143,6 +143,55 @@ def test_update_requests_is_incremental_and_removes_departed_requests():
     assert bridge.sampler.applied_writes == 2
 
 
+def test_update_requests_repairs_async_outputs_before_initializing_request():
+    with _patched_bridge_deps():
+        bridge = _make_bridge()
+
+        input_batch = _make_fake_input_batch(["req0"])
+        input_batch.token_ids_cpu[0, 2] = -1
+        request = SimpleNamespace(
+            sampling_params=SimpleNamespace(name="p0"),
+            output_token_ids=[-1],
+        )
+
+        def update_async_output_token_ids():
+            request.output_token_ids[:] = [12, 13]
+
+        input_batch.update_async_output_token_ids = update_async_output_token_ids
+
+        assert bridge.update_requests(input_batch, {"req0": request})
+
+    assert bridge.req_states.added[0][2] == [10, 11, 12, 13]
+
+
+def test_update_requests_rejects_unresolved_async_placeholders():
+    with _patched_bridge_deps():
+        bridge = _make_bridge()
+        input_batch = _make_fake_input_batch(["req0"])
+        input_batch.token_ids_cpu[0, 2] = -1
+        request = SimpleNamespace(
+            sampling_params=SimpleNamespace(name="p0"),
+            output_token_ids=[-1],
+        )
+
+        assert not bridge.update_requests(input_batch, {"req0": request})
+
+    assert bridge.req_states.added == []
+
+
+def test_refresh_idx_mapping_updates_same_req_ids_when_slots_change():
+    with _patched_bridge_deps():
+        bridge = _make_bridge()
+        req_ids = ("req0",)
+        bridge.req_states.req_id_to_index["req0"] = 1
+        bridge._refresh_idx_mapping(req_ids)
+        bridge.req_states.req_id_to_index["req0"] = 2
+        bridge._refresh_idx_mapping(req_ids)
+
+    assert bridge._idx_mapping_np_storage[:1].tolist() == [2]
+    assert bridge._idx_mapping[:1].tolist() == [2]
+
+
 def test_bind_batch_regular_and_spec_reuse_runner_tensors():
     view = GpuBatchView(max_num_reqs=4, device=torch.device("cpu"))
     req_ids = ["req0", "req1"]
@@ -249,7 +298,7 @@ class _FakeSampler:
 
 class _FakeRequestState:
     def __init__(self, **kwargs):
-        del kwargs
+        self.max_num_reqs = kwargs.get("max_num_reqs", 4)
         self.req_id_to_index = {}
         self.num_speculative_steps = 0
         self.added = []

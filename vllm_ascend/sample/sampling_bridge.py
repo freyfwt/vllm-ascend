@@ -710,7 +710,7 @@ class SamplingBridge:
             )
         self._batch_view = GpuBatchView(max_num_reqs, device)
         self._idx_mapping = torch.empty(max_num_reqs, dtype=torch.int32, device=device)
-        self._idx_mapping_np_storage = np.empty(max_num_reqs, dtype=np.int32)
+        self._idx_mapping_np_storage = np.zeros(max_num_reqs, dtype=np.int32)
         self._idx_mapping_req_ids: tuple[str, ...] = ()
 
     def bind_batch(
@@ -876,6 +876,14 @@ class SamplingBridge:
             if req_id not in active_req_id_set:
                 changed |= self.req_states.remove_request(req_id)
 
+        new_req_ids = [
+            req_id
+            for req_id in active_req_ids
+            if req_id not in self.req_states.req_id_to_index
+        ]
+        if new_req_ids and hasattr(input_batch, "update_async_output_token_ids"):
+            input_batch.update_async_output_token_ids()
+
         for req_id in active_req_ids:
             if req_id in self.req_states.req_id_to_index:
                 continue
@@ -884,13 +892,23 @@ class SamplingBridge:
                 return False
             req_index = input_batch.req_id_to_index[req_id]
             prompt_len = int(input_batch.num_prompt_tokens[req_index])
-            total_len = int(input_batch.num_tokens_no_spec[req_index])
-            if not self._has_all_token_ids(input_batch, req_index, total_len):
-                return False
-            all_token_ids = input_batch.token_ids_cpu[
+            total_len = self._get_total_len(
+                input_batch,
+                request,
                 req_index,
-                :total_len,
-            ].tolist()
+                prompt_len,
+            )
+            if not self._has_all_token_ids(input_batch, req_index, prompt_len):
+                return False
+            all_token_ids = self._get_all_token_ids(
+                input_batch,
+                request,
+                req_index,
+                prompt_len,
+                total_len,
+            )
+            if any(token_id < 0 for token_id in all_token_ids):
+                return False
             num_computed_tokens = min(
                 int(input_batch.num_computed_tokens_cpu[req_index]),
                 total_len,
@@ -917,17 +935,70 @@ class SamplingBridge:
         return True
 
     def _refresh_idx_mapping(self, req_ids: tuple[str, ...]) -> None:
-        if req_ids == self._idx_mapping_req_ids:
-            return
         num_reqs = len(req_ids)
+        if num_reqs > self._idx_mapping_np_storage.shape[0]:
+            raise RuntimeError(
+                f"SamplingBridge got {num_reqs} requests, exceeding "
+                f"max_num_reqs={self._idx_mapping_np_storage.shape[0]}"
+            )
         for i, req_id in enumerate(req_ids):
             self._idx_mapping_np_storage[i] = self.req_states.req_id_to_index[req_id]
+        idx_mapping_np = self._idx_mapping_np_storage[:num_reqs]
+        if np.any(
+            (idx_mapping_np < 0) | (idx_mapping_np >= self.req_states.max_num_reqs)
+        ):
+            raise RuntimeError(
+                "SamplingBridge produced invalid request-state indices: "
+                f"{idx_mapping_np.tolist()}"
+            )
         if num_reqs:
             self._idx_mapping[:num_reqs].copy_(
-                torch.from_numpy(self._idx_mapping_np_storage[:num_reqs]),
+                torch.from_numpy(idx_mapping_np),
                 non_blocking=True,
             )
         self._idx_mapping_req_ids = req_ids
+
+    @staticmethod
+    def _get_total_len(
+        input_batch: Any,
+        request: Any,
+        req_index: int,
+        prompt_len: int,
+    ) -> int:
+        request_output_token_ids = getattr(request, "output_token_ids", None)
+        if request_output_token_ids is not None:
+            return prompt_len + len(request_output_token_ids)
+        return int(input_batch.num_tokens_no_spec[req_index])
+
+    @staticmethod
+    def _get_all_token_ids(
+        input_batch: Any,
+        request: Any,
+        req_index: int,
+        prompt_len: int,
+        total_len: int,
+    ) -> list[int]:
+        prompt_token_ids = input_batch.token_ids_cpu[
+            req_index,
+            :prompt_len,
+        ].tolist()
+        output_len = max(total_len - prompt_len, 0)
+        request_output_token_ids = getattr(request, "output_token_ids", None)
+        if request_output_token_ids is None:
+            output_token_ids = input_batch.token_ids_cpu[
+                req_index,
+                prompt_len:total_len,
+            ].tolist()
+        else:
+            output_token_ids = list(request_output_token_ids[:output_len])
+            if len(output_token_ids) < output_len:
+                output_token_ids.extend(
+                    input_batch.token_ids_cpu[
+                        req_index,
+                        prompt_len + len(output_token_ids):total_len,
+                    ].tolist()
+                )
+        return prompt_token_ids + output_token_ids
 
     @staticmethod
     def _has_all_token_ids(

@@ -2192,6 +2192,11 @@ class NPUModelRunner(GPUModelRunner):
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
 
+        if self.use_async_scheduling:
+            self._draft_token_ids = None
+            self._draft_token_req_ids = None
+            self.input_batch.prev_sampled_token_ids = None
+
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None # type: ignore[no-redef]
 
         def propose_draft_token_ids(sampled_token_ids):

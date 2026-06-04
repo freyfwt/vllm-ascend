@@ -23,6 +23,7 @@ from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.sample.sampling_bridge import (
     SamplingBridge,
 )
+from vllm_ascend.utils import enable_custom_op
 from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
     rejection_sample as v2_rejection_sample,
@@ -524,6 +525,8 @@ def main() -> None:
 
     torch.npu.set_device(int(args.device.split(":")[-1]))
     init_device_properties_triton()
+    if not enable_custom_op():
+        raise RuntimeError("sampling path benchmark requires vllm_ascend custom ops")
     install_fake_ascend_config()
     torch.manual_seed(20260601)
 

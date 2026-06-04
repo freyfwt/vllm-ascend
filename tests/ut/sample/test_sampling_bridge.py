@@ -131,6 +131,46 @@ def test_npu_sampler_apply_top_k_top_p_uses_npu_helper():
     assert top_p.tolist() == [1.0, 0.8999999761581421]
 
 
+def test_npu_sampler_apply_sampling_params_casts_logits_before_top_p():
+    sampler = NPUSampler.__new__(NPUSampler)
+    sampler.num_speculative_tokens = 1
+    sampler.logit_bias_state = SimpleNamespace(apply_logit_bias=lambda *args: None)
+    sampler.penalties_state = SimpleNamespace(apply_penalties=lambda *args: None)
+    sampler.bad_words_state = SimpleNamespace(apply_bad_words=lambda *args: None)
+    sampler.sampling_states = SimpleNamespace(
+        apply_temperature=lambda *args: None,
+        apply_min_p=lambda *args: None,
+        vocab_size=8,
+        top_k=SimpleNamespace(
+            np=np.array([8], dtype=np.int32),
+            gpu=torch.tensor([8], dtype=torch.int32),
+        ),
+        top_p=SimpleNamespace(
+            np=np.array([0.9], dtype=np.float32),
+            gpu=torch.tensor([0.9], dtype=torch.float32),
+        ),
+    )
+    logits = torch.zeros(1, 8, dtype=torch.bfloat16)
+
+    with patch(
+        "vllm_ascend.sample.sampling_bridge.npu_apply_top_k_top_p",
+        side_effect=lambda logits, k, p: logits,
+    ) as apply_top_k_top_p:
+        processed = sampler.apply_sampling_params(
+            logits,
+            torch.tensor([0], dtype=torch.int32),
+            np.array([0], dtype=np.int32),
+            torch.tensor([0], dtype=torch.int64),
+            torch.tensor([3], dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+        )
+
+    assert processed.dtype == torch.float32
+    passed_logits, _, top_p = apply_top_k_top_p.call_args.args
+    assert passed_logits.dtype == torch.float32
+    assert top_p.dtype == torch.float32
+
+
 def test_update_requests_is_incremental_and_removes_departed_requests():
     with _patched_bridge_deps():
         bridge = _make_bridge()

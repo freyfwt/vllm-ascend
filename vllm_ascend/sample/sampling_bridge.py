@@ -204,6 +204,7 @@ class NPUSampler(GpuSampler):
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
     ) -> torch.Tensor:
+        logits = logits.to(torch.float32)
         self.logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
 
         self.penalties_state.apply_penalties(

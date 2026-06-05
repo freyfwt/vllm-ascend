@@ -32,7 +32,7 @@ from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
 SINK = None
 DEFAULT_BATCH_SIZES = (1, 8, 32, 64, 96)
 DEFAULT_SCENARIOS = ("regular", "spec")
-DEFAULT_PATHS = ("v1_native", "v2_native", "v2_optimized")
+DEFAULT_PATHS = ("bridge_bind", "v1_native", "v2_native", "v2_optimized")
 DEFAULT_TEMPERATURE = 0.8
 DEFAULT_TOP_K = 20
 DEFAULT_TOP_P = 0.95
@@ -299,6 +299,7 @@ def run_batch_size(
         regular_v1_flow = make_regular_flow()
         regular_v2_flow = make_regular_flow()
         regular_v2_optimized_flow = make_regular_flow()
+        regular_bridge_bind_flow = make_regular_flow()
 
         def bind_regular_flow(flow: SimpleNamespace):
             if not flow.bridge.update_requests(flow.input_batch, flow.requests):
@@ -314,6 +315,9 @@ def run_batch_size(
                 seq_lens=regular_seq_lens,
                 seq_lens_cpu_upper_bound=regular_seq_lens_cpu_upper_bound,
             )
+
+        def regular_bridge_bind() -> torch.Tensor:
+            return bind_regular_flow(regular_bridge_bind_flow).idx_mapping
 
         def regular_v1_native() -> torch.Tensor:
             sample_batch = bind_regular_flow(regular_v1_flow)
@@ -370,6 +374,8 @@ def run_batch_size(
             )
             return output.sampled_token_ids
 
+        if "bridge_bind" in args.paths:
+            cases.append(("regular", "bridge_bind", regular_bridge_bind))
         if "v1_native" in args.paths:
             cases.append(("regular", "v1_native", regular_v1_native))
         if "v2_native" in args.paths:
@@ -419,6 +425,7 @@ def run_batch_size(
         spec_v1_flow = make_spec_flow()
         spec_v2_flow = make_spec_flow()
         spec_v2_optimized_flow = make_spec_flow()
+        spec_bridge_bind_flow = make_spec_flow()
 
         def bind_spec_flow(flow: SimpleNamespace):
             if not flow.bridge.update_requests(flow.input_batch, flow.requests):
@@ -434,6 +441,9 @@ def run_batch_size(
                 seq_lens=spec_seq_lens,
                 seq_lens_cpu_upper_bound=spec_seq_lens_cpu_upper_bound,
             )
+
+        def spec_bridge_bind() -> torch.Tensor:
+            return bind_spec_flow(spec_bridge_bind_flow).expanded_idx_mapping
 
         def infer_num_sampled(sampled: torch.Tensor) -> torch.Tensor:
             return sampled.ne(-1).sum(dim=1).to(torch.int32)
@@ -488,6 +498,8 @@ def run_batch_size(
             )
             return output.sampled_token_ids
 
+        if "bridge_bind" in args.paths:
+            cases.append(("spec", "bridge_bind", spec_bridge_bind))
         if "v1_native" in args.paths:
             cases.append(("spec", "v1_native", spec_v1_native))
         if "v2_native" in args.paths:
@@ -566,7 +578,8 @@ def main() -> None:
         "notes": [
             "Measured with wall-clock time and NPU synchronization so host-side batch binding is included.",
             "Warmup iterations run first; measured iterations keep the same request batch in continuous decode state.",
-            "All rows include stable update_requests, bind_batch, sampling, and post_update.",
+            "Sampling path rows include stable update_requests, bind_batch, sampling, and post_update.",
+            "bridge_bind rows isolate stable update_requests and bind_batch without sampling or post_update.",
             "Each path owns independent bridge/request state so benchmark cases do not mutate one another.",
             "v2_optimized uses prefetched random tensors, matching the model_runner overlap design.",
             "spec/v2_native uses the current v2 NPU no-draft-logits helper.",

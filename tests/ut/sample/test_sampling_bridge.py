@@ -232,6 +232,21 @@ def test_refresh_idx_mapping_updates_same_req_ids_when_slots_change():
     assert bridge._idx_mapping[:1].tolist() == [2]
 
 
+def test_refresh_idx_mapping_skips_device_copy_for_stable_decode():
+    with _patched_bridge_deps():
+        bridge = _make_bridge()
+        req_ids = ("req0", "req1")
+        bridge.req_states.req_id_to_index.update({"req0": 1, "req1": 2})
+        bridge._idx_mapping = _CopyCountingMapping()
+
+        bridge._refresh_idx_mapping(req_ids)
+        bridge._refresh_idx_mapping(req_ids)
+
+    assert bridge._idx_mapping.copy_calls == 1
+    assert bridge._idx_mapping.copied_values == [[1, 2]]
+    assert bridge._idx_mapping_np_storage[:2].tolist() == [1, 2]
+
+
 def test_bind_batch_regular_and_spec_reuse_runner_tensors():
     view = GpuBatchView(max_num_reqs=4, device=torch.device("cpu"))
     req_ids = ["req0", "req1"]
@@ -377,6 +392,22 @@ class _FakeTemperature:
     def __init__(self, temperature):
         self.gpu = temperature
         self.np = temperature.detach().cpu().numpy()
+
+
+class _CopyCountingMapping:
+    def __init__(self):
+        self.copy_calls = 0
+        self.copied_values = []
+
+    def __getitem__(self, key):
+        self.key = key
+        return self
+
+    def copy_(self, src, non_blocking=False):
+        assert non_blocking
+        self.copy_calls += 1
+        self.copied_values.append(src.tolist())
+        return self
 
 
 def _fake_expand_idx_mapping(idx_mapping, total_num_logits, cu_num_logits, max_expand_len):

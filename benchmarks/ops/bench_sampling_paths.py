@@ -29,7 +29,13 @@ from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
 SINK = None
 DEFAULT_BATCH_SIZES = (1, 8, 32, 64, 96)
 DEFAULT_SCENARIOS = ("regular", "spec")
-DEFAULT_PATHS = ("bridge_bind", "v1_native", "v2_native", "v2_optimized")
+DEFAULT_PATHS = (
+    "bridge_bind",
+    "bridge_bind_refresh",
+    "v1_native",
+    "v2_native",
+    "v2_optimized",
+)
 DEFAULT_TEMPERATURE = 0.8
 DEFAULT_TOP_K = 20
 DEFAULT_TOP_P = 0.95
@@ -297,8 +303,11 @@ def run_batch_size(
         regular_v2_flow = make_regular_flow()
         regular_v2_optimized_flow = make_regular_flow()
         regular_bridge_bind_flow = make_regular_flow()
+        regular_bridge_bind_refresh_flow = make_regular_flow()
 
-        def bind_regular_flow(flow: SimpleNamespace):
+        def bind_regular_flow(flow: SimpleNamespace, force_idx_mapping_refresh: bool = False):
+            if force_idx_mapping_refresh:
+                flow.bridge._idx_mapping_req_ids = ()
             if not flow.bridge.update_requests(flow.input_batch, flow.requests):
                 raise RuntimeError("failed to update regular bridge requests")
             return flow.bridge.bind_batch(
@@ -315,6 +324,12 @@ def run_batch_size(
 
         def regular_bridge_bind() -> torch.Tensor:
             return bind_regular_flow(regular_bridge_bind_flow).idx_mapping
+
+        def regular_bridge_bind_refresh() -> torch.Tensor:
+            return bind_regular_flow(
+                regular_bridge_bind_refresh_flow,
+                force_idx_mapping_refresh=True,
+            ).idx_mapping
 
         def regular_v1_native() -> torch.Tensor:
             sample_batch = bind_regular_flow(regular_v1_flow)
@@ -373,6 +388,8 @@ def run_batch_size(
 
         if "bridge_bind" in args.paths:
             cases.append(("regular", "bridge_bind", regular_bridge_bind))
+        if "bridge_bind_refresh" in args.paths:
+            cases.append(("regular", "bridge_bind_refresh", regular_bridge_bind_refresh))
         if "v1_native" in args.paths:
             cases.append(("regular", "v1_native", regular_v1_native))
         if "v2_native" in args.paths:
@@ -427,8 +444,11 @@ def run_batch_size(
         spec_v2_flow = make_spec_flow()
         spec_v2_optimized_flow = make_spec_flow()
         spec_bridge_bind_flow = make_spec_flow()
+        spec_bridge_bind_refresh_flow = make_spec_flow()
 
-        def bind_spec_flow(flow: SimpleNamespace):
+        def bind_spec_flow(flow: SimpleNamespace, force_idx_mapping_refresh: bool = False):
+            if force_idx_mapping_refresh:
+                flow.bridge._idx_mapping_req_ids = ()
             if not flow.bridge.update_requests(flow.input_batch, flow.requests):
                 raise RuntimeError("failed to update spec bridge requests")
             return flow.bridge.bind_batch(
@@ -445,6 +465,12 @@ def run_batch_size(
 
         def spec_bridge_bind() -> torch.Tensor:
             return bind_spec_flow(spec_bridge_bind_flow).expanded_idx_mapping
+
+        def spec_bridge_bind_refresh() -> torch.Tensor:
+            return bind_spec_flow(
+                spec_bridge_bind_refresh_flow,
+                force_idx_mapping_refresh=True,
+            ).expanded_idx_mapping
 
         def infer_num_sampled(sampled: torch.Tensor) -> torch.Tensor:
             return sampled.ne(-1).sum(dim=1).to(torch.int32)
@@ -501,6 +527,8 @@ def run_batch_size(
 
         if "bridge_bind" in args.paths:
             cases.append(("spec", "bridge_bind", spec_bridge_bind))
+        if "bridge_bind_refresh" in args.paths:
+            cases.append(("spec", "bridge_bind_refresh", spec_bridge_bind_refresh))
         if "v1_native" in args.paths:
             cases.append(("spec", "v1_native", spec_v1_native))
         if "v2_native" in args.paths:
@@ -581,6 +609,7 @@ def main() -> None:
             "Warmup iterations run first; measured iterations keep the same request batch in continuous decode state.",
             "Sampling path rows include stable update_requests, bind_batch, sampling, and post_update.",
             "bridge_bind rows isolate stable update_requests and bind_batch without sampling or post_update.",
+            "bridge_bind_refresh rows invalidate the idx mapping cache each iteration to simulate pre-fix copies.",
             "Each path owns independent bridge/request state so benchmark cases do not mutate one another.",
             "v2_optimized uses prefetched random tensors, matching the model_runner overlap design.",
             "spec/v2_native uses the current v2 NPU no-draft-logits helper.",

@@ -219,13 +219,14 @@ def test_update_requests_rejects_unresolved_async_placeholders():
     assert bridge.req_states.added == []
 
 
-def test_refresh_idx_mapping_updates_same_req_ids_when_slots_change():
+def test_refresh_idx_mapping_updates_same_req_ids_after_cache_invalidation():
     with _patched_bridge_deps():
         bridge = _make_bridge()
         req_ids = ("req0",)
         bridge.req_states.req_id_to_index["req0"] = 1
         bridge._refresh_idx_mapping(req_ids)
         bridge.req_states.req_id_to_index["req0"] = 2
+        bridge._idx_mapping_req_ids = ()
         bridge._refresh_idx_mapping(req_ids)
 
     assert bridge._idx_mapping_np_storage[:1].tolist() == [2]

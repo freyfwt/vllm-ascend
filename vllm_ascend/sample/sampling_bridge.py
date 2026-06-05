@@ -929,22 +929,20 @@ class SamplingBridge:
         return True
 
     def _refresh_idx_mapping(self, req_ids: tuple[str, ...]) -> None:
+        if req_ids == self._idx_mapping_req_ids:
+            return
         num_reqs = len(req_ids)
         if num_reqs > self._idx_mapping_np_storage.shape[0]:
             raise RuntimeError(
                 f"SamplingBridge got {num_reqs} requests, exceeding "
                 f"max_num_reqs={self._idx_mapping_np_storage.shape[0]}"
             )
-        mapping_changed = req_ids != self._idx_mapping_req_ids
         idx_mapping_np = self._idx_mapping_np_storage[:num_reqs]
         for i, req_id in enumerate(req_ids):
-            req_state_idx = self.req_states.req_id_to_index[req_id]
-            if not mapping_changed and idx_mapping_np[i] != req_state_idx:
-                mapping_changed = True
-            idx_mapping_np[i] = req_state_idx
+            idx_mapping_np[i] = self.req_states.req_id_to_index[req_id]
         if np.any((idx_mapping_np < 0) | (idx_mapping_np >= self.req_states.max_num_reqs)):
             raise RuntimeError(f"SamplingBridge produced invalid request-state indices: {idx_mapping_np.tolist()}")
-        if num_reqs and mapping_changed:
+        if num_reqs:
             self._idx_mapping[:num_reqs].copy_(
                 torch.from_numpy(idx_mapping_np),
                 non_blocking=True,

@@ -25,9 +25,6 @@ from vllm_ascend.sample.sampling_bridge import (
 )
 from vllm_ascend.utils import enable_custom_op
 from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
-from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
-    rejection_sample as v2_rejection_sample,
-)
 
 SINK = None
 DEFAULT_BATCH_SIZES = (1, 8, 32, 64, 96)
@@ -384,6 +381,10 @@ def run_batch_size(
             cases.append(("regular", "v2_optimized", regular_v2_optimized))
 
     if "spec" in args.scenarios:
+        from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
+            rejection_sample as v2_rejection_sample,
+        )
+
         rejection_sampler = AscendRejectionSampler(sampler)
         spec_metadata, input_ids, positions = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
         spec_logits = torch.randn(num_logits, vocab_size, dtype=torch.float32, device=device)

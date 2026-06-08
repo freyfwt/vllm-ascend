@@ -1,15 +1,13 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import numpy as np
 import torch
 
 from vllm_ascend.sample.sampling_bridge import (
-    GpuBatchView,
-    NPUSampler,
-    SamplingBridge,
-    _DeviceBackedTensor,
-    _NPUStagedWriteBuffer,
+    FastSampler,
+    NoiseManager,
+    SamplingNoise,
+    apply_regular_sampling_params,
     sample_logits,
 )
 
@@ -17,27 +15,25 @@ from vllm_ascend.sample.sampling_bridge import (
 def test_sample_logits_modes():
     logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
     gumbel = torch.tensor([[2.0, 0.0], [0.0, 4.0]])
-    mapping = torch.tensor([0, 1], dtype=torch.int32)
 
-    assert sample_logits(logits, torch.ones(2), mapping, gumbel).tolist() == [0, 1]
-    assert sample_logits(logits, torch.tensor([0.0, 1.0]), mapping, gumbel).tolist() == [1, 1]
-    assert sample_logits(logits, torch.empty(0), mapping, gumbel, all_random=True).tolist() == [0, 1]
+    assert sample_logits(logits, torch.ones(2), gumbel).tolist() == [0, 1]
+    assert sample_logits(logits, torch.tensor([0.0, 1.0]), gumbel).tolist() == [1, 1]
+    assert sample_logits(logits, torch.empty(0), gumbel, all_random=True).tolist() == [0, 1]
+    assert sample_logits(logits, torch.zeros(2), None, all_greedy=True).tolist() == [1, 0]
 
 
 def test_sample_logits_inplace_gumbel_is_opt_in():
     logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
     original = logits.clone()
     gumbel = torch.tensor([[2.0, 0.0], [0.0, 4.0]])
-    mapping = torch.tensor([0, 1], dtype=torch.int32)
 
-    out = sample_logits(logits, torch.empty(0), mapping, gumbel, all_random=True)
+    out = sample_logits(logits, torch.empty(0), gumbel, all_random=True)
     assert out.tolist() == [0, 1]
     assert logits.tolist() == original.tolist()
 
     out = sample_logits(
         logits,
         torch.empty(0),
-        mapping,
         gumbel,
         all_random=True,
         add_gumbel_inplace=True,
@@ -46,394 +42,136 @@ def test_sample_logits_inplace_gumbel_is_opt_in():
     assert logits.tolist() == (original + gumbel).tolist()
 
 
-def test_sample_regular_uses_upstream_sampling_params():
-    bridge = SamplingBridge.__new__(SamplingBridge)
-    bridge._batch_view = GpuBatchView(2, torch.device("cpu"))
-    bridge.sampler = _FakeSampler(torch.ones(2))
-    input_batch = _sample_input_batch()
-
-    output = bridge.sample_regular(
-        torch.tensor([[0.0, 1.0], [3.0, 0.0]]),
-        input_batch,
-        torch.tensor([[2.0, 0.0], [0.0, 4.0]]),
+def test_apply_regular_sampling_params_reuses_ascend_sampler_processors():
+    sampler = _FakeSampler()
+    metadata = _metadata(
+        temperature=torch.tensor([2.0, 2.0]),
+        all_greedy=False,
+        all_random=True,
+        top_k=torch.tensor([2, 2], dtype=torch.int32),
+        top_p=torch.tensor([1.0, 1.0]),
     )
-
-    assert output.sampled_token_ids.tolist() == [[0], [1]]
-    assert output.num_sampled.tolist() == [1, 1]
-    assert len(bridge.sampler.apply_calls) == 1
-
-
-def test_npu_sampler_apply_sampling_params_reuses_logits():
-    sampler = NPUSampler.__new__(NPUSampler)
-    sampler.num_speculative_tokens = 1
-    sampler.logit_bias_state = SimpleNamespace(apply_logit_bias=lambda logits, *args: logits.add_(1.0))
-    sampler.penalties_state = SimpleNamespace(apply_penalties=lambda *args: None)
-    sampler.bad_words_state = SimpleNamespace(apply_bad_words=lambda *args: None)
-    sampler.sampling_states = SimpleNamespace(
-        apply_temperature=lambda *args: None,
-        apply_min_p=lambda *args: None,
-        vocab_size=2,
-        top_k=SimpleNamespace(
-            np=np.array([2, 2], dtype=np.int32),
-            gpu=torch.tensor([2, 2], dtype=torch.int32),
-        ),
-        top_p=SimpleNamespace(
-            np=np.array([1.0, 1.0], dtype=np.float32),
-            gpu=torch.tensor([1.0, 1.0], dtype=torch.float32),
-        ),
-    )
-    logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
-
-    processed = sampler.apply_sampling_params(
-        logits,
-        torch.tensor([0, 1], dtype=torch.int32),
-        np.array([0, 1], dtype=np.int32),
-        torch.tensor([0, 1], dtype=torch.int64),
-        torch.tensor([3, 4], dtype=torch.int32),
-        torch.zeros(2, dtype=torch.int32),
-    )
-
-    assert processed is logits
-    assert logits.tolist() == [[1.0, 2.0], [4.0, 1.0]]
-
-
-def test_npu_sampler_apply_top_k_top_p_uses_npu_helper():
-    sampler = NPUSampler.__new__(NPUSampler)
-    sampler.sampling_states = SimpleNamespace(
-        vocab_size=8,
-        top_k=SimpleNamespace(
-            np=np.array([8, 3], dtype=np.int32),
-            gpu=torch.tensor([8, 3], dtype=torch.int32),
-        ),
-        top_p=SimpleNamespace(
-            np=np.array([1.0, 0.9], dtype=np.float32),
-            gpu=torch.tensor([1.0, 0.9], dtype=torch.float32),
-        ),
-    )
-    logits = torch.zeros(2, 8)
-    expanded_idx_mapping = torch.tensor([0, 1], dtype=torch.int64)
-    idx_mapping_np = np.array([0, 1], dtype=np.int32)
+    logits = torch.tensor([[2.0, 4.0], [6.0, 8.0]], dtype=torch.float16)
 
     with patch(
         "vllm_ascend.sample.sampling_bridge.npu_apply_top_k_top_p",
-        side_effect=lambda logits, k, p: logits,
+        side_effect=lambda logits, top_k, top_p: logits.add_(3.0),
     ) as apply_top_k_top_p:
-        processed = sampler.apply_top_k_top_p(
-            logits,
-            expanded_idx_mapping,
-            idx_mapping_np,
-        )
-
-    assert processed is logits
-    apply_top_k_top_p.assert_called_once()
-    _, top_k, top_p = apply_top_k_top_p.call_args.args
-    assert top_k.tolist() == [8, 3]
-    assert top_p.tolist() == [1.0, 0.8999999761581421]
-
-
-def test_npu_sampler_apply_sampling_params_casts_logits_before_top_p():
-    sampler = NPUSampler.__new__(NPUSampler)
-    sampler.num_speculative_tokens = 1
-    sampler.logit_bias_state = SimpleNamespace(apply_logit_bias=lambda *args: None)
-    sampler.penalties_state = SimpleNamespace(apply_penalties=lambda *args: None)
-    sampler.bad_words_state = SimpleNamespace(apply_bad_words=lambda *args: None)
-    sampler.sampling_states = SimpleNamespace(
-        apply_temperature=lambda *args: None,
-        apply_min_p=lambda *args: None,
-        vocab_size=8,
-        top_k=SimpleNamespace(
-            np=np.array([8], dtype=np.int32),
-            gpu=torch.tensor([8], dtype=torch.int32),
-        ),
-        top_p=SimpleNamespace(
-            np=np.array([0.9], dtype=np.float32),
-            gpu=torch.tensor([0.9], dtype=torch.float32),
-        ),
-    )
-    logits = torch.zeros(1, 8, dtype=torch.bfloat16)
-
-    with patch(
-        "vllm_ascend.sample.sampling_bridge.npu_apply_top_k_top_p",
-        side_effect=lambda logits, k, p: logits,
-    ) as apply_top_k_top_p:
-        processed = sampler.apply_sampling_params(
-            logits,
-            torch.tensor([0], dtype=torch.int32),
-            np.array([0], dtype=np.int32),
-            torch.tensor([0], dtype=torch.int64),
-            torch.tensor([3], dtype=torch.int32),
-            torch.zeros(1, dtype=torch.int32),
-        )
+        processed = apply_regular_sampling_params(logits, sampler, metadata)
 
     assert processed.dtype == torch.float32
-    passed_logits, _, top_p = apply_top_k_top_p.call_args.args
-    assert passed_logits.dtype == torch.float32
-    assert top_p.dtype == torch.float32
+    assert processed.tolist() == [[4.5, 5.5], [6.5, 7.5]]
+    assert sampler.predict_bonus_token_calls == [False]
+    apply_top_k_top_p.assert_called_once()
+    _, top_k, top_p = apply_top_k_top_p.call_args.args
+    assert top_k is metadata.top_k
+    assert top_p is metadata.top_p
 
 
-def test_update_requests_is_incremental_and_removes_departed_requests():
-    with _patched_bridge_deps():
-        bridge = _make_bridge()
-        bridge.update_requests(_make_fake_input_batch(["req0", "req1"]), _make_fake_requests(["req0", "req1"]))
-        bridge.update_requests(_make_fake_input_batch(["req0", "req1"]), _make_fake_requests(["req0", "req1"]))
-        bridge.update_requests(_make_fake_input_batch(["req1", "req2"]), _make_fake_requests(["req0", "req1", "req2"]))
-
-    assert [item[0] for item in bridge.req_states.added] == ["req0", "req1", "req2"]
-    assert bridge.req_states.removed == ["req0"]
-    assert bridge.sampler.applied_writes == 2
-
-
-def test_update_requests_repairs_async_outputs_before_initializing_request():
-    with _patched_bridge_deps():
-        bridge = _make_bridge()
-
-        input_batch = _make_fake_input_batch(["req0"])
-        input_batch.token_ids_cpu[0, 2] = -1
-        request = SimpleNamespace(
-            sampling_params=SimpleNamespace(name="p0"),
-            output_token_ids=[-1],
-        )
-
-        def update_async_output_token_ids():
-            request.output_token_ids[:] = [12, 13]
-
-        input_batch.update_async_output_token_ids = update_async_output_token_ids
-
-        assert bridge.update_requests(input_batch, {"req0": request})
-
-    assert bridge.req_states.added[0][2] == [10, 11, 12, 13]
-
-
-def test_update_requests_rejects_unresolved_async_placeholders():
-    with _patched_bridge_deps():
-        bridge = _make_bridge()
-        input_batch = _make_fake_input_batch(["req0"])
-        input_batch.token_ids_cpu[0, 2] = -1
-        request = SimpleNamespace(
-            sampling_params=SimpleNamespace(name="p0"),
-            output_token_ids=[-1],
-        )
-
-        assert not bridge.update_requests(input_batch, {"req0": request})
-
-    assert bridge.req_states.added == []
-
-
-def test_refresh_idx_mapping_updates_same_req_ids_after_cache_invalidation():
-    with _patched_bridge_deps():
-        bridge = _make_bridge()
-        req_ids = ("req0",)
-        bridge.req_states.req_id_to_index["req0"] = 1
-        bridge._refresh_idx_mapping(req_ids)
-        bridge.req_states.req_id_to_index["req0"] = 2
-        bridge._idx_mapping_req_ids = ()
-        bridge._refresh_idx_mapping(req_ids)
-
-    assert bridge._idx_mapping_np_storage[:1].tolist() == [2]
-    assert bridge._idx_mapping[:1].tolist() == [2]
-
-
-def test_refresh_idx_mapping_skips_device_copy_for_stable_decode():
-    with _patched_bridge_deps():
-        bridge = _make_bridge()
-        req_ids = ("req0", "req1")
-        bridge.req_states.req_id_to_index.update({"req0": 1, "req1": 2})
-        bridge._idx_mapping = _CopyCountingMapping()
-
-        bridge._refresh_idx_mapping(req_ids)
-        bridge._refresh_idx_mapping(req_ids)
-
-    assert bridge._idx_mapping.copy_calls == 1
-    assert bridge._idx_mapping.copied_values == [[1, 2]]
-    assert bridge._idx_mapping_np_storage[:2].tolist() == [1, 2]
-
-
-def test_bind_batch_regular_and_spec_reuse_runner_tensors():
-    view = GpuBatchView(max_num_reqs=4, device=torch.device("cpu"))
-    req_ids = ["req0", "req1"]
-    regular = view.bind_regular(
-        req_ids,
-        torch.tensor([3, 2], dtype=torch.int32),
-        np.array([3, 2], dtype=np.int32),
-        torch.tensor([10, 11], dtype=torch.int32),
-        torch.tensor([5, 6], dtype=torch.int64),
-        torch.tensor([0, 1], dtype=torch.int32),
-        torch.tensor([0, 1, 2], dtype=torch.int32),
-        np.array([0, 1, 2], dtype=np.int32),
-        torch.tensor([6, 7], dtype=torch.int32),
-        torch.tensor([6, 7], dtype=torch.int32),
+def test_apply_regular_sampling_params_all_greedy_skips_random_only_processors():
+    sampler = _FakeSampler()
+    metadata = _metadata(
+        temperature=torch.zeros(2),
+        all_greedy=True,
+        all_random=False,
+        top_k=None,
+        top_p=None,
     )
+    logits = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
 
-    assert regular is view.input_batch
-    assert regular.expanded_idx_mapping.tolist() == [3, 2]
-    assert regular.expanded_local_pos.tolist() == [0, 0]
-    assert regular.cu_num_logits.tolist() == [0, 1, 2]
+    with patch("vllm_ascend.sample.sampling_bridge.npu_apply_top_k_top_p") as apply_top_k_top_p:
+        processed = apply_regular_sampling_params(logits, sampler, metadata, predict_bonus_token=True)
 
-    metadata = SimpleNamespace(
-        num_draft_tokens=[2, 1],
-        logits_indices=torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32),
-        cu_num_sampled_tokens=torch.tensor([3, 5], dtype=torch.int32),
-    )
-    with patch("vllm_ascend.sample.sampling_bridge.expand_idx_mapping", _fake_expand_idx_mapping):
-        spec = view.bind_spec(
-            req_ids,
-            torch.tensor([4, 5], dtype=torch.int32),
-            np.array([4, 5], dtype=np.int32),
-            metadata,
-            torch.arange(5, dtype=torch.int32),
-            torch.arange(5, dtype=torch.int64),
-            torch.tensor([0, 3, 5], dtype=torch.int32),
-            np.array([0, 3, 5], dtype=np.int32),
-            torch.tensor([8, 9], dtype=torch.int32),
-            torch.tensor([8, 9], dtype=torch.int32),
-            num_speculative_steps=2,
-        )
-
-    assert spec.logits_indices is metadata.logits_indices
-    assert spec.cu_num_logits_np.tolist() == [0, 3, 5]
-    assert spec.expanded_idx_mapping.tolist() == [4, 4, 4, 5, 5]
-    assert spec.expanded_local_pos.tolist() == [0, 1, 2, 0, 1]
+    assert processed.tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    assert sampler.predict_bonus_token_calls == [True]
+    assert metadata.logitsprocs.argmax_invariant[0].calls == 0
+    apply_top_k_top_p.assert_not_called()
 
 
-def test_device_backed_and_staged_tensors_copy_to_device():
-    _DeviceBackedTensor.set_device(torch.device("cpu"))
-    backed = _DeviceBackedTensor(4, torch.int32)
-    backed.np[:] = [1, 2, 3, 4]
-    backed.copy_to_uva(2)
-    assert backed.gpu.tolist() == [1, 2, 0, 0]
-
-    staged = _NPUStagedWriteBuffer((2, 4), torch.int32, torch.device("cpu"))
-    staged.stage_write(0, 1, (idx for idx in [3, 4]))
-    staged.stage_write(1, 0, [5])
-    staged.apply_write()
-    assert staged.gpu.tolist() == [[0, 3, 4, 0], [5, 0, 0, 0]]
-    assert staged._staged_write_indices == []
-
-
-def _patched_bridge_deps():
-    return patch.multiple(
-        "vllm_ascend.sample.sampling_bridge",
-        RequestState=_FakeRequestState,
-        NPUSampler=_FakeGpuSampler,
-    )
-
-
-def _make_bridge():
-    return SamplingBridge(
-        max_num_reqs=4,
-        max_model_len=8,
-        max_num_batched_tokens=4,
-        vocab_size=16,
+def test_fast_sampler_regular_returns_sampler_output_without_bridge_state():
+    fast_sampler = FastSampler(
+        max_num_reqs=2,
         device=torch.device("cpu"),
-        logprobs_mode="raw_logprobs",
         speculative_config=None,
     )
-
-
-def _sample_input_batch():
-    return SimpleNamespace(
-        positions=torch.arange(2, dtype=torch.int64),
-        input_ids=torch.tensor([3, 4], dtype=torch.int32),
-        logits_indices=torch.tensor([0, 1], dtype=torch.int32),
-        expanded_idx_mapping=torch.tensor([0, 1], dtype=torch.int32),
-        idx_mapping_np=np.array([0, 1], dtype=np.int32),
-        expanded_local_pos=torch.zeros(2, dtype=torch.int32),
-        num_reqs=2,
+    sampler = _FakeSampler()
+    metadata = _metadata(
+        temperature=torch.ones(2),
+        all_greedy=False,
+        all_random=True,
+        top_k=None,
+        top_p=None,
     )
+    logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
+    gumbel = torch.tensor([[2.0, 0.0], [0.0, 4.0]])
+
+    with patch(
+        "vllm_ascend.sample.sampling_bridge.npu_apply_top_k_top_p",
+        side_effect=lambda logits, top_k, top_p: logits,
+    ):
+        output = fast_sampler.sample_regular(logits, sampler, metadata, gumbel)
+
+    assert output.sampled_token_ids.tolist() == [[0], [1]]
+    assert output.logprobs_tensors is None
+
+
+def test_noise_manager_all_greedy_returns_empty_noise_without_buffers():
+    manager = NoiseManager.__new__(NoiseManager)
+    metadata = _metadata(
+        temperature=torch.zeros(2),
+        all_greedy=True,
+        all_random=False,
+        top_k=None,
+        top_p=None,
+    )
+
+    regular_noise = manager.prepare_regular_noise(2, 8, metadata)
+    spec_noise = manager.prepare_spec_noise(4, 2, 8, [1, 1], metadata)
+
+    assert regular_noise == SamplingNoise()
+    assert spec_noise == SamplingNoise()
+
+
+class _FakeArgmaxInvariantProcessor:
+    def __init__(self):
+        self.calls = 0
+
+    def apply(self, logits):
+        self.calls += 1
+        return logits.add_(1.0)
 
 
 class _FakeSampler:
-    def __init__(self, temperature):
-        self.sampling_states = SimpleNamespace(temperature=_FakeTemperature(temperature))
-        self.apply_calls = []
+    def __init__(self):
+        self.predict_bonus_token_calls = []
 
-    def apply_sampling_params(self, *args):
-        self.apply_calls.append(args)
-        return args[0].to(torch.float32)
-
-
-class _FakeRequestState:
-    def __init__(self, **kwargs):
-        self.max_num_reqs = kwargs.get("max_num_reqs", 4)
-        self.req_id_to_index = {}
-        self.num_speculative_steps = 0
-        self.added = []
-        self.removed = []
-
-    def remove_request(self, req_id):
-        if req_id not in self.req_id_to_index:
-            return False
-        self.req_id_to_index.pop(req_id)
-        self.removed.append(req_id)
-        return True
-
-    def add_request(self, req_id, prompt_len, all_token_ids, num_computed_tokens):
-        self.req_id_to_index[req_id] = len(self.req_id_to_index)
-        self.added.append((req_id, prompt_len, all_token_ids, num_computed_tokens))
+    def apply_logits_processors(self, logits, sampling_metadata, predict_bonus_token):
+        del sampling_metadata
+        self.predict_bonus_token_calls.append(predict_bonus_token)
+        return logits.add_(1.0)
 
     @staticmethod
-    def apply_staged_writes():
-        return None
+    def apply_temperature(logits, temperature, all_random):
+        del all_random
+        return logits.div_(temperature.unsqueeze(1))
 
 
-class _FakeGpuSampler:
-    def __init__(self, **kwargs):
-        del kwargs
-        self.added = []
-        self.applied_writes = 0
-
-    def add_request(self, req_idx, prompt_len, sampling_params):
-        self.added.append((req_idx, prompt_len, sampling_params.name))
-
-    def apply_staged_writes(self):
-        self.applied_writes += 1
-
-
-class _FakeTemperature:
-    def __init__(self, temperature):
-        self.gpu = temperature
-        self.np = temperature.detach().cpu().numpy()
-
-
-class _CopyCountingMapping:
-    def __init__(self):
-        self.copy_calls = 0
-        self.copied_values = []
-
-    def __getitem__(self, key):
-        self.key = key
-        return self
-
-    def copy_(self, src, non_blocking=False):
-        assert non_blocking
-        self.copy_calls += 1
-        self.copied_values.append(src.tolist())
-        return self
-
-
-def _fake_expand_idx_mapping(idx_mapping, total_num_logits, cu_num_logits, max_expand_len):
-    del max_expand_len
-    expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
-    expanded_local_pos = idx_mapping.new_empty(total_num_logits)
-    for req_idx in range(idx_mapping.shape[0]):
-        start = int(cu_num_logits[req_idx])
-        end = int(cu_num_logits[req_idx + 1])
-        expanded_idx_mapping[start:end] = idx_mapping[req_idx]
-        expanded_local_pos[start:end] = torch.arange(end - start, dtype=torch.int32)
-    return expanded_idx_mapping, expanded_local_pos
-
-
-def _make_fake_input_batch(req_ids):
+def _metadata(
+    *,
+    temperature,
+    all_greedy,
+    all_random,
+    top_k,
+    top_p,
+):
     return SimpleNamespace(
-        req_ids=req_ids,
-        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
-        num_prompt_tokens=np.array([2, 1, 1], dtype=np.int32),
-        num_tokens_no_spec=np.array([3, 2, 2], dtype=np.int32),
-        num_computed_tokens_cpu=np.array([3, 2, 2], dtype=np.int32),
-        token_ids_cpu=np.array([[10, 11, 12, 0], [20, 21, 0, 0], [30, 31, 0, 0]], dtype=np.int32),
-        is_token_ids=np.ones((3, 4), dtype=bool),
+        temperature=temperature,
+        all_greedy=all_greedy,
+        all_random=all_random,
+        top_k=top_k,
+        top_p=top_p,
+        generators={},
+        logitsprocs=SimpleNamespace(
+            argmax_invariant=[_FakeArgmaxInvariantProcessor()],
+        ),
     )
-
-
-def _make_fake_requests(req_ids):
-    return {req_id: SimpleNamespace(sampling_params=SimpleNamespace(name=f"p{i}")) for i, req_id in enumerate(req_ids)}

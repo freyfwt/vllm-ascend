@@ -8,10 +8,8 @@ import time
 from collections.abc import Callable
 from types import SimpleNamespace
 
-import numpy as np
 import torch
 import torch_npu  # noqa: F401
-from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -20,22 +18,13 @@ import vllm_ascend.ascend_config as ascend_config_module
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.sample.sampler import AscendSampler
-from vllm_ascend.sample.sampling_bridge import (
-    SamplingBridge,
-)
+from vllm_ascend.sample.sampling_bridge import FastSampler
 from vllm_ascend.utils import enable_custom_op
-from vllm_ascend.worker.v2.sample.gumbel import gumbel_sample
 
 SINK = None
 DEFAULT_BATCH_SIZES = (1, 8, 32, 64, 96)
 DEFAULT_SCENARIOS = ("regular", "spec")
-DEFAULT_PATHS = (
-    "bridge_bind",
-    "bridge_bind_refresh",
-    "v1_native",
-    "v2_native",
-    "v2_optimized",
-)
+DEFAULT_PATHS = ("v1_native", "fast")
 DEFAULT_TEMPERATURE = 0.8
 DEFAULT_TOP_K = 20
 DEFAULT_TOP_P = 0.95
@@ -86,7 +75,7 @@ def make_spec_metadata(
     num_speculative_steps: int,
     vocab_size: int,
     device: torch.device,
-) -> tuple[SpecDecodeMetadata, torch.Tensor, torch.Tensor]:
+) -> tuple[SpecDecodeMetadata, torch.Tensor]:
     num_draft_tokens = [num_speculative_steps] * batch_size
     num_sampled_tokens = [num_speculative_steps + 1] * batch_size
     cu_num_draft_tokens = torch.tensor(num_draft_tokens, dtype=torch.int32, device=device).cumsum(0)
@@ -101,14 +90,14 @@ def make_spec_metadata(
 
     num_logits = batch_size * (num_speculative_steps + 1)
     logits_indices = torch.arange(num_logits, dtype=torch.int32, device=device)
-    draft_segments = torch.randint(
+    input_ids = torch.randint(
         0,
         vocab_size,
-        (batch_size, num_speculative_steps + 1),
+        (num_logits,),
         dtype=torch.int32,
         device=device,
     )
-    draft_token_ids = draft_segments[:, 1:].contiguous().view(-1)
+    draft_token_ids = input_ids[torch.tensor(target_logits_indices, dtype=torch.int32, device=device) + 1].contiguous()
     metadata = SpecDecodeMetadata(
         draft_token_ids=draft_token_ids,
         num_draft_tokens=num_draft_tokens,
@@ -118,13 +107,12 @@ def make_spec_metadata(
         bonus_logits_indices=torch.tensor(bonus_logits_indices, dtype=torch.int32, device=device),
         logits_indices=logits_indices,
     )
-    positions = torch.arange(num_logits, dtype=torch.int64, device=device)
-    return metadata, draft_segments.flatten(), positions
+    return metadata, input_ids
 
 
 def boost_draft_logits(
     logits: torch.Tensor,
-    draft_tokens: torch.Tensor,
+    input_ids: torch.Tensor,
     num_speculative_steps: int,
     boost: float,
 ) -> None:
@@ -135,7 +123,7 @@ def boost_draft_logits(
         start = req_idx * (num_speculative_steps + 1)
         for step in range(num_speculative_steps):
             rows.append(start + step)
-            cols.append(int(draft_tokens[start + step + 1].item()))
+            cols.append(int(input_ids[start + step + 1].item()))
     logits[
         torch.tensor(rows, dtype=torch.int64, device=logits.device),
         torch.tensor(cols, dtype=torch.int64, device=logits.device),
@@ -147,36 +135,6 @@ def make_gumbel(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
     gumbel.exponential_()
     gumbel.log_().neg_()
     return gumbel
-
-
-def make_bridge_batch(
-    batch_size: int,
-    temperature: float,
-    top_k: int,
-    top_p: float,
-) -> tuple[SimpleNamespace, dict[str, SimpleNamespace]]:
-    req_ids = [f"req_{idx}" for idx in range(batch_size)]
-    token_ids = torch.arange(batch_size, dtype=torch.int32).view(batch_size, 1)
-    input_batch = SimpleNamespace(
-        req_ids=req_ids,
-        req_id_to_index={req_id: idx for idx, req_id in enumerate(req_ids)},
-        num_prompt_tokens=torch.ones(batch_size, dtype=torch.int32).numpy(),
-        num_tokens_no_spec=torch.ones(batch_size, dtype=torch.int32).numpy(),
-        num_computed_tokens_cpu=torch.ones(batch_size, dtype=torch.int32).numpy(),
-        token_ids_cpu=token_ids.numpy(),
-        is_token_ids=torch.ones(batch_size, 1, dtype=torch.bool).numpy(),
-    )
-    requests = {
-        req_id: SimpleNamespace(
-            sampling_params=SamplingParams(
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-            )
-        )
-        for req_id in req_ids
-    }
-    return input_batch, requests
 
 
 def benchmark(
@@ -210,31 +168,6 @@ def benchmark(
     }
 
 
-def make_sampling_bridge(
-    batch_size: int,
-    max_model_len: int,
-    max_num_batched_tokens: int,
-    vocab_size: int,
-    spec_steps: int,
-    device: torch.device,
-    enable_spec: bool,
-) -> SamplingBridge:
-    speculative_config = None
-    if enable_spec:
-        speculative_config = SimpleNamespace(
-            num_speculative_tokens=spec_steps,
-        )
-    return SamplingBridge(
-        max_num_reqs=batch_size,
-        max_model_len=max_model_len,
-        max_num_batched_tokens=max_num_batched_tokens,
-        vocab_size=vocab_size,
-        device=device,
-        logprobs_mode="raw_logprobs",
-        speculative_config=speculative_config,
-    )
-
-
 def resolve_batch_sizes(args: argparse.Namespace) -> list[int]:
     if args.batch_size is not None:
         return [args.batch_size]
@@ -251,9 +184,8 @@ def run_batch_size(
     vocab_size = args.vocab_size
     spec_steps = args.spec_steps
     num_logits = batch_size * (spec_steps + 1)
-    max_model_len = 1 + (args.warmups + args.iterations + 4) * (spec_steps + 1)
-
     sampler = AscendSampler()
+    rejection_sampler = AscendRejectionSampler(sampler)
     sampling_metadata = make_sampling_metadata(
         batch_size,
         device,
@@ -265,276 +197,66 @@ def run_batch_size(
 
     if "regular" in args.scenarios:
         regular_logits = torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device)
-        regular_seed = torch.arange(100000, 100000 + batch_size, dtype=torch.int64, device=device)
         regular_gumbel = make_gumbel((batch_size, vocab_size), device)
-        regular_input_ids = torch.arange(batch_size, dtype=torch.int32, device=device)
-        regular_positions = torch.arange(batch_size, dtype=torch.int64, device=device)
-        regular_logits_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-        regular_query_start_loc = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
-        regular_query_start_loc_np = np.arange(batch_size + 1, dtype=np.int32)
-        regular_seq_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
-        regular_seq_lens_cpu_upper_bound = torch.ones(batch_size, dtype=torch.int32)
-
-        def make_regular_flow() -> SimpleNamespace:
-            bridge = make_sampling_bridge(
-                batch_size=batch_size,
-                max_model_len=max_model_len,
-                max_num_batched_tokens=batch_size,
-                vocab_size=vocab_size,
-                spec_steps=spec_steps,
-                device=device,
-                enable_spec=False,
-            )
-            input_batch, requests = make_bridge_batch(
-                batch_size,
-                args.temperature,
-                args.top_k,
-                args.top_p,
-            )
-            assert bridge.update_requests(input_batch, requests)
-            return SimpleNamespace(
-                bridge=bridge,
-                input_batch=input_batch,
-                requests=requests,
-                num_sampled=bridge._batch_view.num_sampled_ones(batch_size),
-            )
-
-        regular_v1_flow = make_regular_flow()
-        regular_v2_flow = make_regular_flow()
-        regular_v2_optimized_flow = make_regular_flow()
-        regular_bridge_bind_flow = make_regular_flow()
-        regular_bridge_bind_refresh_flow = make_regular_flow()
-
-        def bind_regular_flow(flow: SimpleNamespace, force_idx_mapping_refresh: bool = False):
-            if force_idx_mapping_refresh:
-                flow.bridge._idx_mapping_req_ids = ()
-            if not flow.bridge.update_requests(flow.input_batch, flow.requests):
-                raise RuntimeError("failed to update regular bridge requests")
-            return flow.bridge.bind_batch(
-                flow.input_batch,
-                regular_input_ids,
-                regular_positions,
-                regular_logits_indices,
-                None,
-                query_start_loc=regular_query_start_loc,
-                query_start_loc_np=regular_query_start_loc_np,
-                seq_lens=regular_seq_lens,
-                seq_lens_cpu_upper_bound=regular_seq_lens_cpu_upper_bound,
-            )
-
-        def regular_bridge_bind() -> torch.Tensor:
-            return bind_regular_flow(regular_bridge_bind_flow).idx_mapping
-
-        def regular_bridge_bind_refresh() -> torch.Tensor:
-            return bind_regular_flow(
-                regular_bridge_bind_refresh_flow,
-                force_idx_mapping_refresh=True,
-            ).idx_mapping
-
-        def regular_v1_native() -> torch.Tensor:
-            sample_batch = bind_regular_flow(regular_v1_flow)
-            sampled = sampler(regular_logits, sampling_metadata).sampled_token_ids
-            regular_v1_flow.bridge.post_update(
-                sample_batch,
-                sampled,
-                regular_v1_flow.num_sampled,
-            )
-            return sampled
-
-        def regular_v2_native() -> torch.Tensor:
-            sample_batch = bind_regular_flow(regular_v2_flow)
-            regular_pos = sample_batch.positions[sample_batch.logits_indices]
-            regular_token_ids = sample_batch.input_ids[sample_batch.logits_indices]
-            processed = regular_v2_flow.bridge.sampler.apply_sampling_params(
-                regular_logits,
-                sample_batch.expanded_idx_mapping,
-                sample_batch.idx_mapping_np,
-                regular_pos,
-                regular_token_ids,
-                sample_batch.expanded_local_pos,
-            )
-            sampled = (
-                gumbel_sample(
-                    processed,
-                    sample_batch.expanded_idx_mapping,
-                    regular_v2_flow.bridge.sampler.sampling_states.temperature.gpu,
-                    regular_seed,
-                    regular_pos,
-                    apply_temperature=False,
-                )
-                .to(torch.int32)
-                .view(-1, 1)
-            )
-            regular_v2_flow.bridge.post_update(
-                sample_batch,
-                sampled,
-                regular_v2_flow.num_sampled,
-            )
-            return sampled
-
-        def regular_v2_optimized() -> torch.Tensor:
-            sample_batch = bind_regular_flow(regular_v2_optimized_flow)
-            output = regular_v2_optimized_flow.bridge.sample_regular(
-                regular_logits,
-                sample_batch,
-                regular_gumbel,
-            )
-            regular_v2_optimized_flow.bridge.post_update(
-                sample_batch,
-                output.sampled_token_ids,
-                output.num_sampled,
-            )
-            return output.sampled_token_ids
-
-        if "bridge_bind" in args.paths:
-            cases.append(("regular", "bridge_bind", regular_bridge_bind))
-        if "bridge_bind_refresh" in args.paths:
-            cases.append(("regular", "bridge_bind_refresh", regular_bridge_bind_refresh))
-        if "v1_native" in args.paths:
-            cases.append(("regular", "v1_native", regular_v1_native))
-        if "v2_native" in args.paths:
-            cases.append(("regular", "v2_native", regular_v2_native))
-        if "v2_optimized" in args.paths:
-            cases.append(("regular", "v2_optimized", regular_v2_optimized))
-
-    if "spec" in args.scenarios:
-        from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
-            rejection_sample as v2_rejection_sample,
+        regular_fast_sampler = FastSampler(
+            max_num_reqs=batch_size,
+            device=device,
+            speculative_config=None,
         )
 
-        rejection_sampler = AscendRejectionSampler(sampler)
-        spec_metadata, input_ids, positions = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
+        def regular_v1_native() -> torch.Tensor:
+            return sampler(regular_logits.clone(), sampling_metadata).sampled_token_ids
+
+        def regular_fast() -> torch.Tensor:
+            return regular_fast_sampler.sample_regular(
+                regular_logits.clone(),
+                sampler,
+                sampling_metadata,
+                regular_gumbel,
+            ).sampled_token_ids
+
+        if "v1_native" in args.paths:
+            cases.append(("regular", "v1_native", regular_v1_native))
+        if "fast" in args.paths:
+            cases.append(("regular", "fast", regular_fast))
+
+    if "spec" in args.scenarios:
+        spec_metadata, input_ids = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
         spec_logits = torch.randn(num_logits, vocab_size, dtype=torch.float32, device=device)
         boost_draft_logits(spec_logits, input_ids, spec_steps, boost=12.0)
-        tokens_per_req = spec_steps + 1
-        spec_query_start_loc = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
-        spec_query_start_loc.mul_(tokens_per_req)
-        spec_query_start_loc_np = np.arange(batch_size + 1, dtype=np.int32) * tokens_per_req
-        spec_seq_lens = torch.full((batch_size,), tokens_per_req, dtype=torch.int32, device=device)
-        spec_seq_lens_cpu_upper_bound = torch.full((batch_size,), tokens_per_req, dtype=torch.int32)
-        rejection_acceptance_uniform = torch.rand(num_logits, dtype=torch.float32, device=device)
-        rejection_acceptance_uniform.clamp_(min=1e-20)
-        rejection_recovery_gumbel = make_gumbel((batch_size, vocab_size), device)
-        rejection_seed = torch.arange(200000, 200000 + batch_size, dtype=torch.int64, device=device)
-
-        def make_spec_flow() -> SimpleNamespace:
-            bridge = make_sampling_bridge(
-                batch_size=batch_size,
-                max_model_len=max_model_len,
-                max_num_batched_tokens=num_logits,
-                vocab_size=vocab_size,
-                spec_steps=spec_steps,
-                device=device,
-                enable_spec=True,
-            )
-            input_batch, requests = make_bridge_batch(
-                batch_size,
-                args.temperature,
-                args.top_k,
-                args.top_p,
-            )
-            assert bridge.update_requests(input_batch, requests)
-            return SimpleNamespace(
-                bridge=bridge,
-                input_batch=input_batch,
-                requests=requests,
-            )
-
-        spec_v1_flow = make_spec_flow()
-        spec_v2_flow = make_spec_flow()
-        spec_v2_optimized_flow = make_spec_flow()
-        spec_bridge_bind_flow = make_spec_flow()
-        spec_bridge_bind_refresh_flow = make_spec_flow()
-
-        def bind_spec_flow(flow: SimpleNamespace, force_idx_mapping_refresh: bool = False):
-            if force_idx_mapping_refresh:
-                flow.bridge._idx_mapping_req_ids = ()
-            if not flow.bridge.update_requests(flow.input_batch, flow.requests):
-                raise RuntimeError("failed to update spec bridge requests")
-            return flow.bridge.bind_batch(
-                flow.input_batch,
-                input_ids,
-                positions,
-                spec_metadata.logits_indices,
-                spec_metadata,
-                query_start_loc=spec_query_start_loc,
-                query_start_loc_np=spec_query_start_loc_np,
-                seq_lens=spec_seq_lens,
-                seq_lens_cpu_upper_bound=spec_seq_lens_cpu_upper_bound,
-            )
-
-        def spec_bridge_bind() -> torch.Tensor:
-            return bind_spec_flow(spec_bridge_bind_flow).expanded_idx_mapping
-
-        def spec_bridge_bind_refresh() -> torch.Tensor:
-            return bind_spec_flow(
-                spec_bridge_bind_refresh_flow,
-                force_idx_mapping_refresh=True,
-            ).expanded_idx_mapping
-
-        def infer_num_sampled(sampled: torch.Tensor) -> torch.Tensor:
-            return sampled.ne(-1).sum(dim=1).to(torch.int32)
+        acceptance_uniform = torch.rand(num_logits, dtype=torch.float32, device=device)
+        acceptance_uniform.clamp_(min=1e-20)
+        recovery_gumbel = make_gumbel((batch_size, vocab_size), device)
+        spec_fast_sampler = FastSampler(
+            max_num_reqs=batch_size,
+            device=device,
+            speculative_config=SimpleNamespace(num_speculative_tokens=spec_steps),
+        )
 
         def spec_v1_native() -> torch.Tensor:
-            sample_batch = bind_spec_flow(spec_v1_flow)
-            sampled = rejection_sampler(spec_metadata, None, spec_logits, sampling_metadata).sampled_token_ids
-            num_sampled = infer_num_sampled(sampled)
-            spec_v1_flow.bridge.post_update(sample_batch, sampled, num_sampled)
-            return sampled
-
-        def spec_v2_native() -> torch.Tensor:
-            sample_batch = bind_spec_flow(spec_v2_flow)
-            draft_tokens = sample_batch.input_ids[sample_batch.logits_indices]
-            spec_pos = sample_batch.positions[sample_batch.logits_indices]
-            processed = spec_v2_flow.bridge.sampler.apply_sampling_params(
-                spec_logits,
-                sample_batch.expanded_idx_mapping,
-                sample_batch.idx_mapping_np,
-                spec_pos,
-                draft_tokens,
-                sample_batch.expanded_local_pos,
-            )
-            sampled, num_sampled = v2_rejection_sample(
-                processed,
+            return rejection_sampler(
+                spec_metadata,
                 None,
-                draft_tokens,
-                sample_batch.cu_num_logits,
-                spec_pos,
-                sample_batch.idx_mapping,
-                sample_batch.expanded_idx_mapping,
-                sample_batch.expanded_local_pos,
-                spec_v2_flow.bridge.sampler.sampling_states.temperature.gpu,
-                rejection_seed,
-                spec_steps,
-            )
-            spec_v2_flow.bridge.post_update(sample_batch, sampled, num_sampled)
-            return sampled
+                spec_logits.clone(),
+                sampling_metadata,
+            ).sampled_token_ids
 
-        def spec_v2_optimized() -> torch.Tensor:
-            sample_batch = bind_spec_flow(spec_v2_optimized_flow)
-            output = spec_v2_optimized_flow.bridge.sample_spec(
-                spec_logits,
-                sample_batch,
-                rejection_acceptance_uniform,
-                rejection_recovery_gumbel,
-            )
-            spec_v2_optimized_flow.bridge.post_update(
-                sample_batch,
-                output.sampled_token_ids,
-                output.num_sampled,
-            )
-            return output.sampled_token_ids
+        def spec_fast() -> torch.Tensor:
+            return spec_fast_sampler.sample_spec(
+                spec_logits.clone(),
+                sampler,
+                rejection_sampler,
+                sampling_metadata,
+                spec_metadata,
+                input_ids,
+                acceptance_uniform,
+                recovery_gumbel,
+            ).sampled_token_ids
 
-        if "bridge_bind" in args.paths:
-            cases.append(("spec", "bridge_bind", spec_bridge_bind))
-        if "bridge_bind_refresh" in args.paths:
-            cases.append(("spec", "bridge_bind_refresh", spec_bridge_bind_refresh))
         if "v1_native" in args.paths:
             cases.append(("spec", "v1_native", spec_v1_native))
-        if "v2_native" in args.paths:
-            cases.append(("spec", "v2_native", spec_v2_native))
-        if "v2_optimized" in args.paths:
-            cases.append(("spec", "v2_optimized", spec_v2_optimized))
+        if "fast" in args.paths:
+            cases.append(("spec", "fast", spec_fast))
 
     results = []
     for scenario, path, fn in cases:
@@ -605,30 +327,14 @@ def main() -> None:
         "iterations": args.iterations,
         "timer": "wall_clock_with_npu_synchronize",
         "notes": [
-            "Measured with wall-clock time and NPU synchronization so host-side batch binding is included.",
-            "Warmup iterations run first; measured iterations keep the same request batch in continuous decode state.",
-            "Sampling path rows include stable update_requests, bind_batch, sampling, and post_update.",
-            "bridge_bind rows isolate stable update_requests and bind_batch without sampling or post_update.",
-            "bridge_bind_refresh rows invalidate the idx mapping cache each iteration to simulate pre-fix copies.",
-            "Each path owns independent bridge/request state so benchmark cases do not mutate one another.",
-            "v2_optimized uses prefetched random tensors, matching the model_runner overlap design.",
-            "spec/v2_native uses the current v2 NPU no-draft-logits helper.",
+            "Measured with wall-clock time and NPU synchronization.",
+            "v1_native uses the existing Ascend sampler or rejection sampler.",
+            "fast uses the V1-native fast sampler with prefetched random tensors.",
+            "The benchmark does not include ModelRunnerV2 bridge rows because that design is removed.",
         ],
         "results": results,
     }
     print(json.dumps(payload, indent=2))
-
-    print("\n| batch | scenario | path | mean ms | median ms | p90 ms | speedup vs v1 |")
-    print("|---:|---|---|---:|---:|---:|---:|")
-    for result in results:
-        speedup = result.get("speedup_vs_v1_native")
-        speedup_text = "" if speedup is None else f"{float(speedup):.2f}x"
-        print(
-            f"| {result['batch_size']} | {result['scenario']} | {result['path']} | "
-            f"{float(result['mean_ms']):.3f} | "
-            f"{float(result['median_ms']):.3f} | {float(result['p90_ms']):.3f} | "
-            f"{speedup_text} |"
-        )
 
 
 if __name__ == "__main__":

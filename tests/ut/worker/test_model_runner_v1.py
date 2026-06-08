@@ -159,8 +159,7 @@ class TestNPUModelRunnerFastSamplingGate(unittest.TestCase):
         enable_async_exponential=False,
     ):
         runner = NPUModelRunner.__new__(NPUModelRunner)
-        runner.sampling_bridge = SimpleNamespace(sampler=SimpleNamespace(compute_nans=compute_nans))
-        runner.device = SimpleNamespace(type="npu")
+        runner.fast_sampler = SimpleNamespace()
         runner.input_batch = SimpleNamespace(
             sampling_metadata=sampling_metadata,
             num_reqs=2,
@@ -183,10 +182,16 @@ class TestNPUModelRunnerFastSamplingGate(unittest.TestCase):
             (SimpleNamespace(max_num_logprobs=None, logprob_token_ids=None), False, False, True),
         ]
         for sampling_metadata, compute_nans, enable_async_exponential, expected in cases:
-            with self.subTest(
-                sampling_metadata=sampling_metadata,
-                compute_nans=compute_nans,
-                enable_async_exponential=enable_async_exponential,
+            with (
+                self.subTest(
+                    sampling_metadata=sampling_metadata,
+                    compute_nans=compute_nans,
+                    enable_async_exponential=enable_async_exponential,
+                ),
+                patch(
+                    "vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS",
+                    compute_nans,
+                ),
             ):
                 self.assertEqual(
                     self._build_runner(
@@ -197,39 +202,12 @@ class TestNPUModelRunnerFastSamplingGate(unittest.TestCase):
                     expected,
                 )
 
+    @patch("vllm_ascend.worker.model_runner_v1.lmhead_tp_enable", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS", False)
+    def test_can_fast_sample_accepts_regular_path(self, _mock_lmhead_tp_enable):
+        sampling_metadata = SimpleNamespace(max_num_logprobs=None, logprob_token_ids=None)
 
-class TestNPUModelRunnerSampleState(unittest.TestCase):
-    def test_update_sampling_state_passes_num_sampled_to_bridge(self):
-        runner = NPUModelRunner.__new__(NPUModelRunner)
-        sampling_batch = SimpleNamespace(name="batch")
-        runner._sampling_batch = sampling_batch
-        runner.sampling_bridge = MagicMock()
-        sampler_output = SimpleNamespace(
-            sampled_token_ids=torch.tensor([[7, -1]], dtype=torch.int32),
-            num_sampled=torch.tensor([1], dtype=torch.int32),
-        )
-
-        runner._update_sampling_state(sampler_output)
-
-        runner.sampling_bridge.post_update.assert_called_once_with(
-            sampling_batch,
-            sampler_output.sampled_token_ids,
-            sampler_output.num_sampled,
-        )
-        self.assertIsNone(runner._sampling_batch)
-
-    def test_update_sampling_state_ignores_legacy_sampler_output(self):
-        runner = NPUModelRunner.__new__(NPUModelRunner)
-        runner._sampling_batch = SimpleNamespace(name="batch")
-        runner.sampling_bridge = MagicMock()
-        sampler_output = SimpleNamespace(
-            sampled_token_ids=torch.tensor([[7]], dtype=torch.int32),
-        )
-
-        runner._update_sampling_state(sampler_output)
-
-        runner.sampling_bridge.post_update.assert_not_called()
-        self.assertIsNone(runner._sampling_batch)
+        self.assertTrue(self._build_runner(sampling_metadata)._can_fast_sample(None))
 
 
 class TestNPUModelRunnerDebugger(unittest.TestCase):

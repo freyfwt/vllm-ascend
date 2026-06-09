@@ -380,6 +380,7 @@ class AscendRejectionSampler(RejectionSampler):
         assert metadata.max_spec_len <= MAX_SPEC_LEN
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
+        need_logprobs = sampling_metadata.max_num_logprobs is not None
 
         # When indexing with a tensor (bonus_logits_indices), PyTorch
         # creates a new tensor with separate storage from the original
@@ -391,7 +392,7 @@ class AscendRejectionSampler(RejectionSampler):
             logits=bonus_logits,
             sampling_metadata=replace(
                 sampling_metadata,
-                max_num_logprobs=-1,
+                max_num_logprobs=-1 if need_logprobs else None,
             ),
             predict_bonus_token=True,
             # Override the logprobs mode to return logits because they are
@@ -407,7 +408,7 @@ class AscendRejectionSampler(RejectionSampler):
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
         target_logits = raw_target_logits
-        if not self.is_processed_logprobs_mode:
+        if need_logprobs and not self.is_processed_logprobs_mode:
             # Clone raw_target_logits before applying processors to preserve
             # the original raw logits for logprobs computation, since
             # apply_logits_processors modifies the tensor in-place.
@@ -442,7 +443,8 @@ class AscendRejectionSampler(RejectionSampler):
             )
 
         logprobs_tensors = None
-        if sampling_metadata.max_num_logprobs is not None:
+        if need_logprobs:
+            assert bonus_sampler_output.logprobs_tensors is not None
             logprobs_tensors = self._get_logprobs_tensors(
                 sampling_metadata.max_num_logprobs,
                 metadata,

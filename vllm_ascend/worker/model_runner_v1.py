@@ -2340,12 +2340,13 @@ class NPUModelRunner(GPUModelRunner):
 
         if hasattr(self, "rejection_sampler"):
             self.rejection_sampler.do_async_rejection_random(
-                num_logits=sum(spec_decode_metadata.num_draft_tokens),
+                num_logits=int(spec_decode_metadata.logits_indices.shape[0]),
                 num_reqs=self.input_batch.num_reqs,
                 recovery_vocab_size=random_vocab_size,
                 num_draft_tokens=spec_decode_metadata.num_draft_tokens,
                 sampling_metadata=sampling_metadata,
                 device=self.device,
+                include_bonus_logits=True,
             )
 
     def _sampling_random_vocab_size(self) -> int:

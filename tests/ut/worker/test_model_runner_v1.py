@@ -215,12 +215,13 @@ class TestNPUModelRunnerAsyncSamplingRandom(unittest.TestCase):
         runner._prepare_async_sampling_random(metadata, torch.arange(6))
 
         runner.rejection_sampler.do_async_rejection_random.assert_called_once_with(
-            num_logits=4,
+            num_logits=6,
             num_reqs=2,
             recovery_vocab_size=16,
             num_draft_tokens=[2, 2],
             sampling_metadata=sampling_metadata,
             device=torch.device("cpu"),
+            include_bonus_logits=True,
         )
 
     def test_prepare_async_sampling_random_preserves_async_exponential(self):

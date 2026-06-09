@@ -251,7 +251,7 @@ def run_batch_size(
         if "optimized" in args.paths:
             spec_randoms = make_rejection_randoms(
                 args.warmups + args.iterations,
-                batch_size * spec_steps,
+                num_logits,
                 batch_size,
                 vocab_size,
                 device,
@@ -363,7 +363,8 @@ def main() -> None:
             "Each measured iteration refreshes a per-path working logits tensor before timing "
             "so timed rows do not include input clone.",
             "v1_native uses the existing sampler calls without the optimized rejection operator.",
-            "optimized uses prefetched regular Gumbel/rejection random tensors and the native rejection operator.",
+            "optimized uses prefetched regular Gumbel/rejection random tensors; "
+            "spec bonus tokens are sampled from bonus logits after draft acceptance.",
             "The benchmark does not include ModelRunnerV2 bridge or FastSampler rows because that design is removed.",
         ],
         "results": results,

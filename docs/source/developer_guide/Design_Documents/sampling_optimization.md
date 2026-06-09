@@ -9,8 +9,8 @@ three focused optimizations inside the existing components:
   division;
 - random tensors are generated on a separate NPU stream before sampling when
   possible;
-- speculative decoding uses a native NPU rejection sampling operator from the
-  existing `AscendRejectionSampler` entry.
+- speculative decoding uses a native NPU rejection sampling operator that
+  samples the bonus token only after draft acceptance is known.
 
 The design intentionally does not introduce a V2 bridge, `FastSampler`, V2-style
 input packing, or request-state adaptation. Regular sampling still enters
@@ -73,23 +73,33 @@ benchmarks usable without ModelRunnerV1.
 
 ## Speculative Decoding
 
-`AscendRejectionSampler.forward` keeps the existing structure:
+`AscendRejectionSampler.forward` keeps the existing V1 entry, but the optimized
+branch uses the V2-style bonus flow:
 
-1. sample the bonus token with the existing `AscendSampler`;
-2. process target logits with existing logits processors;
-3. apply speculative sampling constraints;
-4. generate output token ids;
-5. build logprobs with the existing `_get_logprobs_tensors` path.
+1. gather draft and bonus logits in `metadata.logits_indices` order;
+2. apply speculative sampling constraints to draft and bonus rows together;
+3. run rejection sampling over draft rows;
+4. if every draft token is accepted for a request, sample the bonus token from
+   that request's bonus row using the prefetched recovery Gumbel row;
+5. otherwise insert the recovered token at the rejection position;
+6. build logprobs with the existing `_get_logprobs_tensors` path.
 
 Step 4 uses the native NPU rejection operator when the required V1 tensors are
 available. The runner passes `input_ids` as the ModelRunner-only entrance guard
-for the optimized path; the operator consumes the existing
-`metadata.draft_token_ids` and reuses the bonus token already sampled by
-`AscendSampler`.
+for the optimized path; the operator consumes `input_ids[metadata.logits_indices]`
+so each draft row can read the next draft token and each fully accepted request
+can sample from its bonus row. The optimized path no longer calls
+`AscendSampler` to pre-sample bonus tokens.
 
 Reduced sampling is supported by passing candidate token ids into the operator.
 Dense vocab mode indexes logits directly by token id; reduced mode searches the
 candidate token ids and returns global token ids.
+
+The optimized branch is intentionally limited to the hot path without penalties,
+bad words, allowed-token masks, or custom logits processors. Those features
+remain on the V1 fallback path because V1 handles bonus logits processors with
+`predict_bonus_token=True`, which requires different request history semantics
+from draft-row processing.
 
 ## Fallbacks
 
@@ -98,8 +108,11 @@ behavior:
 
 - `enable_async_exponential=True`;
 - speculative calls outside the ModelRunnerV1 optimized entrance;
-- all-greedy reduced-sampling speculative batches, where the existing path keeps
-  the distributed greedy behavior.
+- all-greedy speculative batches, where the existing path keeps the cheaper
+  greedy-specific rejection flow;
+- draft-probability rejection, penalties, bad words, allowed-token masks, or
+  custom logits processors;
+- processed-logprobs mode when sampled-token logprobs are requested.
 
 The fallback path is still the existing V1 Ascend sampler or rejection sampler.
 
@@ -111,6 +124,8 @@ Unit tests should cover:
 - reduced regular sampling maps candidate positions back to token ids;
 - optimized rejection is not disabled by logprobs or reduced sampling;
 - `enable_async_exponential=True` disables the optimized rejection branch;
+- optimized rejection samples bonus tokens from bonus logits after draft
+  acceptance;
 - ModelRunnerV1 prepares regular Gumbel random tensors and speculative rejection
   random tensors in the expected cases;
 - all-greedy batches do not prepare random tensors.

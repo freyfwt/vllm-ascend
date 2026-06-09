@@ -216,6 +216,7 @@ def _probabilistic_rejection_kernel(
     TARGET_INDEX_BLOCK_SIZE: tl.constexpr,
     HAS_DRAFT_PROBS: tl.constexpr,
     HAS_TARGET_INDICES: tl.constexpr,
+    HAS_BONUS_LOGITS: tl.constexpr,
     NUM_SPECULATIVE_STEPS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
@@ -227,10 +228,15 @@ def _probabilistic_rejection_kernel(
     num_sampled = 0
     accepted = True
     num_draft_tokens = end_idx - start_idx
+    if HAS_BONUS_LOGITS:
+        num_draft_tokens -= 1
     for i in range(NUM_SPECULATIVE_STEPS):
         if accepted and i < num_draft_tokens:
             logit_idx = start_idx + i
-            draft_tokens = tl.load(draft_tokens_ptr + logit_idx)
+            draft_token_offset = 0
+            if HAS_BONUS_LOGITS:
+                draft_token_offset = 1
+            draft_tokens = tl.load(draft_tokens_ptr + logit_idx + draft_token_offset)
             if temperature == 0.0:
                 blocks = tl.arange(0, PADDED_VOCAB_NUM_BLOCKS)
                 mask = blocks < vocab_num_blocks
@@ -313,6 +319,7 @@ def _recovery_kernel(
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_PROBS: tl.constexpr,
     HAS_TARGET_INDICES: tl.constexpr,
+    HAS_BONUS_LOGITS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
@@ -320,12 +327,20 @@ def _recovery_kernel(
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_draft_tokens = end_idx - start_idx
-    if recovery_idx >= num_draft_tokens:
-        return
+    if HAS_BONUS_LOGITS:
+        num_draft_tokens -= 1
+        if recovery_idx > num_draft_tokens:
+            return
+    else:
+        if recovery_idx >= num_draft_tokens:
+            return
     recovery_token_idx = start_idx + recovery_idx
     req_state_idx = tl.load(expanded_idx_mapping_ptr + recovery_token_idx)
     temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
-    if temperature == 0.0:
+    is_bonus = False
+    if HAS_BONUS_LOGITS:
+        is_bonus = recovery_idx == num_draft_tokens
+    if temperature == 0.0 and not is_bonus:
         return
 
     block_idx = tl.program_id(1)
@@ -344,36 +359,42 @@ def _recovery_kernel(
         other=float("-inf"),
     ).to(tl.float32)
     if HAS_DRAFT_PROBS:
-        target_lse = _compute_global_lse(
-            target_local_max_ptr,
-            target_local_max_stride,
-            target_local_sumexp_ptr,
-            target_local_sumexp_stride,
-            recovery_token_idx,
-            vocab_num_blocks,
-            PADDED_VOCAB_NUM_BLOCKS,
-        )
-        target_log_probs = logits - target_lse
-        draft_probs = tl.load(
-            draft_probs_ptr + recovery_token_idx * draft_probs_stride + token_ids,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
-        draft_log_probs = tl.log(draft_probs)
-        ratio = tl.exp(draft_log_probs - target_log_probs)
-        logits = tl.where(
-            ratio < 1.0,
-            target_log_probs + tl.log(1.0 - ratio),
-            float("-inf"),
-        )
+        if not is_bonus:
+            target_lse = _compute_global_lse(
+                target_local_max_ptr,
+                target_local_max_stride,
+                target_local_sumexp_ptr,
+                target_local_sumexp_stride,
+                recovery_token_idx,
+                vocab_num_blocks,
+                PADDED_VOCAB_NUM_BLOCKS,
+            )
+            target_log_probs = logits - target_lse
+            draft_probs = tl.load(
+                draft_probs_ptr + recovery_token_idx * draft_probs_stride + token_ids,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
+            draft_log_probs = tl.log(draft_probs)
+            ratio = tl.exp(draft_log_probs - target_log_probs)
+            logits = tl.where(
+                ratio < 1.0,
+                target_log_probs + tl.log(1.0 - ratio),
+                float("-inf"),
+            )
     else:
-        rejected_draft = tl.load(draft_tokens_ptr + recovery_token_idx)
-        logits = tl.where(token_ids != rejected_draft, logits, float("-inf"))
-    logits += tl.load(
-        recovery_gumbel_ptr + req_idx * recovery_gumbel_stride + block,
-        mask=mask,
-        other=float("-inf"),
-    ).to(tl.float32)
+        if not is_bonus:
+            draft_token_offset = 0
+            if HAS_BONUS_LOGITS:
+                draft_token_offset = 1
+            rejected_draft = tl.load(draft_tokens_ptr + recovery_token_idx + draft_token_offset)
+            logits = tl.where(token_ids != rejected_draft, logits, float("-inf"))
+    if temperature != 0.0:
+        logits += tl.load(
+            recovery_gumbel_ptr + req_idx * recovery_gumbel_stride + block,
+            mask=mask,
+            other=float("-inf"),
+        ).to(tl.float32)
 
     value, idx = tl.max(logits, axis=0, return_indices=True)
     argmax_idx = block_idx * BLOCK_SIZE + idx
@@ -403,6 +424,7 @@ def _insert_resampled_or_bonus_kernel(
     cu_num_logits_ptr,
     expanded_idx_mapping_ptr,
     temperature_ptr,
+    HAS_BONUS_LOGITS: tl.constexpr,
     PADDED_RECOVERY_BLOCKS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
@@ -410,9 +432,11 @@ def _insert_resampled_or_bonus_kernel(
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_draft_tokens = end_idx - start_idx
+    if HAS_BONUS_LOGITS:
+        num_draft_tokens -= 1
 
     tl.store(num_sampled_ptr + req_idx, num_sampled + 1)
-    if num_sampled == num_draft_tokens:
+    if not HAS_BONUS_LOGITS and num_sampled == num_draft_tokens:
         bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
         tl.store(
             sampled_ptr + req_idx * sampled_stride + num_sampled,
@@ -423,7 +447,10 @@ def _insert_resampled_or_bonus_kernel(
     recovery_token_idx = start_idx + num_sampled
     req_state_idx = tl.load(expanded_idx_mapping_ptr + recovery_token_idx)
     temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
-    if temperature == 0.0:
+    is_bonus = False
+    if HAS_BONUS_LOGITS:
+        is_bonus = num_sampled == num_draft_tokens
+    if temperature == 0.0 and not is_bonus:
         return
 
     blocks = tl.arange(0, PADDED_RECOVERY_BLOCKS)
@@ -547,6 +574,7 @@ def rejection_sample(
         TARGET_INDEX_BLOCK_SIZE=target_index_block_size,
         HAS_DRAFT_PROBS=draft_probs is not None,
         HAS_TARGET_INDICES=target_indices is not None,
+        HAS_BONUS_LOGITS=False,
         NUM_SPECULATIVE_STEPS=num_speculative_steps,
         num_warps=1,
     )
@@ -578,6 +606,7 @@ def rejection_sample(
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_PROBS=draft_probs is not None,
         HAS_TARGET_INDICES=target_indices is not None,
+        HAS_BONUS_LOGITS=False,
         BLOCK_SIZE=recovery_block_size,
     )
     _insert_resampled_or_bonus_kernel[(num_reqs,)](
@@ -593,6 +622,163 @@ def rejection_sample(
         cu_num_logits,
         expanded_idx_mapping,
         temperature,
+        HAS_BONUS_LOGITS=False,
+        PADDED_RECOVERY_BLOCKS=padded_recovery_blocks,
+    )
+    return sampled, num_sampled
+
+
+def rejection_sample_with_bonus_logits(
+    target_logits: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    draft_probs: torch.Tensor | None,
+    target_indices: torch.Tensor | None,
+    cu_num_logits: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    temperature: torch.Tensor,
+    acceptance_uniform: torch.Tensor,
+    recovery_gumbel: torch.Tensor,
+    num_speculative_steps: int,
+    workspace: RejectionWorkspace | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert draft_probs is None, "bonus-logits rejection path does not support draft_probs yet"
+    num_reqs = cu_num_logits.shape[0] - 1
+    num_logits, vocab_size = target_logits.shape
+    assert target_indices is None or target_indices.shape == target_logits.shape
+    assert draft_tokens.ndim == 1
+    assert draft_tokens.shape[0] == num_logits
+
+    vocab_block_size = 8192
+    vocab_num_blocks = triton.cdiv(vocab_size, vocab_block_size)
+    padded_vocab_num_blocks = triton.next_power_of_2(vocab_num_blocks)
+    target_index_block_size = triton.next_power_of_2(vocab_size) if target_indices is not None else 1
+    recovery_block_size = 1024
+    recovery_blocks = triton.cdiv(vocab_size, recovery_block_size)
+    padded_recovery_blocks = triton.next_power_of_2(recovery_blocks)
+    if workspace is None:
+        workspace = RejectionWorkspace()
+    (
+        target_local_argmax,
+        target_local_max,
+        target_local_sumexp,
+        sampled,
+        num_sampled,
+        recovery_local_argmax,
+        recovery_local_max,
+    ) = workspace.prepare(
+        target_logits,
+        num_reqs,
+        num_logits,
+        vocab_num_blocks,
+        recovery_blocks,
+        num_speculative_steps,
+    )
+    _compute_block_stats_kernel[(num_logits, vocab_num_blocks)](
+        target_local_argmax,
+        target_local_argmax.stride(0),
+        target_local_max,
+        target_local_max.stride(0),
+        target_local_sumexp,
+        target_local_sumexp.stride(0),
+        target_local_max,
+        target_local_max.stride(0),
+        target_local_sumexp,
+        target_local_sumexp.stride(0),
+        target_logits,
+        target_logits.stride(0),
+        target_logits,
+        target_logits.stride(0),
+        target_logits.stride(0),
+        target_indices,
+        0 if target_indices is None else target_indices.stride(0),
+        expanded_idx_mapping,
+        expanded_local_pos,
+        temperature,
+        vocab_size,
+        num_speculative_steps,
+        BLOCK_SIZE=vocab_block_size,
+        HAS_DRAFT_LOGITS=False,
+        HAS_TARGET_INDICES=target_indices is not None,
+    )
+
+    _probabilistic_rejection_kernel[(num_reqs,)](
+        sampled,
+        sampled.stride(0),
+        num_sampled,
+        target_logits,
+        target_logits.stride(0),
+        target_local_argmax,
+        target_local_argmax.stride(0),
+        target_local_max,
+        target_local_max.stride(0),
+        target_local_sumexp,
+        target_local_sumexp.stride(0),
+        draft_tokens,
+        draft_probs,
+        0,
+        target_indices,
+        0 if target_indices is None else target_indices.stride(0),
+        cu_num_logits,
+        idx_mapping,
+        temperature,
+        acceptance_uniform,
+        vocab_num_blocks,
+        vocab_size,
+        PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
+        TARGET_INDEX_BLOCK_SIZE=target_index_block_size,
+        HAS_DRAFT_PROBS=False,
+        HAS_TARGET_INDICES=target_indices is not None,
+        HAS_BONUS_LOGITS=True,
+        NUM_SPECULATIVE_STEPS=num_speculative_steps,
+        num_warps=1,
+    )
+
+    _recovery_kernel[(num_reqs, recovery_blocks)](
+        recovery_local_argmax,
+        recovery_local_argmax.stride(0),
+        recovery_local_max,
+        recovery_local_max.stride(0),
+        target_logits,
+        target_logits.stride(0),
+        target_local_max,
+        target_local_max.stride(0),
+        target_local_sumexp,
+        target_local_sumexp.stride(0),
+        num_sampled,
+        cu_num_logits,
+        expanded_idx_mapping,
+        draft_tokens,
+        draft_probs,
+        0,
+        target_indices,
+        0 if target_indices is None else target_indices.stride(0),
+        temperature,
+        recovery_gumbel,
+        recovery_gumbel.stride(0),
+        vocab_size,
+        vocab_num_blocks,
+        PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
+        HAS_DRAFT_PROBS=False,
+        HAS_TARGET_INDICES=target_indices is not None,
+        HAS_BONUS_LOGITS=True,
+        BLOCK_SIZE=recovery_block_size,
+    )
+    _insert_resampled_or_bonus_kernel[(num_reqs,)](
+        sampled,
+        sampled.stride(0),
+        num_sampled,
+        recovery_local_argmax,
+        recovery_local_argmax.stride(0),
+        recovery_local_max,
+        recovery_local_max.stride(0),
+        target_logits,
+        recovery_blocks,
+        cu_num_logits,
+        expanded_idx_mapping,
+        temperature,
+        HAS_BONUS_LOGITS=True,
         PADDED_RECOVERY_BLOCKS=padded_recovery_blocks,
     )
     return sampled, num_sampled

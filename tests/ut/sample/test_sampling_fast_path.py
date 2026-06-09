@@ -82,6 +82,14 @@ class _FakeBonusSampler:
         )
 
 
+def _fake_rejection_sampler(logprobs_mode="raw_logprobs"):
+    sampler = AscendRejectionSampler.__new__(AscendRejectionSampler)
+    sampler.sampler = SimpleNamespace(logprobs_mode=logprobs_mode)
+    sampler.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
+    sampler.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
+    return sampler
+
+
 def test_gumbel_sample_does_not_mutate_logits():
     logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]])
     original = logits.clone()
@@ -137,13 +145,14 @@ def test_topk_topp_sampler_maps_reduce_sample_candidates_to_token_ids():
 
 def test_rejection_sampler_optimized_gate_keeps_async_exponential_fallback():
     sampling_metadata = SimpleNamespace(all_greedy=False)
+    sampler = _fake_rejection_sampler()
 
     with patch("vllm_ascend.sample.rejection_sampler.get_ascend_config") as get_config:
         get_config.return_value = SimpleNamespace(
             enable_async_exponential=True,
             enable_reduce_sample=False,
         )
-        assert not AscendRejectionSampler._can_use_optimized_rejection(
+        assert not sampler._can_use_optimized_rejection(
             sampling_metadata,
             torch.arange(4),
         )
@@ -154,14 +163,40 @@ def test_rejection_sampler_optimized_gate_accepts_logprobs_and_reduce_sample():
         all_greedy=False,
         max_num_logprobs=1,
         logprob_token_ids={0: [7]},
+        no_penalties=True,
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=SimpleNamespace(non_argmax_invariant=[], argmax_invariant=[]),
     )
+    sampler = _fake_rejection_sampler()
 
     with patch("vllm_ascend.sample.rejection_sampler.get_ascend_config") as get_config:
         get_config.return_value = SimpleNamespace(
             enable_async_exponential=False,
             enable_reduce_sample=True,
         )
-        assert AscendRejectionSampler._can_use_optimized_rejection(
+        assert sampler._can_use_optimized_rejection(
+            sampling_metadata,
+            torch.arange(4),
+        )
+
+
+def test_rejection_sampler_optimized_gate_rejects_all_greedy():
+    sampling_metadata = SimpleNamespace(
+        all_greedy=True,
+        no_penalties=True,
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=SimpleNamespace(non_argmax_invariant=[], argmax_invariant=[]),
+    )
+    sampler = _fake_rejection_sampler()
+
+    with patch("vllm_ascend.sample.rejection_sampler.get_ascend_config") as get_config:
+        get_config.return_value = SimpleNamespace(
+            enable_async_exponential=False,
+            enable_reduce_sample=False,
+        )
+        assert not sampler._can_use_optimized_rejection(
             sampling_metadata,
             torch.arange(4),
         )
@@ -222,16 +257,28 @@ def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
     logits[2, 22] = 2.0
     logits[3, 23] = 36.0
 
-    candidate_logits = torch.tensor(
-        [[40.0, 1.0, -2.0], [42.0, 2.0, -3.0]],
+    candidate_logits_all = torch.tensor(
+        [
+            [40.0, 1.0, -2.0],
+            [35.0, 1.0, -2.0],
+            [42.0, 2.0, -3.0],
+            [36.0, 1.0, -2.0],
+        ],
         dtype=torch.float32,
         device=device,
     )
-    candidate_indices = torch.tensor(
-        [[11, 12, 13], [21, 22, 24]],
+    candidate_indices_all = torch.tensor(
+        [
+            [11, 12, 13],
+            [14, 12, 13],
+            [21, 22, 24],
+            [23, 22, 24],
+        ],
         dtype=torch.int64,
         device=device,
     )
+    candidate_logits_draft = candidate_logits_all[[0, 2]]
+    candidate_indices_draft = candidate_indices_all[[0, 2]]
 
     metadata = SpecDecodeMetadata(
         draft_token_ids=torch.tensor([11, 21], dtype=torch.int32, device=device),
@@ -247,7 +294,9 @@ def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
     input_ids = torch.tensor([99, 11, 98, 21], dtype=torch.int32, device=device)
 
     def fake_apply_sampling_constraints(logits, cu_num_draft_tokens, sampling_metadata, top_k):
-        return candidate_logits.clone(), candidate_indices
+        if logits.shape[0] == candidate_logits_all.shape[0]:
+            return candidate_logits_all.clone(), candidate_indices_all
+        return candidate_logits_draft.clone(), candidate_indices_draft
 
     config = SimpleNamespace(enable_reduce_sample=True, enable_async_exponential=False)
     uniform = torch.full((2,), 1e-4, dtype=torch.float64, device=device)

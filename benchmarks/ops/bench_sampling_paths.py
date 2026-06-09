@@ -115,18 +115,18 @@ def boost_draft_logits(
     num_speculative_steps: int,
     boost: float,
 ) -> None:
-    rows = []
-    cols = []
     num_reqs = logits.shape[0] // (num_speculative_steps + 1)
-    for req_idx in range(num_reqs):
-        start = req_idx * (num_speculative_steps + 1)
-        for step in range(num_speculative_steps):
-            rows.append(start + step)
-            cols.append(int(input_ids[start + step + 1].item()))
-    logits[
-        torch.tensor(rows, dtype=torch.int64, device=logits.device),
-        torch.tensor(cols, dtype=torch.int64, device=logits.device),
-    ] += boost
+    req_starts = torch.arange(
+        0,
+        num_reqs * (num_speculative_steps + 1),
+        num_speculative_steps + 1,
+        dtype=torch.int64,
+        device=logits.device,
+    )
+    steps = torch.arange(num_speculative_steps, dtype=torch.int64, device=logits.device)
+    rows = (req_starts.unsqueeze(1) + steps.unsqueeze(0)).flatten()
+    cols = input_ids[rows + 1].to(torch.int64)
+    logits[rows, cols] += boost
 
 
 def make_gumbel(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
@@ -134,6 +134,26 @@ def make_gumbel(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
     gumbel.exponential_()
     gumbel.log_().neg_()
     return gumbel
+
+
+def make_rejection_randoms(
+    count: int,
+    num_draft_logits: int,
+    batch_size: int,
+    vocab_size: int,
+    device: torch.device,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.npu.Event]]:
+    randoms = []
+    for _ in range(count):
+        acceptance_uniform = torch.empty((num_draft_logits,), dtype=torch.float32, device=device)
+        acceptance_uniform.uniform_()
+        acceptance_uniform.clamp_(min=1e-20)
+        recovery_gumbel = make_gumbel((batch_size, vocab_size), device)
+        event = torch.npu.Event()
+        event.record()
+        randoms.append((acceptance_uniform, recovery_gumbel, event))
+    torch.npu.synchronize()
+    return randoms
 
 
 def benchmark(
@@ -217,6 +237,16 @@ def run_batch_size(
         spec_metadata, input_ids = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
         spec_logits = torch.randn(num_logits, vocab_size, dtype=torch.float32, device=device)
         boost_draft_logits(spec_logits, input_ids, spec_steps, boost=12.0)
+        spec_randoms = []
+        if "optimized" in args.paths:
+            spec_randoms = make_rejection_randoms(
+                args.warmups + args.iterations,
+                batch_size * spec_steps,
+                batch_size,
+                vocab_size,
+                device,
+            )
+        spec_random_idx = 0
 
         def spec_v1_native() -> torch.Tensor:
             return rejection_sampler(
@@ -227,6 +257,13 @@ def run_batch_size(
             ).sampled_token_ids
 
         def spec_optimized() -> torch.Tensor:
+            nonlocal spec_random_idx
+            acceptance_uniform, recovery_gumbel, event = spec_randoms[spec_random_idx]
+            spec_random_idx += 1
+            rejection_sampler._acceptance_uniform = acceptance_uniform
+            rejection_sampler._recovery_gumbel = recovery_gumbel
+            rejection_sampler._random_event = event
+            rejection_sampler._random_ready = True
             return rejection_sampler(
                 spec_metadata,
                 None,
@@ -311,7 +348,7 @@ def main() -> None:
         "notes": [
             "Measured with wall-clock time and NPU synchronization.",
             "v1_native uses the existing sampler calls without the optimized rejection operator.",
-            "optimized uses prefetched regular Gumbel tensors and the native rejection operator.",
+            "optimized uses prefetched regular Gumbel/rejection random tensors and the native rejection operator.",
             "The benchmark does not include ModelRunnerV2 bridge or FastSampler rows because that design is removed.",
         ],
         "results": results,

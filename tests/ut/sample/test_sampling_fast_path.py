@@ -206,6 +206,7 @@ def test_topk_topp_sampler_npu_preserves_reduce_sample_logprobs():
 @pytest.mark.skipif(not _npu_available(), reason="requires NPU")
 def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
     from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+
     from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
     torch.npu.set_device(0)

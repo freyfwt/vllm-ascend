@@ -156,28 +156,24 @@ def make_rejection_randoms(
     return randoms
 
 
-def make_logits_pool(
-    logits: torch.Tensor,
-    count: int,
-) -> list[torch.Tensor]:
-    pool = [logits.clone() for _ in range(count)]
-    torch.npu.synchronize()
-    return pool
-
-
 def benchmark(
     name: str,
     fn: Callable[[], torch.Tensor],
     warmups: int,
     iterations: int,
+    prepare: Callable[[], None] | None = None,
 ) -> dict[str, float | list[float] | str]:
     global SINK
     for _ in range(warmups):
+        if prepare is not None:
+            prepare()
         SINK = fn()
     torch.npu.synchronize()
 
     times_ms: list[float] = []
     for _ in range(iterations):
+        if prepare is not None:
+            prepare()
         torch.npu.synchronize()
         start = time.perf_counter()
         SINK = fn()
@@ -221,44 +217,36 @@ def run_batch_size(
         args.top_k,
         args.top_p,
     )
-    cases: list[tuple[str, str, Callable[[], torch.Tensor]]] = []
+    cases: list[tuple[str, str, Callable[[], torch.Tensor], Callable[[], None] | None]] = []
 
     if "regular" in args.scenarios:
         regular_logits = torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device)
         regular_gumbels = [make_gumbel((batch_size, vocab_size), device) for _ in range(args.warmups + args.iterations)]
         regular_gumbel_idx = 0
-        regular_logits_by_path = {
-            path: make_logits_pool(regular_logits, args.warmups + args.iterations) for path in args.paths
-        }
-        regular_logits_idx_by_path = {path: 0 for path in args.paths}
+        regular_logits_by_path = {path: regular_logits.clone() for path in args.paths}
 
-        def next_regular_logits(path: str) -> torch.Tensor:
-            idx = regular_logits_idx_by_path[path]
-            regular_logits_idx_by_path[path] += 1
-            return regular_logits_by_path[path][idx]
+        def prepare_regular_logits(path: str) -> None:
+            regular_logits_by_path[path].copy_(regular_logits, non_blocking=True)
 
         def regular_v1_native() -> torch.Tensor:
-            return sampler(next_regular_logits("v1_native"), sampling_metadata).sampled_token_ids
+            return sampler(regular_logits_by_path["v1_native"], sampling_metadata).sampled_token_ids
 
         def regular_optimized() -> torch.Tensor:
             nonlocal regular_gumbel_idx
             sampler.set_gumbel_event(regular_gumbels[regular_gumbel_idx], None)
             regular_gumbel_idx += 1
-            return sampler(next_regular_logits("optimized"), sampling_metadata).sampled_token_ids
+            return sampler(regular_logits_by_path["optimized"], sampling_metadata).sampled_token_ids
 
         if "v1_native" in args.paths:
-            cases.append(("regular", "v1_native", regular_v1_native))
+            cases.append(("regular", "v1_native", regular_v1_native, lambda: prepare_regular_logits("v1_native")))
         if "optimized" in args.paths:
-            cases.append(("regular", "optimized", regular_optimized))
+            cases.append(("regular", "optimized", regular_optimized, lambda: prepare_regular_logits("optimized")))
 
     if "spec" in args.scenarios:
         spec_metadata, input_ids = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
         spec_logits = torch.randn(num_logits, vocab_size, dtype=torch.float32, device=device)
         boost_draft_logits(spec_logits, input_ids, spec_steps, boost=12.0)
-        spec_logits_by_path = {
-            path: make_logits_pool(spec_logits, args.warmups + args.iterations) for path in args.paths
-        }
-        spec_logits_idx_by_path = {path: 0 for path in args.paths}
+        spec_logits_by_path = {path: spec_logits.clone() for path in args.paths}
         spec_randoms = []
         if "optimized" in args.paths:
             spec_randoms = make_rejection_randoms(
@@ -270,16 +258,14 @@ def run_batch_size(
             )
         spec_random_idx = 0
 
-        def next_spec_logits(path: str) -> torch.Tensor:
-            idx = spec_logits_idx_by_path[path]
-            spec_logits_idx_by_path[path] += 1
-            return spec_logits_by_path[path][idx]
+        def prepare_spec_logits(path: str) -> None:
+            spec_logits_by_path[path].copy_(spec_logits, non_blocking=True)
 
         def spec_v1_native() -> torch.Tensor:
             return rejection_sampler(
                 spec_metadata,
                 None,
-                next_spec_logits("v1_native"),
+                spec_logits_by_path["v1_native"],
                 sampling_metadata,
             ).sampled_token_ids
 
@@ -294,20 +280,20 @@ def run_batch_size(
             return rejection_sampler(
                 spec_metadata,
                 None,
-                next_spec_logits("optimized"),
+                spec_logits_by_path["optimized"],
                 sampling_metadata,
                 input_ids,
             ).sampled_token_ids
 
         if "v1_native" in args.paths:
-            cases.append(("spec", "v1_native", spec_v1_native))
+            cases.append(("spec", "v1_native", spec_v1_native, lambda: prepare_spec_logits("v1_native")))
         if "optimized" in args.paths:
-            cases.append(("spec", "optimized", spec_optimized))
+            cases.append(("spec", "optimized", spec_optimized, lambda: prepare_spec_logits("optimized")))
 
     results = []
-    for scenario, path, fn in cases:
+    for scenario, path, fn, prepare in cases:
         name = f"{scenario}/{path}"
-        result = benchmark(name, fn, args.warmups, args.iterations)
+        result = benchmark(name, fn, args.warmups, args.iterations, prepare)
         result["batch_size"] = batch_size
         result["scenario"] = scenario
         result["path"] = path
@@ -374,7 +360,7 @@ def main() -> None:
         "timer": "wall_clock_with_npu_synchronize",
         "notes": [
             "Measured with wall-clock time and NPU synchronization.",
-            "Each measured iteration consumes a pre-created fresh logits tensor "
+            "Each measured iteration refreshes a per-path working logits tensor before timing "
             "so timed rows do not include input clone.",
             "v1_native uses the existing sampler calls without the optimized rejection operator.",
             "optimized uses prefetched regular Gumbel/rejection random tensors and the native rejection operator.",

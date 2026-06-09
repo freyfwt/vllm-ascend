@@ -18,13 +18,12 @@ import vllm_ascend.ascend_config as ascend_config_module
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.sample.sampler import AscendSampler
-from vllm_ascend.sample.sampling_bridge import FastSampler
 from vllm_ascend.utils import enable_custom_op
 
 SINK = None
 DEFAULT_BATCH_SIZES = (1, 8, 32, 64, 96)
 DEFAULT_SCENARIOS = ("regular", "spec")
-DEFAULT_PATHS = ("v1_native", "fast")
+DEFAULT_PATHS = ("v1_native", "optimized")
 DEFAULT_TEMPERATURE = 0.8
 DEFAULT_TOP_K = 20
 DEFAULT_TOP_P = 0.95
@@ -197,41 +196,27 @@ def run_batch_size(
 
     if "regular" in args.scenarios:
         regular_logits = torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device)
-        regular_gumbel = make_gumbel((batch_size, vocab_size), device)
-        regular_fast_sampler = FastSampler(
-            max_num_reqs=batch_size,
-            device=device,
-            speculative_config=None,
-        )
+        regular_gumbels = [make_gumbel((batch_size, vocab_size), device) for _ in range(args.warmups + args.iterations)]
+        regular_gumbel_idx = 0
 
         def regular_v1_native() -> torch.Tensor:
             return sampler(regular_logits.clone(), sampling_metadata).sampled_token_ids
 
-        def regular_fast() -> torch.Tensor:
-            return regular_fast_sampler.sample_regular(
-                regular_logits.clone(),
-                sampler,
-                sampling_metadata,
-                regular_gumbel,
-            ).sampled_token_ids
+        def regular_optimized() -> torch.Tensor:
+            nonlocal regular_gumbel_idx
+            sampler.set_gumbel_event(regular_gumbels[regular_gumbel_idx], None)
+            regular_gumbel_idx += 1
+            return sampler(regular_logits.clone(), sampling_metadata).sampled_token_ids
 
         if "v1_native" in args.paths:
             cases.append(("regular", "v1_native", regular_v1_native))
-        if "fast" in args.paths:
-            cases.append(("regular", "fast", regular_fast))
+        if "optimized" in args.paths:
+            cases.append(("regular", "optimized", regular_optimized))
 
     if "spec" in args.scenarios:
         spec_metadata, input_ids = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
         spec_logits = torch.randn(num_logits, vocab_size, dtype=torch.float32, device=device)
         boost_draft_logits(spec_logits, input_ids, spec_steps, boost=12.0)
-        acceptance_uniform = torch.rand(num_logits, dtype=torch.float32, device=device)
-        acceptance_uniform.clamp_(min=1e-20)
-        recovery_gumbel = make_gumbel((batch_size, vocab_size), device)
-        spec_fast_sampler = FastSampler(
-            max_num_reqs=batch_size,
-            device=device,
-            speculative_config=SimpleNamespace(num_speculative_tokens=spec_steps),
-        )
 
         def spec_v1_native() -> torch.Tensor:
             return rejection_sampler(
@@ -241,22 +226,19 @@ def run_batch_size(
                 sampling_metadata,
             ).sampled_token_ids
 
-        def spec_fast() -> torch.Tensor:
-            return spec_fast_sampler.sample_spec(
-                spec_logits.clone(),
-                sampler,
-                rejection_sampler,
-                sampling_metadata,
+        def spec_optimized() -> torch.Tensor:
+            return rejection_sampler(
                 spec_metadata,
+                None,
+                spec_logits.clone(),
+                sampling_metadata,
                 input_ids,
-                acceptance_uniform,
-                recovery_gumbel,
             ).sampled_token_ids
 
         if "v1_native" in args.paths:
             cases.append(("spec", "v1_native", spec_v1_native))
-        if "fast" in args.paths:
-            cases.append(("spec", "fast", spec_fast))
+        if "optimized" in args.paths:
+            cases.append(("spec", "optimized", spec_optimized))
 
     results = []
     for scenario, path, fn in cases:
@@ -328,9 +310,9 @@ def main() -> None:
         "timer": "wall_clock_with_npu_synchronize",
         "notes": [
             "Measured with wall-clock time and NPU synchronization.",
-            "v1_native uses the existing Ascend sampler or rejection sampler.",
-            "fast uses the V1-native fast sampler with prefetched random tensors.",
-            "The benchmark does not include ModelRunnerV2 bridge rows because that design is removed.",
+            "v1_native uses the existing sampler calls without the optimized rejection operator.",
+            "optimized uses prefetched regular Gumbel tensors and the native rejection operator.",
+            "The benchmark does not include ModelRunnerV2 bridge or FastSampler rows because that design is removed.",
         ],
         "results": results,
     }

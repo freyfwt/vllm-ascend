@@ -32,7 +32,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -126,11 +125,6 @@ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
-from vllm_ascend.sample.sampling_bridge import (
-    FastSampler,
-    NoiseManager,
-    SamplingNoise,
-)
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
@@ -297,16 +291,6 @@ class NPUModelRunner(GPUModelRunner):
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
         self.sampler = AscendSampler()
-        self.fast_sampler: FastSampler | None = None
-        self._noise_manager: NoiseManager | None = None
-        if get_pp_group().is_last_rank and not self.is_pooling_model:
-            self.fast_sampler = FastSampler(
-                max_num_reqs=self.max_num_reqs,
-                device=device,
-                speculative_config=self.vllm_config.speculative_config,
-            )
-            self._noise_manager = NoiseManager(device)
-        self._sampling_noise: SamplingNoise | None = None
         self.attn_state: AscendAttentionState | None = None
 
         # Ascend-specific configurations
@@ -1982,19 +1966,10 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False  # type: ignore[has-type]
-        self._sampling_noise = None
-        if self._can_fast_sample(spec_decode_metadata):
-            self._sampling_noise = self._make_noise(
-                spec_decode_metadata,
-                logits_indices,
-            )
-        else:
-            if self.ascend_config.enable_async_exponential:
-                self.sampler.do_async_exponential(
-                    b_s=logits_indices.shape[0],
-                    head_dim=self.model_config.get_vocab_size(),
-                    generators=self.input_batch.sampling_metadata.generators,
-                )
+        self._prepare_async_sampling_random(
+            spec_decode_metadata,
+            logits_indices,
+        )
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
@@ -2336,99 +2311,63 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
-    def _can_fast_sample(
-        self,
-        spec_decode_metadata: SpecDecodeMetadata | None,
-    ) -> bool:
-        fast_sampler = getattr(self, "fast_sampler", None)
-        if fast_sampler is None:
-            return False
-        sampling_metadata = self.input_batch.sampling_metadata
-        if sampling_metadata.max_num_logprobs is not None:
-            return False
-        if getattr(sampling_metadata, "logprob_token_ids", None):
-            return False
-        # Fast path does not produce num_nans diagnostics.
-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
-            return False
-        if lmhead_tp_enable():
-            return False
-        if self.ascend_config.enable_reduce_sample:
-            return False
-        if self.ascend_config.enable_async_exponential:
-            return False
-        num_reqs = self.input_batch.num_reqs
-        if np.any(self.discard_request_mask.np[:num_reqs]):
-            return False
-        if spec_decode_metadata is None:
-            return True
-        return self.speculative_config is not None and hasattr(self, "rejection_sampler")
-
-    def _make_noise(
+    def _prepare_async_sampling_random(
         self,
         spec_decode_metadata: SpecDecodeMetadata | None,
         logits_indices: torch.Tensor,
-    ) -> SamplingNoise:
-        assert self._noise_manager is not None
+    ) -> None:
         sampling_metadata = self.input_batch.sampling_metadata
+        if self.ascend_config.enable_async_exponential:
+            self.sampler.do_async_exponential(
+                b_s=logits_indices.shape[0],
+                head_dim=self.model_config.get_vocab_size(),
+                generators=sampling_metadata.generators,
+            )
+            return
+
+        if sampling_metadata.all_greedy:
+            return
+
+        random_vocab_size = self._sampling_random_vocab_size()
+        if spec_decode_metadata is None:
+            self.sampler.do_async_gumbel(
+                b_s=int(logits_indices.shape[0]),
+                head_dim=random_vocab_size,
+                generators=sampling_metadata.generators,
+                device=self.device,
+            )
+            return
+
+        if hasattr(self, "rejection_sampler"):
+            self.rejection_sampler.do_async_rejection_random(
+                num_logits=sum(spec_decode_metadata.num_draft_tokens),
+                num_reqs=self.input_batch.num_reqs,
+                recovery_vocab_size=random_vocab_size,
+                num_draft_tokens=spec_decode_metadata.num_draft_tokens,
+                sampling_metadata=sampling_metadata,
+                device=self.device,
+            )
+
+    def _sampling_random_vocab_size(self) -> int:
         vocab_size = self.model_config.get_vocab_size()
-        if spec_decode_metadata is None:
-            return self._noise_manager.prepare_regular_noise(
-                int(logits_indices.shape[0]),
-                vocab_size,
-                sampling_metadata,
-            )
-        return self._noise_manager.prepare_spec_noise(
-            int(spec_decode_metadata.logits_indices.shape[0]),
-            self.input_batch.num_reqs,
-            vocab_size,
-            spec_decode_metadata.num_draft_tokens,
-            sampling_metadata,
-        )
+        if not (
+            get_ascend_config().enable_reduce_sample
+            and self.input_batch.sampling_metadata.top_k is not None
+        ):
+            return vocab_size
 
-    def _fast_sample(
-        self,
-        logits: torch.Tensor,
-        spec_decode_metadata: SpecDecodeMetadata | None,
-        noise: SamplingNoise,
-    ) -> SamplerOutput:
-        assert self.fast_sampler is not None
-        assert self._noise_manager is not None
-        self._noise_manager.wait(noise)
-        sampling_metadata = self.input_batch.sampling_metadata
-        if spec_decode_metadata is None:
-            return self.fast_sampler.sample_regular(
-                logits,
-                self.sampler,
-                sampling_metadata,
-                noise.sampling_gumbel,
-            )
-
-        return self.fast_sampler.sample_spec(
-            logits,
-            self.sampler,
-            self.rejection_sampler,
-            sampling_metadata,
-            spec_decode_metadata,
-            self.input_ids.gpu,
-            noise.acceptance_uniform,
-            noise.recovery_gumbel,
-        )
+        valid_top_k = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < vocab_size]
+        if len(valid_top_k) == 0:
+            return vocab_size
+        max_topk = valid_top_k.max()
+        candidate_size = int(max_topk) * get_tp_group().world_size
+        return min(candidate_size, vocab_size)
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         self.input_batch.update_async_output_token_ids()
-        noise = getattr(self, "_sampling_noise", None)
-        self._sampling_noise = None
-        if logits is not None and noise is not None:
-            sampler_output = self._fast_sample(
-                logits,
-                spec_decode_metadata,
-                noise,
-            )
-            return sampler_output
 
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
@@ -2451,6 +2390,7 @@ class NPUModelRunner(GPUModelRunner):
             None,  # draft_probs
             logits,
             sampling_metadata,
+            input_ids=self.input_ids.gpu,
         )
         return sampler_output
 

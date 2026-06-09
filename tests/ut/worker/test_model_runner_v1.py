@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
@@ -150,64 +151,92 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         self.assertEqual(actual_output_token_ids[1], [4, 5, 7])
 
 
-class TestNPUModelRunnerFastSamplingGate(unittest.TestCase):
+class TestNPUModelRunnerAsyncSamplingRandom(unittest.TestCase):
     def _build_runner(
         self,
         sampling_metadata,
         *,
-        compute_nans=False,
         enable_async_exponential=False,
     ):
         runner = NPUModelRunner.__new__(NPUModelRunner)
-        runner.fast_sampler = SimpleNamespace()
+        runner.device = torch.device("cpu")
+        runner.model_config = MagicMock()
+        runner.model_config.get_vocab_size.return_value = 16
+        runner.sampler = MagicMock()
         runner.input_batch = SimpleNamespace(
             sampling_metadata=sampling_metadata,
             num_reqs=2,
+            top_k_cpu=np.array([4, 4], dtype=np.int32),
         )
         runner.ascend_config = SimpleNamespace(
             enable_reduce_sample=False,
             enable_async_exponential=enable_async_exponential,
         )
-        runner.discard_request_mask = SimpleNamespace(np=torch.zeros(2, dtype=torch.bool).numpy())
-        runner.speculative_config = None
+        runner.rejection_sampler = MagicMock()
         return runner
 
-    @patch("vllm_ascend.worker.model_runner_v1.lmhead_tp_enable", return_value=False)
-    def test_can_fast_sample_rejects_unsupported_consumers(self, _mock_lmhead_tp_enable):
-        cases = [
-            (SimpleNamespace(max_num_logprobs=1, logprob_token_ids=None), False, False, False),
-            (SimpleNamespace(max_num_logprobs=None, logprob_token_ids={"req0": [1]}), False, False, False),
-            (SimpleNamespace(max_num_logprobs=None, logprob_token_ids=None), True, False, False),
-            (SimpleNamespace(max_num_logprobs=None, logprob_token_ids=None), False, True, False),
-            (SimpleNamespace(max_num_logprobs=None, logprob_token_ids=None), False, False, True),
-        ]
-        for sampling_metadata, compute_nans, enable_async_exponential, expected in cases:
-            with (
-                self.subTest(
-                    sampling_metadata=sampling_metadata,
-                    compute_nans=compute_nans,
-                    enable_async_exponential=enable_async_exponential,
-                ),
-                patch(
-                    "vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS",
-                    compute_nans,
-                ),
-            ):
-                self.assertEqual(
-                    self._build_runner(
-                        sampling_metadata,
-                        compute_nans=compute_nans,
-                        enable_async_exponential=enable_async_exponential,
-                    )._can_fast_sample(None),
-                    expected,
-                )
+    @patch("vllm_ascend.worker.model_runner_v1.get_ascend_config")
+    def test_prepare_async_sampling_random_skips_all_greedy(self, mock_get_ascend_config):
+        mock_get_ascend_config.return_value = SimpleNamespace(enable_reduce_sample=False)
+        sampling_metadata = SimpleNamespace(all_greedy=True, generators={}, top_k=None)
+        runner = self._build_runner(sampling_metadata)
 
-    @patch("vllm_ascend.worker.model_runner_v1.lmhead_tp_enable", return_value=False)
-    @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS", False)
-    def test_can_fast_sample_accepts_regular_path(self, _mock_lmhead_tp_enable):
-        sampling_metadata = SimpleNamespace(max_num_logprobs=None, logprob_token_ids=None)
+        runner._prepare_async_sampling_random(None, torch.arange(2))
 
-        self.assertTrue(self._build_runner(sampling_metadata)._can_fast_sample(None))
+        runner.sampler.do_async_gumbel.assert_not_called()
+        runner.sampler.do_async_exponential.assert_not_called()
+        runner.rejection_sampler.do_async_rejection_random.assert_not_called()
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_ascend_config")
+    def test_prepare_async_sampling_random_uses_regular_gumbel(self, mock_get_ascend_config):
+        mock_get_ascend_config.return_value = SimpleNamespace(enable_reduce_sample=False)
+        sampling_metadata = SimpleNamespace(all_greedy=False, generators={}, top_k=None)
+        runner = self._build_runner(sampling_metadata)
+
+        runner._prepare_async_sampling_random(None, torch.arange(2))
+
+        runner.sampler.do_async_gumbel.assert_called_once_with(
+            b_s=2,
+            head_dim=16,
+            generators={},
+            device=torch.device("cpu"),
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_ascend_config")
+    def test_prepare_async_sampling_random_uses_rejection_random(self, mock_get_ascend_config):
+        mock_get_ascend_config.return_value = SimpleNamespace(enable_reduce_sample=False)
+        sampling_metadata = SimpleNamespace(all_greedy=False, generators={}, top_k=None)
+        metadata = SimpleNamespace(
+            logits_indices=torch.arange(6),
+            num_draft_tokens=[2, 2],
+        )
+        runner = self._build_runner(sampling_metadata)
+
+        runner._prepare_async_sampling_random(metadata, torch.arange(6))
+
+        runner.rejection_sampler.do_async_rejection_random.assert_called_once_with(
+            num_logits=4,
+            num_reqs=2,
+            recovery_vocab_size=16,
+            num_draft_tokens=[2, 2],
+            sampling_metadata=sampling_metadata,
+            device=torch.device("cpu"),
+        )
+
+    def test_prepare_async_sampling_random_preserves_async_exponential(self):
+        sampling_metadata = SimpleNamespace(all_greedy=False, generators={}, top_k=None)
+        runner = self._build_runner(
+            sampling_metadata,
+            enable_async_exponential=True,
+        )
+
+        runner._prepare_async_sampling_random(None, torch.arange(3))
+
+        runner.sampler.do_async_exponential.assert_called_once_with(
+            b_s=3,
+            head_dim=16,
+            generators={},
+        )
 
 
 class TestNPUModelRunnerDebugger(unittest.TestCase):

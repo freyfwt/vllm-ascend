@@ -15,6 +15,24 @@ DEFAULT_LOGPROBS_MODE = "raw_logprobs"
 _SAMPLING_EPS = 1e-5
 
 
+def _fill_gumbel(
+    gumbel: torch.Tensor,
+    generators: dict[int, torch.Generator],
+) -> None:
+    gumbel.exponential_()
+    for req_idx, generator in generators.items():
+        if req_idx < gumbel.shape[0]:
+            gumbel[req_idx].exponential_(generator=generator)
+    gumbel.log_().neg_()
+
+
+def gumbel_sample(
+    logits: torch.Tensor,
+    gumbel: torch.Tensor,
+) -> torch.Tensor:
+    return (logits + gumbel[: logits.shape[0], : logits.shape[1]]).argmax(dim=-1).view(-1)
+
+
 def random_sample(
     probs: torch.Tensor,
     generators: dict[int, torch.Generator],
@@ -69,9 +87,14 @@ class AscendSampler(Sampler):
         super().__init__(logprobs_mode=logprobs_mode)
         self.topk_topp_sampler = AscendTopKTopPSampler(logprobs_mode=logprobs_mode)
         self.async_exponential_event = torch.npu.Event()
+        self.async_gumbel_event = torch.npu.Event()
+        self._gumbel_buffer: torch.Tensor | None = None
 
     def set_q_event(self, q, event):
         self.topk_topp_sampler.set_q_event(q, event)
+
+    def set_gumbel_event(self, gumbel, event):
+        self.topk_topp_sampler.set_gumbel_event(gumbel, event)
 
     def prepare_sampling(self, top_k):
         self.topk_topp_sampler.prepare_sampling(top_k)
@@ -90,6 +113,29 @@ class AscendSampler(Sampler):
                     q[i].exponential_(generator=generator)
             self.async_exponential_event.record()
         self.set_q_event(q, self.async_exponential_event)
+
+    def do_async_gumbel(
+        self,
+        b_s: int,
+        head_dim: int,
+        generators: dict[int, torch.Generator],
+        device: torch.device,
+    ) -> None:
+        if b_s <= 0 or head_dim <= 0:
+            return
+        with torch.npu.stream(global_stream()):
+            global_stream().wait_stream(torch.npu.current_stream())
+            if (
+                self._gumbel_buffer is None
+                or self._gumbel_buffer.device != device
+                or self._gumbel_buffer.shape[0] < b_s
+                or self._gumbel_buffer.shape[1] < head_dim
+            ):
+                self._gumbel_buffer = torch.empty((b_s, head_dim), device=device, dtype=torch.float32)
+            gumbel = self._gumbel_buffer[:b_s, :head_dim]
+            _fill_gumbel(gumbel, generators)
+            self.async_gumbel_event.record()
+        self.set_gumbel_event(gumbel, self.async_gumbel_event)
 
     @staticmethod
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
@@ -115,6 +161,9 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         super().__init__(**kwargs)
         self.apply_top_k_top_p = apply_top_k_top_p
         self.top_k = None
+        self.gumbel = None
+        self.gumbel_event = None
+        self.gumbel_ready = False
 
     def set_q_event(self, q, event):
         # Pass in async exponential results.
@@ -122,11 +171,32 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         self.q = q
         self.async_event = event
 
+    def set_gumbel_event(self, gumbel, event):
+        self.gumbel = gumbel
+        self.gumbel_event = event
+        self.gumbel_ready = True
+
     def prepare_sampling(self, top_k):
         if top_k is not None:
             self.top_k = top_k
         else:
             self.top_k = None
+
+    def _get_gumbel(self, logits, generators):
+        if (
+            self.gumbel_ready
+            and self.gumbel is not None
+            and self.gumbel.shape[0] >= logits.shape[0]
+            and self.gumbel.shape[1] >= logits.shape[1]
+        ):
+            if self.gumbel_event is not None:
+                torch.npu.current_stream().wait_event(self.gumbel_event)
+            self.gumbel_ready = False
+            return self.gumbel[: logits.shape[0], : logits.shape[1]]
+
+        gumbel = torch.empty_like(logits, dtype=torch.float32)
+        _fill_gumbel(gumbel, generators)
+        return gumbel
 
     def forward_native(self, logits, generators, k, p):
         """Override pytorch native implementation to torch_npu"""
@@ -143,8 +213,11 @@ class AscendTopKTopPSampler(TopKTopPSampler):
             elif self.logprobs_mode == "processed_logprobs":
                 logits_to_return = cand_logits.log_softmax(dim=-1, dtype=torch.float32)
 
-            probs = torch.softmax(cand_logits, dim=-1)
-            pos = random_sample(probs, generators)  # [B]
+            if get_ascend_config().enable_async_exponential:
+                probs = torch.softmax(cand_logits, dim=-1)
+                pos = random_sample(probs, generators)  # [B]
+            else:
+                pos = gumbel_sample(cand_logits, self._get_gumbel(cand_logits, generators))
 
             next_token = cand_idx.gather(dim=1, index=pos.unsqueeze(1)).squeeze(1)  # [B]
             return next_token, logits_to_return
@@ -156,12 +229,12 @@ class AscendTopKTopPSampler(TopKTopPSampler):
             elif self.logprobs_mode == "processed_logprobs":
                 logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
 
-            probs = logits.softmax(dim=-1, dtype=torch.float32)
             if get_ascend_config().enable_async_exponential:
                 # Add synchronize to prevent synchronize error.
                 self.async_event.synchronize()
+                probs = logits.softmax(dim=-1, dtype=torch.float32)
                 return probs.div_(self.q).argmax(dim=-1).view(-1), logits_to_return
-            return random_sample(probs, generators), logits_to_return
+            return gumbel_sample(logits, self._get_gumbel(logits, generators)), logits_to_return
 
 
 def _apply_top_k_top_p_pytorch(

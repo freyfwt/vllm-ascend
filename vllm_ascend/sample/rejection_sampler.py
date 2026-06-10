@@ -267,7 +267,6 @@ class AscendRejectionSampler(RejectionSampler):
         metadata: SpecDecodeMetadata,
         target_logits_or_tuple: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
         sampling_metadata: SamplingMetadata,
-        input_ids: torch.Tensor,
     ) -> torch.Tensor:
         if isinstance(target_logits_or_tuple, tuple):
             target_logits, target_indices = target_logits_or_tuple
@@ -296,10 +295,9 @@ class AscendRejectionSampler(RejectionSampler):
             target_logits.device,
             include_bonus_logits=True,
         )
-        draft_tokens = input_ids[metadata.logits_indices].contiguous()
         sampled, _num_sampled = optimized_rejection_sample(
             target_logits,
-            draft_tokens,
+            metadata.draft_token_ids.contiguous(),
             target_indices,
             spec_tensors.cu_num_logits,
             spec_tensors.idx_mapping,
@@ -316,12 +314,9 @@ class AscendRejectionSampler(RejectionSampler):
     @staticmethod
     def _can_use_optimized_rejection(
         sampling_metadata: SamplingMetadata,
-        input_ids: torch.Tensor | None,
         draft_probs: torch.Tensor | None = None,
         is_processed_logprobs_mode: bool = False,
     ) -> bool:
-        if input_ids is None:
-            return False
         if draft_probs is not None:
             return False
         if sampling_metadata.all_greedy:
@@ -381,7 +376,6 @@ class AscendRejectionSampler(RejectionSampler):
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-        input_ids: torch.Tensor | None = None,
     ) -> SamplerOutput:
         """
         Args:
@@ -411,13 +405,11 @@ class AscendRejectionSampler(RejectionSampler):
         need_logprobs = sampling_metadata.max_num_logprobs is not None
         use_optimized_rejection = self._can_use_optimized_rejection(
             sampling_metadata,
-            input_ids,
             draft_probs,
             self.is_processed_logprobs_mode,
         )
 
         if use_optimized_rejection:
-            assert input_ids is not None
             raw_logits = logits[metadata.logits_indices].to(torch.float32)
             target_logits = raw_logits
             if need_logprobs and not self.is_processed_logprobs_mode:
@@ -432,7 +424,6 @@ class AscendRejectionSampler(RejectionSampler):
                 metadata,
                 target_logits_or_tuple,
                 sampling_metadata,
-                input_ids,
             )
 
             logprobs_tensors = None

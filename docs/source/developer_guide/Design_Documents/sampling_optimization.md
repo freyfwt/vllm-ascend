@@ -85,11 +85,10 @@ branch uses the V2-style bonus flow:
 6. build logprobs with the existing `_get_logprobs_tensors` path.
 
 Step 4 uses the native NPU rejection operator when the required V1 tensors are
-available. The runner passes `input_ids` as the ModelRunner-only entrance guard
-for the optimized path; the operator consumes `input_ids[metadata.logits_indices]`
-so each draft row can read the next draft token and each fully accepted request
-can sample from its bonus row. The optimized path no longer calls
-`AscendSampler` to pre-sample bonus tokens.
+available. The operator consumes compact `metadata.draft_token_ids` and
+draft+bonus logits rows; it samples the bonus row only after all draft tokens for
+that request are accepted. The optimized path no longer calls `AscendSampler` to
+pre-sample bonus tokens.
 
 Reduced sampling is supported by passing candidate token ids into the operator.
 Dense vocab mode indexes logits directly by token id; reduced mode searches the

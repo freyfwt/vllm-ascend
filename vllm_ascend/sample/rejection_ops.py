@@ -201,10 +201,11 @@ def _probabilistic_rejection_kernel(
     num_sampled = 0
     accepted = True
     num_draft_tokens = end_idx - start_idx - 1
+    draft_start_idx = start_idx - req_idx
     for i in range(NUM_SPECULATIVE_STEPS):
         if accepted and i < num_draft_tokens:
             logit_idx = start_idx + i
-            draft_tokens = tl.load(draft_tokens_ptr + logit_idx + 1)
+            draft_tokens = tl.load(draft_tokens_ptr + draft_start_idx + i)
             if temperature == 0.0:
                 blocks = tl.arange(0, PADDED_VOCAB_NUM_BLOCKS)
                 mask = blocks < vocab_num_blocks
@@ -306,7 +307,8 @@ def _recovery_kernel(
         other=float("-inf"),
     ).to(tl.float32)
     if not is_bonus:
-        rejected_draft = tl.load(draft_tokens_ptr + recovery_token_idx + 1)
+        draft_start_idx = start_idx - req_idx
+        rejected_draft = tl.load(draft_tokens_ptr + draft_start_idx + recovery_idx)
         logits = tl.where(token_ids != rejected_draft, logits, float("-inf"))
     if temperature != 0.0:
         logits += tl.load(
@@ -389,12 +391,12 @@ def rejection_sample(
     num_speculative_steps: int,
     workspace: RejectionWorkspace | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample draft recovery or bonus tokens from draft+bonus logits rows."""
+    """Sample from draft+bonus logits rows using compact draft token ids."""
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
     assert target_indices is None or target_indices.shape == target_logits.shape
     assert draft_tokens.ndim == 1
-    assert draft_tokens.shape[0] == num_logits
+    assert draft_tokens.shape[0] == num_logits - num_reqs
 
     vocab_block_size = 8192
     vocab_num_blocks = triton.cdiv(vocab_size, vocab_block_size)

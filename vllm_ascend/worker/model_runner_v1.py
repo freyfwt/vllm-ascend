@@ -2384,7 +2384,6 @@ class NPUModelRunner(GPUModelRunner):
             None,  # draft_probs
             logits,
             sampling_metadata,
-            input_ids=self.input_ids.gpu,
         )
         return sampler_output
 

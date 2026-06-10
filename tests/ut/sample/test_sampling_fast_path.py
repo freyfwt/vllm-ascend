@@ -154,7 +154,6 @@ def test_rejection_sampler_optimized_gate_keeps_async_exponential_fallback():
         )
         assert not sampler._can_use_optimized_rejection(
             sampling_metadata,
-            torch.arange(4),
         )
 
 
@@ -177,7 +176,6 @@ def test_rejection_sampler_optimized_gate_accepts_logprobs_and_reduce_sample():
         )
         assert sampler._can_use_optimized_rejection(
             sampling_metadata,
-            torch.arange(4),
         )
 
 
@@ -198,7 +196,6 @@ def test_rejection_sampler_optimized_gate_rejects_all_greedy():
         )
         assert not sampler._can_use_optimized_rejection(
             sampling_metadata,
-            torch.arange(4),
         )
 
 
@@ -291,7 +288,6 @@ def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
     )
     sampling_metadata = _sampling_metadata(device)
     bonus_token_ids = torch.tensor([14, 23], dtype=torch.int32, device=device)
-    input_ids = torch.tensor([99, 11, 98, 21], dtype=torch.int32, device=device)
 
     def fake_apply_sampling_constraints(logits, cu_num_draft_tokens, sampling_metadata, top_k):
         if logits.shape[0] == candidate_logits_all.shape[0]:
@@ -299,6 +295,7 @@ def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
         return candidate_logits_draft.clone(), candidate_indices_draft
 
     config = SimpleNamespace(enable_reduce_sample=True, enable_async_exponential=False)
+    fallback_config = SimpleNamespace(enable_reduce_sample=True, enable_async_exponential=True)
     uniform = torch.full((2,), 1e-4, dtype=torch.float64, device=device)
     acceptance_uniform = torch.full((2,), 1e-4, dtype=torch.float32, device=device)
     recovery_gumbel = torch.zeros((2, 3), dtype=torch.float32, device=device)
@@ -320,11 +317,10 @@ def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
             None,
             logits.clone(),
             sampling_metadata,
-            input_ids=input_ids,
         )
 
     with (
-        patch("vllm_ascend.sample.rejection_sampler.get_ascend_config", return_value=config),
+        patch("vllm_ascend.sample.rejection_sampler.get_ascend_config", return_value=fallback_config),
         patch("vllm_ascend.sample.rejection_sampler.apply_sampling_constraints", fake_apply_sampling_constraints),
         patch("vllm_ascend.sample.rejection_sampler.generate_uniform_probs", return_value=uniform),
     ):
@@ -333,7 +329,6 @@ def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
             None,
             logits.clone(),
             sampling_metadata,
-            input_ids=None,
         )
 
     torch.npu.synchronize()

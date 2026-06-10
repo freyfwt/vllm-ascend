@@ -74,7 +74,7 @@ def make_spec_metadata(
     num_speculative_steps: int,
     vocab_size: int,
     device: torch.device,
-) -> tuple[SpecDecodeMetadata, torch.Tensor]:
+) -> SpecDecodeMetadata:
     num_draft_tokens = [num_speculative_steps] * batch_size
     num_sampled_tokens = [num_speculative_steps + 1] * batch_size
     cu_num_draft_tokens = torch.tensor(num_draft_tokens, dtype=torch.int32, device=device).cumsum(0)
@@ -89,15 +89,14 @@ def make_spec_metadata(
 
     num_logits = batch_size * (num_speculative_steps + 1)
     logits_indices = torch.arange(num_logits, dtype=torch.int32, device=device)
-    input_ids = torch.randint(
+    draft_token_ids = torch.randint(
         0,
         vocab_size,
-        (num_logits,),
+        (batch_size * num_speculative_steps,),
         dtype=torch.int32,
         device=device,
     )
-    draft_token_ids = input_ids[torch.tensor(target_logits_indices, dtype=torch.int32, device=device) + 1].contiguous()
-    metadata = SpecDecodeMetadata(
+    return SpecDecodeMetadata(
         draft_token_ids=draft_token_ids,
         num_draft_tokens=num_draft_tokens,
         cu_num_draft_tokens=cu_num_draft_tokens,
@@ -106,12 +105,11 @@ def make_spec_metadata(
         bonus_logits_indices=torch.tensor(bonus_logits_indices, dtype=torch.int32, device=device),
         logits_indices=logits_indices,
     )
-    return metadata, input_ids
 
 
 def boost_draft_logits(
     logits: torch.Tensor,
-    input_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
     num_speculative_steps: int,
     boost: float,
 ) -> None:
@@ -125,7 +123,7 @@ def boost_draft_logits(
     )
     steps = torch.arange(num_speculative_steps, dtype=torch.int64, device=logits.device)
     rows = (req_starts.unsqueeze(1) + steps.unsqueeze(0)).flatten()
-    cols = input_ids[rows + 1].to(torch.int64)
+    cols = draft_token_ids.to(torch.int64)
     logits[rows, cols] += boost
 
 
@@ -243,9 +241,9 @@ def run_batch_size(
             cases.append(("regular", "optimized", regular_optimized, lambda: prepare_regular_logits("optimized")))
 
     if "spec" in args.scenarios:
-        spec_metadata, input_ids = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
+        spec_metadata = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
         spec_logits = torch.randn(num_logits, vocab_size, dtype=torch.float32, device=device)
-        boost_draft_logits(spec_logits, input_ids, spec_steps, boost=12.0)
+        boost_draft_logits(spec_logits, spec_metadata.draft_token_ids, spec_steps, boost=12.0)
         spec_logits_by_path = {path: spec_logits.clone() for path in args.paths}
         spec_randoms = []
         if "optimized" in args.paths:
@@ -262,12 +260,17 @@ def run_batch_size(
             spec_logits_by_path[path].copy_(spec_logits, non_blocking=True)
 
         def spec_v1_native() -> torch.Tensor:
-            return rejection_sampler(
-                spec_metadata,
-                None,
-                spec_logits_by_path["v1_native"],
-                sampling_metadata,
-            ).sampled_token_ids
+            old_can_use_optimized_rejection = rejection_sampler._can_use_optimized_rejection
+            rejection_sampler._can_use_optimized_rejection = lambda *_args, **_kwargs: False
+            try:
+                return rejection_sampler(
+                    spec_metadata,
+                    None,
+                    spec_logits_by_path["v1_native"],
+                    sampling_metadata,
+                ).sampled_token_ids
+            finally:
+                rejection_sampler._can_use_optimized_rejection = old_can_use_optimized_rejection
 
         def spec_optimized() -> torch.Tensor:
             nonlocal spec_random_idx
@@ -282,7 +285,6 @@ def run_batch_size(
                 None,
                 spec_logits_by_path["optimized"],
                 sampling_metadata,
-                input_ids,
             ).sampled_token_ids
 
         if "v1_native" in args.paths:

@@ -31,7 +31,7 @@ from vllm_ascend.sample.rejection_ops import (
     RejectionWorkspace,
 )
 from vllm_ascend.sample.rejection_ops import (
-    rejection_sample_with_bonus_logits as optimized_rejection_sample_with_bonus_logits,
+    rejection_sample as optimized_rejection_sample,
 )
 from vllm_ascend.sample.sampler import _fill_gumbel, apply_top_k_top_p
 from vllm_ascend.utils import global_stream
@@ -262,10 +262,9 @@ class AscendRejectionSampler(RejectionSampler):
             expanded_local_pos=expanded_local_pos,
         )
 
-    def _optimized_rejection_sample_with_bonus_logits(
+    def _optimized_rejection_sample(
         self,
         metadata: SpecDecodeMetadata,
-        draft_probs: torch.Tensor | None,
         target_logits_or_tuple: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
         sampling_metadata: SamplingMetadata,
         input_ids: torch.Tensor,
@@ -298,10 +297,9 @@ class AscendRejectionSampler(RejectionSampler):
             include_bonus_logits=True,
         )
         draft_tokens = input_ids[metadata.logits_indices].contiguous()
-        sampled, _num_sampled = optimized_rejection_sample_with_bonus_logits(
+        sampled, _num_sampled = optimized_rejection_sample(
             target_logits,
             draft_tokens,
-            draft_probs,
             target_indices,
             spec_tensors.cu_num_logits,
             spec_tensors.idx_mapping,
@@ -430,9 +428,8 @@ class AscendRejectionSampler(RejectionSampler):
                 sampling_metadata,
                 self.top_k,
             )
-            output_token_ids = self._optimized_rejection_sample_with_bonus_logits(
+            output_token_ids = self._optimized_rejection_sample(
                 metadata,
-                draft_probs,
                 target_logits_or_tuple,
                 sampling_metadata,
                 input_ids,

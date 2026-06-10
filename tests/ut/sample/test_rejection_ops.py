@@ -32,7 +32,7 @@ def test_rejection_sample_samples_bonus_after_acceptance():
         dtype=torch.float32,
         device=device,
     )
-    sampled, num_sampled = rejection_sample(
+    sampled = rejection_sample(
         target_logits=target_logits,
         draft_tokens=torch.tensor([1, 2, 3], dtype=torch.int32, device=device),
         target_indices=None,
@@ -48,4 +48,3 @@ def test_rejection_sample_samples_bonus_after_acceptance():
 
     torch.npu.synchronize()
     assert sampled.cpu().tolist() == [[1, 2, 4], [0, -1, -1]]
-    assert num_sampled.cpu().tolist() == [3, 1]

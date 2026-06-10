@@ -181,9 +181,9 @@ class TestNPUModelRunnerAsyncSamplingRandom(unittest.TestCase):
 
         runner._prepare_async_sampling_random(None, torch.arange(2))
 
-        runner.sampler.do_async_gumbel.assert_not_called()
+        runner.sampler.prepare_async_gumbel.assert_not_called()
         runner.sampler.do_async_exponential.assert_not_called()
-        runner.rejection_sampler.do_async_rejection_random.assert_not_called()
+        runner.rejection_sampler.prepare_async_rejection_random.assert_not_called()
 
     @patch("vllm_ascend.worker.model_runner_v1.get_ascend_config")
     def test_prepare_async_sampling_random_uses_regular_gumbel(self, mock_get_ascend_config):
@@ -193,7 +193,7 @@ class TestNPUModelRunnerAsyncSamplingRandom(unittest.TestCase):
 
         runner._prepare_async_sampling_random(None, torch.arange(2))
 
-        runner.sampler.do_async_gumbel.assert_called_once_with(
+        runner.sampler.prepare_async_gumbel.assert_called_once_with(
             b_s=2,
             head_dim=16,
             generators={},
@@ -211,7 +211,7 @@ class TestNPUModelRunnerAsyncSamplingRandom(unittest.TestCase):
 
         runner._prepare_async_sampling_random(metadata, torch.arange(6))
 
-        runner.rejection_sampler.do_async_rejection_random.assert_called_once_with(
+        runner.rejection_sampler.prepare_async_rejection_random.assert_called_once_with(
             num_logits=6,
             recovery_vocab_size=16,
             num_draft_tokens=[2, 2],

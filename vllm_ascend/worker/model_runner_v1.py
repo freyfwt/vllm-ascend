@@ -2324,7 +2324,7 @@ class NPUModelRunner(GPUModelRunner):
 
         random_vocab_size = self._sampling_random_vocab_size()
         if spec_decode_metadata is None:
-            self.sampler.do_async_gumbel(
+            self.sampler.prepare_async_gumbel(
                 b_s=int(logits_indices.shape[0]),
                 head_dim=random_vocab_size,
                 generators=sampling_metadata.generators,
@@ -2332,7 +2332,7 @@ class NPUModelRunner(GPUModelRunner):
             return
 
         if hasattr(self, "rejection_sampler"):
-            self.rejection_sampler.do_async_rejection_random(
+            self.rejection_sampler.prepare_async_rejection_random(
                 num_logits=int(spec_decode_metadata.logits_indices.shape[0]),
                 recovery_vocab_size=random_vocab_size,
                 num_draft_tokens=spec_decode_metadata.num_draft_tokens,

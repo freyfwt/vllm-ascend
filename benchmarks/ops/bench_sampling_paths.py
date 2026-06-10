@@ -6,7 +6,7 @@ import json
 import statistics
 import time
 from collections.abc import Callable
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 import torch_npu  # noqa: F401
@@ -17,13 +17,13 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 import vllm_ascend.ascend_config as ascend_config_module
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
-from vllm_ascend.sample.sampler import AscendSampler
+from vllm_ascend.sample.sampler import AscendSampler, _fill_gumbel
 from vllm_ascend.utils import enable_custom_op
 
 SINK = None
 DEFAULT_BATCH_SIZES = (1, 8, 32, 64, 96)
 DEFAULT_SCENARIOS = ("regular", "spec")
-DEFAULT_PATHS = ("v1_native", "optimized")
+DEFAULT_PATHS = ("no_async_exponential", "v1_native", "optimized")
 DEFAULT_TEMPERATURE = 0.8
 DEFAULT_TOP_K = 20
 DEFAULT_TOP_P = 0.95
@@ -37,6 +37,18 @@ def install_fake_ascend_config() -> None:
         enable_reduce_sample=False,
         enable_async_exponential=False,
     )
+
+
+def set_enable_async_exponential(enabled: bool) -> bool:
+    old_enabled = ascend_config_module._ASCEND_CONFIG.enable_async_exponential
+    ascend_config_module._ASCEND_CONFIG.enable_async_exponential = enabled
+    return old_enabled
+
+
+def sync_get_gumbel(self, logits: torch.Tensor, generators: dict[int, torch.Generator]) -> torch.Tensor:
+    gumbel = torch.empty_like(logits, dtype=torch.float32)
+    _fill_gumbel(gumbel, generators)
+    return gumbel
 
 
 def make_sampling_metadata(
@@ -127,33 +139,6 @@ def boost_draft_logits(
     logits[rows, cols] += boost
 
 
-def make_gumbel(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
-    gumbel = torch.empty(shape, dtype=torch.float32, device=device)
-    gumbel.exponential_()
-    gumbel.log_().neg_()
-    return gumbel
-
-
-def make_rejection_randoms(
-    count: int,
-    num_logits: int,
-    batch_size: int,
-    vocab_size: int,
-    device: torch.device,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.npu.Event]]:
-    randoms = []
-    for _ in range(count):
-        acceptance_uniform = torch.empty((num_logits,), dtype=torch.float32, device=device)
-        acceptance_uniform.uniform_()
-        acceptance_uniform.clamp_(min=1e-20)
-        recovery_gumbel = make_gumbel((batch_size, vocab_size), device)
-        event = torch.npu.Event()
-        event.record()
-        randoms.append((acceptance_uniform, recovery_gumbel, event))
-    torch.npu.synchronize()
-    return randoms
-
-
 def benchmark(
     name: str,
     fn: Callable[[], torch.Tensor],
@@ -208,6 +193,13 @@ def run_batch_size(
     num_logits = batch_size * (spec_steps + 1)
     sampler = AscendSampler()
     rejection_sampler = AscendRejectionSampler(sampler)
+    no_async_sampler = AscendSampler()
+    no_async_sampler.topk_topp_sampler._get_gumbel = MethodType(
+        sync_get_gumbel,
+        no_async_sampler.topk_topp_sampler,
+    )
+    no_async_rejection_sampler = AscendRejectionSampler(no_async_sampler)
+    no_async_rejection_sampler._can_use_optimized_rejection = lambda *_args, **_kwargs: False
     sampling_metadata = make_sampling_metadata(
         batch_size,
         device,
@@ -219,49 +211,104 @@ def run_batch_size(
 
     if "regular" in args.scenarios:
         regular_logits = torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device)
-        regular_gumbels = [make_gumbel((batch_size, vocab_size), device) for _ in range(args.warmups + args.iterations)]
-        regular_gumbel_idx = 0
         regular_logits_by_path = {path: regular_logits.clone() for path in args.paths}
 
         def prepare_regular_logits(path: str) -> None:
             regular_logits_by_path[path].copy_(regular_logits, non_blocking=True)
 
+        def prepare_regular_no_async() -> None:
+            prepare_regular_logits("no_async_exponential")
+
+        def prepare_regular_v1_native() -> None:
+            prepare_regular_logits("v1_native")
+            sampler.do_async_exponential(
+                b_s=batch_size,
+                head_dim=vocab_size,
+                generators=sampling_metadata.generators,
+            )
+
+        def prepare_regular_optimized() -> None:
+            prepare_regular_logits("optimized")
+            sampler.prepare_async_gumbel(
+                b_s=batch_size,
+                head_dim=vocab_size,
+                generators=sampling_metadata.generators,
+            )
+
+        def regular_no_async() -> torch.Tensor:
+            old_enable_async_exponential = set_enable_async_exponential(False)
+            try:
+                return no_async_sampler(
+                    regular_logits_by_path["no_async_exponential"],
+                    sampling_metadata,
+                ).sampled_token_ids
+            finally:
+                ascend_config_module._ASCEND_CONFIG.enable_async_exponential = old_enable_async_exponential
+
         def regular_v1_native() -> torch.Tensor:
-            return sampler(regular_logits_by_path["v1_native"], sampling_metadata).sampled_token_ids
+            old_enable_async_exponential = set_enable_async_exponential(True)
+            try:
+                return sampler(regular_logits_by_path["v1_native"], sampling_metadata).sampled_token_ids
+            finally:
+                ascend_config_module._ASCEND_CONFIG.enable_async_exponential = old_enable_async_exponential
 
         def regular_optimized() -> torch.Tensor:
-            nonlocal regular_gumbel_idx
-            sampler.set_gumbel_event(regular_gumbels[regular_gumbel_idx], None)
-            regular_gumbel_idx += 1
-            return sampler(regular_logits_by_path["optimized"], sampling_metadata).sampled_token_ids
+            old_enable_async_exponential = set_enable_async_exponential(False)
+            try:
+                return sampler(regular_logits_by_path["optimized"], sampling_metadata).sampled_token_ids
+            finally:
+                ascend_config_module._ASCEND_CONFIG.enable_async_exponential = old_enable_async_exponential
 
+        if "no_async_exponential" in args.paths:
+            cases.append(("regular", "no_async_exponential", regular_no_async, prepare_regular_no_async))
         if "v1_native" in args.paths:
-            cases.append(("regular", "v1_native", regular_v1_native, lambda: prepare_regular_logits("v1_native")))
+            cases.append(("regular", "v1_native", regular_v1_native, prepare_regular_v1_native))
         if "optimized" in args.paths:
-            cases.append(("regular", "optimized", regular_optimized, lambda: prepare_regular_logits("optimized")))
+            cases.append(("regular", "optimized", regular_optimized, prepare_regular_optimized))
 
     if "spec" in args.scenarios:
         spec_metadata = make_spec_metadata(batch_size, spec_steps, vocab_size, device)
         spec_logits = torch.randn(num_logits, vocab_size, dtype=torch.float32, device=device)
         boost_draft_logits(spec_logits, spec_metadata.draft_token_ids, spec_steps, boost=12.0)
         spec_logits_by_path = {path: spec_logits.clone() for path in args.paths}
-        spec_randoms = []
-        if "optimized" in args.paths:
-            spec_randoms = make_rejection_randoms(
-                args.warmups + args.iterations,
-                num_logits,
-                batch_size,
-                vocab_size,
-                device,
-            )
-        spec_random_idx = 0
 
         def prepare_spec_logits(path: str) -> None:
             spec_logits_by_path[path].copy_(spec_logits, non_blocking=True)
 
+        def prepare_spec_no_async() -> None:
+            prepare_spec_logits("no_async_exponential")
+
+        def prepare_spec_v1_native() -> None:
+            prepare_spec_logits("v1_native")
+            sampler.do_async_exponential(
+                b_s=batch_size,
+                head_dim=vocab_size,
+                generators=sampling_metadata.generators,
+            )
+
+        def prepare_spec_optimized() -> None:
+            prepare_spec_logits("optimized")
+            rejection_sampler.prepare_async_rejection_random(
+                num_logits=num_logits,
+                recovery_vocab_size=vocab_size,
+                num_draft_tokens=spec_metadata.num_draft_tokens,
+                sampling_metadata=sampling_metadata,
+            )
+
+        def spec_no_async() -> torch.Tensor:
+            old_enable_async_exponential = set_enable_async_exponential(False)
+            try:
+                return no_async_rejection_sampler(
+                    spec_metadata,
+                    None,
+                    spec_logits_by_path["no_async_exponential"],
+                    sampling_metadata,
+                ).sampled_token_ids
+            finally:
+                ascend_config_module._ASCEND_CONFIG.enable_async_exponential = old_enable_async_exponential
+
         def spec_v1_native() -> torch.Tensor:
-            old_can_use_optimized_rejection = rejection_sampler._can_use_optimized_rejection
-            rejection_sampler._can_use_optimized_rejection = lambda *_args, **_kwargs: False
+            old_enable_async_exponential = set_enable_async_exponential(True)
             try:
                 return rejection_sampler(
                     spec_metadata,
@@ -270,24 +317,26 @@ def run_batch_size(
                     sampling_metadata,
                 ).sampled_token_ids
             finally:
-                rejection_sampler._can_use_optimized_rejection = old_can_use_optimized_rejection
+                ascend_config_module._ASCEND_CONFIG.enable_async_exponential = old_enable_async_exponential
 
         def spec_optimized() -> torch.Tensor:
-            nonlocal spec_random_idx
-            acceptance_uniform, recovery_gumbel, event = spec_randoms[spec_random_idx]
-            spec_random_idx += 1
-            rejection_sampler._set_rejection_random(acceptance_uniform, recovery_gumbel, event)
-            return rejection_sampler(
-                spec_metadata,
-                None,
-                spec_logits_by_path["optimized"],
-                sampling_metadata,
-            ).sampled_token_ids
+            old_enable_async_exponential = set_enable_async_exponential(False)
+            try:
+                return rejection_sampler(
+                    spec_metadata,
+                    None,
+                    spec_logits_by_path["optimized"],
+                    sampling_metadata,
+                ).sampled_token_ids
+            finally:
+                ascend_config_module._ASCEND_CONFIG.enable_async_exponential = old_enable_async_exponential
 
+        if "no_async_exponential" in args.paths:
+            cases.append(("spec", "no_async_exponential", spec_no_async, prepare_spec_no_async))
         if "v1_native" in args.paths:
-            cases.append(("spec", "v1_native", spec_v1_native, lambda: prepare_spec_logits("v1_native")))
+            cases.append(("spec", "v1_native", spec_v1_native, prepare_spec_v1_native))
         if "optimized" in args.paths:
-            cases.append(("spec", "optimized", spec_optimized, lambda: prepare_spec_logits("optimized")))
+            cases.append(("spec", "optimized", spec_optimized, prepare_spec_optimized))
 
     results = []
     for scenario, path, fn, prepare in cases:
@@ -361,6 +410,7 @@ def main() -> None:
             "Measured with wall-clock time and NPU synchronization.",
             "Each measured iteration refreshes a per-path working logits tensor before timing "
             "so timed rows do not include input clone.",
+            "no_async_exponential restores the old non-prefetched regular random path inside the benchmark only.",
             "v1_native uses the existing sampler calls without the optimized rejection operator.",
             "optimized uses prefetched regular Gumbel/rejection random tensors; "
             "spec bonus tokens are sampled from bonus logits after draft acceptance.",

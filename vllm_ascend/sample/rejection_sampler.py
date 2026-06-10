@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
-from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.triton_utils import HAS_TRITON
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
@@ -16,6 +16,7 @@ from vllm.v1.sample.rejection_sampler import (
 )
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.worker.gpu.input_batch import expand_idx_mapping
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.triton.reject_sample import (
@@ -31,26 +32,6 @@ from vllm_ascend.sample.rejection_ops import RejectionWorkspace
 from vllm_ascend.sample.rejection_ops import rejection_sample as optimized_rejection_sample
 from vllm_ascend.sample.sampler import _fill_gumbel, apply_top_k_top_p
 from vllm_ascend.utils import global_stream
-
-
-@triton.jit
-def _expand_idx_mapping_kernel(
-    idx_mapping_ptr,
-    expanded_idx_mapping_ptr,
-    expanded_local_pos_ptr,
-    cu_num_logits_ptr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    start_idx = tl.load(cu_num_logits_ptr + req_idx)
-    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
-    num_tokens = end_idx - start_idx
-
-    block = tl.arange(0, BLOCK_SIZE)
-    mask = block < num_tokens
-    req_idx_value = tl.load(idx_mapping_ptr + req_idx)
-    tl.store(expanded_idx_mapping_ptr + start_idx + block, req_idx_value, mask=mask)
-    tl.store(expanded_local_pos_ptr + start_idx + block, block, mask=mask)
 
 
 class AscendRejectionSampler(RejectionSampler):
@@ -106,20 +87,21 @@ class AscendRejectionSampler(RejectionSampler):
         self._buffers: dict[str, torch.Tensor] = {}
         self._arange_sizes: dict[str, int] = {}
         self._workspace = RejectionWorkspace()
-        self._random_ready = False
         self._acceptance_uniform: torch.Tensor | None = None
         self._recovery_gumbel: torch.Tensor | None = None
-        self._random_event = torch.npu.Event()
+        self._random_event = None
 
-    def do_async_rejection_random(
+    def prepare_async_rejection_random(
         self,
         num_logits: int,
         recovery_vocab_size: int,
         num_draft_tokens: list[int],
         sampling_metadata: SamplingMetadata,
     ) -> None:
-        self._random_ready = False
         if sampling_metadata.all_greedy or num_logits <= 0 or recovery_vocab_size <= 0:
+            self._acceptance_uniform = None
+            self._recovery_gumbel = None
+            self._random_event = None
             return
 
         device = torch.device("npu", torch.npu.current_device())
@@ -131,6 +113,7 @@ class AscendRejectionSampler(RejectionSampler):
             torch.float32,
             device,
         )
+        random_event = torch.npu.Event()
 
         with torch.npu.stream(global_stream()):
             global_stream().wait_stream(torch.npu.current_stream())
@@ -140,24 +123,11 @@ class AscendRejectionSampler(RejectionSampler):
                 num_draft_tokens,
                 sampling_metadata.generators,
             )
-            self._random_event.record()
+            random_event.record()
 
-        self._set_rejection_random(
-            acceptance_uniform,
-            recovery_gumbel,
-            self._random_event,
-        )
-
-    def _set_rejection_random(
-        self,
-        acceptance_uniform: torch.Tensor,
-        recovery_gumbel: torch.Tensor,
-        event,
-    ) -> None:
         self._acceptance_uniform = acceptance_uniform
         self._recovery_gumbel = recovery_gumbel
-        self._random_event = event
-        self._random_ready = True
+        self._random_event = random_event
 
     @staticmethod
     def _fill_rejection_random(
@@ -180,40 +150,19 @@ class AscendRejectionSampler(RejectionSampler):
         self,
         num_logits: int,
         recovery_vocab_size: int,
-        num_draft_tokens: list[int],
-        sampling_metadata: SamplingMetadata,
-        device: torch.device,
+        num_reqs: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_reqs = len(num_draft_tokens)
-        if (
-            self._random_ready
-            and self._acceptance_uniform is not None
-            and self._recovery_gumbel is not None
-            and self._acceptance_uniform.shape[0] >= num_logits
-            and self._recovery_gumbel.shape[0] >= num_reqs
-            and self._recovery_gumbel.shape[1] >= recovery_vocab_size
-        ):
-            torch.npu.current_stream().wait_event(self._random_event)
-            self._random_ready = False
-            return (
-                self._acceptance_uniform[:num_logits],
-                self._recovery_gumbel[:num_reqs, :recovery_vocab_size],
-            )
-
-        acceptance_uniform = self._buffer("acceptance_uniform", (num_logits,), torch.float32, device)
-        recovery_gumbel = self._buffer(
-            "recovery_gumbel",
-            (num_reqs, recovery_vocab_size),
-            torch.float32,
-            device,
+        assert self._acceptance_uniform is not None
+        assert self._recovery_gumbel is not None
+        assert self._random_event is not None
+        assert self._acceptance_uniform.shape[0] >= num_logits
+        assert self._recovery_gumbel.shape[0] >= num_reqs
+        assert self._recovery_gumbel.shape[1] >= recovery_vocab_size
+        torch.npu.current_stream().wait_event(self._random_event)
+        return (
+            self._acceptance_uniform[:num_logits],
+            self._recovery_gumbel[:num_reqs, :recovery_vocab_size],
         )
-        self._fill_rejection_random(
-            acceptance_uniform,
-            recovery_gumbel,
-            num_draft_tokens,
-            sampling_metadata.generators,
-        )
-        return acceptance_uniform, recovery_gumbel
 
     def _prepare_spec_tensors(
         self,
@@ -229,15 +178,11 @@ class AscendRejectionSampler(RejectionSampler):
         cu_num_logits[1:].copy_(metadata.cu_num_sampled_tokens, non_blocking=True)
 
         idx_mapping = self._arange_buffer("idx_mapping", num_reqs, device)
-        expanded_idx_mapping = self._buffer("expanded_idx_mapping", (num_logits,), torch.int32, device)
-        expanded_local_pos = self._buffer("expanded_local_pos", (num_logits,), torch.int32, device)
-        block_size = triton.next_power_of_2(max(max_tokens, 1))
-        _expand_idx_mapping_kernel[(num_reqs,)](
+        expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
             idx_mapping,
-            expanded_idx_mapping,
-            expanded_local_pos,
+            num_logits,
             cu_num_logits,
-            BLOCK_SIZE=block_size,
+            max_tokens,
         )
         return cu_num_logits, idx_mapping, expanded_idx_mapping, expanded_local_pos
 
@@ -259,17 +204,19 @@ class AscendRejectionSampler(RejectionSampler):
 
         num_logits = int(metadata.logits_indices.shape[0])
         recovery_vocab_size = int(target_logits.shape[1])
-        acceptance_uniform, recovery_gumbel = self._get_rejection_random(
-            num_logits,
-            recovery_vocab_size,
-            metadata.num_draft_tokens,
-            sampling_metadata,
-            target_logits.device,
-        )
+        if sampling_metadata.all_greedy:
+            acceptance_uniform = self._buffer("greedy_acceptance_uniform", (1,), torch.float32, target_logits.device)
+            recovery_gumbel = self._buffer("greedy_recovery_gumbel", (1, 1), torch.float32, target_logits.device)
+        else:
+            acceptance_uniform, recovery_gumbel = self._get_rejection_random(
+                num_logits,
+                recovery_vocab_size,
+                len(metadata.num_draft_tokens),
+            )
         cu_num_logits, idx_mapping, expanded_idx_mapping, expanded_local_pos = self._prepare_spec_tensors(
             metadata, target_logits.device
         )
-        sampled, _num_sampled = optimized_rejection_sample(
+        sampled = optimized_rejection_sample(
             target_logits,
             metadata.draft_token_ids.contiguous(),
             target_indices,
@@ -286,27 +233,102 @@ class AscendRejectionSampler(RejectionSampler):
         return sampled
 
     @staticmethod
+    def _greedy_reduce_sample_logits(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        tp_group = get_tp_group()
+        rank = tp_group.rank_in_group
+        vocab_size = logits.shape[-1]
+
+        local_logits, local_indices = logits.max(dim=-1, keepdim=True)
+        local_global_indices = local_indices + rank * vocab_size
+        return (
+            tp_group.all_gather(local_logits, dim=-1),
+            tp_group.all_gather(local_global_indices, dim=-1),
+        )
+
+    def _apply_optimized_sampling_constraints(
+        self,
+        target_logits: torch.Tensor,
+        metadata: SpecDecodeMetadata,
+        sampling_metadata: SamplingMetadata,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        if sampling_metadata.all_greedy and get_ascend_config().enable_reduce_sample:
+            return self._greedy_reduce_sample_logits(target_logits)
+        return apply_sampling_constraints(
+            target_logits,
+            metadata.cu_num_sampled_tokens,
+            sampling_metadata,
+            self.top_k,
+        )
+
+    @staticmethod
+    def _has_v1_logits_processors(sampling_metadata: SamplingMetadata) -> bool:
+        logitsprocs = sampling_metadata.logitsprocs
+        return (
+            not sampling_metadata.no_penalties
+            or sampling_metadata.allowed_token_ids_mask is not None
+            or bool(sampling_metadata.bad_words_token_ids)
+            or bool(logitsprocs.non_argmax_invariant)
+        )
+
+    @staticmethod
+    def _has_unsupported_logits_processors(sampling_metadata: SamplingMetadata) -> bool:
+        return bool(sampling_metadata.logitsprocs.argmax_invariant)
+
+    @staticmethod
+    def _joint_rows(
+        logits_indices: torch.Tensor,
+        selected_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if selected_indices.numel() == 0:
+            return selected_indices.to(torch.long)
+        return (logits_indices[:, None] == selected_indices[None, :]).to(torch.int32).argmax(dim=0)
+
+    def _apply_v1_logits_processors(
+        self,
+        joint_logits: torch.Tensor,
+        metadata: SpecDecodeMetadata,
+        sampling_metadata: SamplingMetadata,
+    ) -> torch.Tensor:
+        if not self._has_v1_logits_processors(sampling_metadata):
+            return joint_logits
+
+        target_rows = self._joint_rows(metadata.logits_indices, metadata.target_logits_indices)
+        if target_rows.numel() > 0:
+            target_logits = self.apply_logits_processors(joint_logits[target_rows], sampling_metadata, metadata)
+            joint_logits[target_rows] = target_logits
+
+        bonus_rows = self._joint_rows(metadata.logits_indices, metadata.bonus_logits_indices)
+        if bonus_rows.numel() > 0:
+            bonus_logits = self.sampler.apply_logits_processors(
+                joint_logits[bonus_rows],
+                sampling_metadata,
+                predict_bonus_token=True,
+            )
+            joint_logits[bonus_rows] = bonus_logits
+        return joint_logits
+
+    @staticmethod
     def _can_use_optimized_rejection(
         sampling_metadata: SamplingMetadata,
         draft_probs: torch.Tensor | None = None,
-        is_processed_logprobs_mode: bool = False,
     ) -> bool:
         if draft_probs is not None:
             return False
-        if sampling_metadata.all_greedy:
-            return False
         if get_ascend_config().enable_async_exponential:
             return False
-        if sampling_metadata.max_num_logprobs is not None and is_processed_logprobs_mode:
-            return False
-        logitsprocs = sampling_metadata.logitsprocs
-        has_logits_processors = bool(logitsprocs.non_argmax_invariant) or bool(logitsprocs.argmax_invariant)
-        return (
-            sampling_metadata.no_penalties
-            and sampling_metadata.allowed_token_ids_mask is None
-            and not sampling_metadata.bad_words_token_ids
-            and not has_logits_processors
-        )
+        return not AscendRejectionSampler._has_unsupported_logits_processors(sampling_metadata)
+
+    @staticmethod
+    def _select_logprob_logits(
+        processed_logits: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
+        metadata: SpecDecodeMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(processed_logits, tuple):
+            processed_logits = processed_logits[0]
+        logits_indices = metadata.logits_indices
+        target_rows = AscendRejectionSampler._joint_rows(logits_indices, metadata.target_logits_indices)
+        bonus_rows = AscendRejectionSampler._joint_rows(logits_indices, metadata.bonus_logits_indices)
+        return processed_logits[target_rows], processed_logits[bonus_rows]
 
     def _buffer(
         self,
@@ -374,25 +396,28 @@ class AscendRejectionSampler(RejectionSampler):
                 requested.
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
+        need_logprobs = sampling_metadata.max_num_logprobs is not None
+        assert not (need_logprobs and get_ascend_config().enable_reduce_sample), (
+            "enable_reduce_sample and logprobs are not supported together."
+        )
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
-        need_logprobs = sampling_metadata.max_num_logprobs is not None
         use_optimized_rejection = self._can_use_optimized_rejection(
             sampling_metadata,
             draft_probs,
-            self.is_processed_logprobs_mode,
         )
 
         if use_optimized_rejection:
-            raw_logits = logits[metadata.logits_indices].to(torch.float32)
-            target_logits = raw_logits
-            if need_logprobs and not self.is_processed_logprobs_mode:
-                target_logits = target_logits.clone()
-            processed_target_logits = apply_sampling_constraints(
+            target_logits = logits[metadata.logits_indices].to(torch.float32)
+            target_logits = self._apply_v1_logits_processors(
                 target_logits,
-                metadata.cu_num_sampled_tokens,
+                metadata,
                 sampling_metadata,
-                self.top_k,
+            )
+            processed_target_logits = self._apply_optimized_sampling_constraints(
+                target_logits,
+                metadata,
+                sampling_metadata,
             )
             output_token_ids = self._optimized_rejection_sample(
                 metadata,
@@ -402,8 +427,14 @@ class AscendRejectionSampler(RejectionSampler):
 
             logprobs_tensors = None
             if need_logprobs:
-                target_logprobs = logits[target_logits_indices].to(torch.float32)
-                bonus_logprobs = logits[bonus_logits_indices].to(torch.float32)
+                if self.is_processed_logprobs_mode:
+                    target_logprobs, bonus_logprobs = self._select_logprob_logits(
+                        processed_target_logits,
+                        metadata,
+                    )
+                else:
+                    target_logprobs = logits[target_logits_indices].to(torch.float32)
+                    bonus_logprobs = logits[bonus_logits_indices].to(torch.float32)
                 logprobs_tensors = self._get_logprobs_tensors(
                     sampling_metadata.max_num_logprobs,
                     metadata,

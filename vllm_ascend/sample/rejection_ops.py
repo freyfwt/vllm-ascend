@@ -390,7 +390,7 @@ def rejection_sample(
     recovery_gumbel: torch.Tensor,
     num_speculative_steps: int,
     workspace: RejectionWorkspace | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Sample from draft+bonus logits rows using compact draft token ids."""
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
@@ -505,4 +505,4 @@ def rejection_sample(
         temperature,
         PADDED_RECOVERY_BLOCKS=padded_recovery_blocks,
     )
-    return sampled, num_sampled
+    return sampled

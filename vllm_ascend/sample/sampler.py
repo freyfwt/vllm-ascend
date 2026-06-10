@@ -90,11 +90,20 @@ class AscendSampler(Sampler):
         self.async_gumbel_event = torch.npu.Event()
         self._gumbel_buffer: torch.Tensor | None = None
 
+    def forward(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        predict_bonus_token: bool = False,
+        logprobs_mode_override=None,
+    ):
+        assert not (sampling_metadata.max_num_logprobs is not None and get_ascend_config().enable_reduce_sample), (
+            "enable_reduce_sample and logprobs are not supported together."
+        )
+        return super().forward(logits, sampling_metadata, predict_bonus_token, logprobs_mode_override)
+
     def set_q_event(self, q, event):
         self.topk_topp_sampler.set_q_event(q, event)
-
-    def set_gumbel_event(self, gumbel, event):
-        self.topk_topp_sampler.set_gumbel_event(gumbel, event)
 
     def prepare_sampling(self, top_k):
         self.topk_topp_sampler.prepare_sampling(top_k)
@@ -114,7 +123,7 @@ class AscendSampler(Sampler):
             self.async_exponential_event.record()
         self.set_q_event(q, self.async_exponential_event)
 
-    def do_async_gumbel(
+    def prepare_async_gumbel(
         self,
         b_s: int,
         head_dim: int,
@@ -135,7 +144,7 @@ class AscendSampler(Sampler):
             gumbel = self._gumbel_buffer[:b_s, :head_dim]
             _fill_gumbel(gumbel, generators)
             self.async_gumbel_event.record()
-        self.set_gumbel_event(gumbel, self.async_gumbel_event)
+        self.topk_topp_sampler.set_gumbel_event(gumbel, self.async_gumbel_event)
 
     @staticmethod
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
@@ -163,7 +172,6 @@ class AscendTopKTopPSampler(TopKTopPSampler):
         self.top_k = None
         self.gumbel = None
         self.gumbel_event = None
-        self.gumbel_ready = False
 
     def set_q_event(self, q, event):
         # Pass in async exponential results.
@@ -174,7 +182,6 @@ class AscendTopKTopPSampler(TopKTopPSampler):
     def set_gumbel_event(self, gumbel, event):
         self.gumbel = gumbel
         self.gumbel_event = event
-        self.gumbel_ready = True
 
     def prepare_sampling(self, top_k):
         if top_k is not None:
@@ -183,20 +190,12 @@ class AscendTopKTopPSampler(TopKTopPSampler):
             self.top_k = None
 
     def _get_gumbel(self, logits, generators):
-        if (
-            self.gumbel_ready
-            and self.gumbel is not None
-            and self.gumbel.shape[0] >= logits.shape[0]
-            and self.gumbel.shape[1] >= logits.shape[1]
-        ):
-            if self.gumbel_event is not None:
-                torch.npu.current_stream().wait_event(self.gumbel_event)
-            self.gumbel_ready = False
-            return self.gumbel[: logits.shape[0], : logits.shape[1]]
-
-        gumbel = torch.empty_like(logits, dtype=torch.float32)
-        _fill_gumbel(gumbel, generators)
-        return gumbel
+        assert self.gumbel is not None
+        assert self.gumbel_event is not None
+        assert self.gumbel.shape[0] >= logits.shape[0]
+        assert self.gumbel.shape[1] >= logits.shape[1]
+        torch.npu.current_stream().wait_event(self.gumbel_event)
+        return self.gumbel[: logits.shape[0], : logits.shape[1]]
 
     def forward_native(self, logits, generators, k, p):
         """Override pytorch native implementation to torch_npu"""

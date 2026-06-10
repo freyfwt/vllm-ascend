@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
-from vllm_ascend.sample.sampler import AscendTopKTopPSampler, gumbel_sample
+from vllm_ascend.sample.sampler import AscendSampler, AscendTopKTopPSampler, gumbel_sample
 
 
 def _npu_available() -> bool:
@@ -42,7 +42,8 @@ def _sampling_metadata(device, max_num_logprobs=2):
 class _FakeBonusSampler:
     logprobs_mode = "raw_logprobs"
 
-    def __init__(self, bonus_token_ids):
+    def __init__(self, bonus_token_ids, logprobs_mode="raw_logprobs"):
+        self.logprobs_mode = logprobs_mode
         self.bonus_token_ids = bonus_token_ids.view(-1, 1).to(torch.int32)
 
     def __call__(
@@ -54,11 +55,18 @@ class _FakeBonusSampler:
     ):
         from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 
+        logprobs = logits.to(torch.float32).clone()
+        if logprobs_mode_override == "processed_logits":
+            logprobs.div_(sampling_metadata.temperature.unsqueeze(-1))
+        elif logprobs_mode_override == "processed_logprobs":
+            logprobs.div_(sampling_metadata.temperature.unsqueeze(-1))
+            logprobs = logprobs.log_softmax(dim=-1, dtype=torch.float32)
+
         return SamplerOutput(
             sampled_token_ids=self.bonus_token_ids,
             logprobs_tensors=LogprobsTensors(
                 torch.empty(0, dtype=torch.int32, device=logits.device),
-                logits.to(torch.float32).clone(),
+                logprobs,
                 torch.empty(0, dtype=torch.int32, device=logits.device),
             ),
         )
@@ -86,6 +94,7 @@ def _fake_rejection_sampler(logprobs_mode="raw_logprobs"):
     sampler = AscendRejectionSampler.__new__(AscendRejectionSampler)
     sampler.sampler = SimpleNamespace(logprobs_mode=logprobs_mode)
     sampler.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
+    sampler.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
     return sampler
 
 
@@ -142,6 +151,19 @@ def test_topk_topp_sampler_maps_reduce_sample_candidates_to_token_ids():
     assert logits_to_return.tolist() == cand_logits.tolist()
 
 
+def test_ascend_sampler_asserts_reduce_sample_with_logprobs():
+    sampler = AscendSampler.__new__(AscendSampler)
+    sampling_metadata = _sampling_metadata(torch.device("cpu"), max_num_logprobs=1)
+
+    with patch("vllm_ascend.sample.sampler.get_ascend_config") as get_config:
+        get_config.return_value = SimpleNamespace(
+            enable_reduce_sample=True,
+            enable_async_exponential=False,
+        )
+        with pytest.raises(AssertionError, match="enable_reduce_sample and logprobs"):
+            sampler.forward(torch.empty((2, 4)), sampling_metadata)
+
+
 def test_rejection_sampler_optimized_gate_keeps_async_exponential_fallback():
     sampling_metadata = SimpleNamespace(all_greedy=False)
     sampler = _fake_rejection_sampler()
@@ -156,7 +178,7 @@ def test_rejection_sampler_optimized_gate_keeps_async_exponential_fallback():
         )
 
 
-def test_rejection_sampler_optimized_gate_accepts_logprobs_and_reduce_sample():
+def test_rejection_sampler_optimized_gate_accepts_processed_logprobs():
     sampling_metadata = SimpleNamespace(
         all_greedy=False,
         max_num_logprobs=1,
@@ -165,6 +187,21 @@ def test_rejection_sampler_optimized_gate_accepts_logprobs_and_reduce_sample():
         bad_words_token_ids={},
         logitsprocs=SimpleNamespace(non_argmax_invariant=[], argmax_invariant=[]),
     )
+    sampler = _fake_rejection_sampler(logprobs_mode="processed_logprobs")
+
+    with patch("vllm_ascend.sample.rejection_sampler.get_ascend_config") as get_config:
+        get_config.return_value = SimpleNamespace(
+            enable_async_exponential=False,
+            enable_reduce_sample=False,
+        )
+        assert sampler._can_use_optimized_rejection(
+            sampling_metadata,
+        )
+
+
+def test_rejection_sampler_asserts_reduce_sample_with_logprobs():
+    metadata = SimpleNamespace(max_spec_len=1)
+    sampling_metadata = SimpleNamespace(max_num_logprobs=1)
     sampler = _fake_rejection_sampler()
 
     with patch("vllm_ascend.sample.rejection_sampler.get_ascend_config") as get_config:
@@ -172,12 +209,11 @@ def test_rejection_sampler_optimized_gate_accepts_logprobs_and_reduce_sample():
             enable_async_exponential=False,
             enable_reduce_sample=True,
         )
-        assert sampler._can_use_optimized_rejection(
-            sampling_metadata,
-        )
+        with pytest.raises(AssertionError, match="enable_reduce_sample and logprobs"):
+            sampler.forward(metadata, None, torch.empty(0), sampling_metadata)
 
 
-def test_rejection_sampler_optimized_gate_rejects_all_greedy():
+def test_rejection_sampler_optimized_gate_accepts_all_greedy():
     sampling_metadata = SimpleNamespace(
         all_greedy=True,
         no_penalties=True,
@@ -192,49 +228,206 @@ def test_rejection_sampler_optimized_gate_rejects_all_greedy():
             enable_async_exponential=False,
             enable_reduce_sample=False,
         )
+        assert sampler._can_use_optimized_rejection(
+            sampling_metadata,
+        )
+
+
+def test_rejection_sampler_optimized_gate_accepts_v1_logits_processors():
+    sampling_metadata = SimpleNamespace(
+        all_greedy=False,
+        no_penalties=False,
+        allowed_token_ids_mask=object(),
+        bad_words_token_ids={0: [[1]]},
+        logitsprocs=SimpleNamespace(non_argmax_invariant=[object()], argmax_invariant=[]),
+    )
+    sampler = _fake_rejection_sampler()
+
+    with patch("vllm_ascend.sample.rejection_sampler.get_ascend_config") as get_config:
+        get_config.return_value = SimpleNamespace(
+            enable_async_exponential=False,
+            enable_reduce_sample=False,
+        )
+        assert sampler._can_use_optimized_rejection(
+            sampling_metadata,
+        )
+
+
+def test_rejection_sampler_optimized_gate_rejects_argmax_invariant_logits_processors():
+    sampling_metadata = SimpleNamespace(
+        all_greedy=False,
+        no_penalties=True,
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=SimpleNamespace(non_argmax_invariant=[], argmax_invariant=[object()]),
+    )
+    sampler = _fake_rejection_sampler()
+
+    with patch("vllm_ascend.sample.rejection_sampler.get_ascend_config") as get_config:
+        get_config.return_value = SimpleNamespace(
+            enable_async_exponential=False,
+            enable_reduce_sample=False,
+        )
         assert not sampler._can_use_optimized_rejection(
             sampling_metadata,
         )
 
 
 @pytest.mark.skipif(not _npu_available(), reason="requires NPU")
-def test_topk_topp_sampler_npu_preserves_reduce_sample_logprobs():
+def test_rejection_sampler_npu_matches_fallback_with_greedy_reduce_sample():
+    from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+
+    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+
+    class FakeTPGroup:
+        rank_in_group = 1
+        world_size = 2
+
+        @staticmethod
+        def all_gather(tensor, dim=-1):
+            if tensor.dtype.is_floating_point:
+                remote = torch.full_like(tensor, -100.0)
+            else:
+                remote = torch.zeros_like(tensor)
+            return torch.cat((remote, tensor), dim=dim)
+
     torch.npu.set_device(0)
+    init_device_properties_triton()
     device = torch.device("npu:0")
-    sampler = AscendTopKTopPSampler(logprobs_mode="processed_logprobs")
-    sampler.top_k = 2
-    cand_logits = torch.tensor([[0.0, 1.0], [3.0, 0.0]], dtype=torch.float32, device=device)
-    cand_idx = torch.tensor([[11, 12], [21, 22]], dtype=torch.int64, device=device)
-    gumbel = torch.tensor([[2.0, 0.0], [0.0, 4.0]], dtype=torch.float32, device=device)
-    sampler.apply_top_k_top_p = lambda logits, k, p, top_k: (cand_logits, cand_idx)
+
+    vocab_size = 32
+    logits = torch.full((4, vocab_size), -20.0, dtype=torch.float32, device=device)
+    logits[0, 11] = 40.0
+    logits[1, 14] = 35.0
+    logits[2, 21] = 42.0
+    logits[3, 23] = 36.0
+
+    metadata = SpecDecodeMetadata(
+        draft_token_ids=torch.tensor([43, 53], dtype=torch.int32, device=device),
+        num_draft_tokens=[1, 1],
+        cu_num_draft_tokens=torch.tensor([1, 2], dtype=torch.int32, device=device),
+        cu_num_sampled_tokens=torch.tensor([2, 4], dtype=torch.int32, device=device),
+        target_logits_indices=torch.tensor([0, 2], dtype=torch.int32, device=device),
+        bonus_logits_indices=torch.tensor([1, 3], dtype=torch.int32, device=device),
+        logits_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device),
+    )
+    sampling_metadata = _sampling_metadata(device, max_num_logprobs=None)
+    sampling_metadata.temperature.zero_()
+    sampling_metadata.all_greedy = True
+    sampling_metadata.all_random = False
+    bonus_token_ids = torch.tensor([46, 55], dtype=torch.int32, device=device)
+
+    config = SimpleNamespace(enable_reduce_sample=True, enable_async_exponential=False)
+    fallback_config = SimpleNamespace(enable_reduce_sample=True, enable_async_exponential=True)
+    optimized_sampler = AscendRejectionSampler(_FakeBonusSampler(bonus_token_ids))
+    fallback_sampler = AscendRejectionSampler(_FakeBonusSampler(bonus_token_ids))
 
     with (
-        patch("vllm_ascend.sample.sampler.get_ascend_config") as get_config,
-        patch.object(sampler, "_get_gumbel", return_value=gumbel),
+        patch("vllm_ascend.sample.rejection_sampler.get_ascend_config", return_value=config),
+        patch("vllm_ascend.sample.sampler.get_ascend_config", return_value=config),
+        patch("vllm_ascend.sample.rejection_sampler.get_tp_group", return_value=FakeTPGroup()),
     ):
-        get_config.return_value = SimpleNamespace(
-            enable_reduce_sample=True,
-            enable_async_exponential=False,
+        optimized = optimized_sampler(
+            metadata,
+            None,
+            logits.clone(),
+            sampling_metadata,
         )
-        sampled, logits_to_return = sampler.forward_native(
-            torch.empty((2, 4), dtype=torch.float32, device=device),
-            {},
+
+    with (
+        patch("vllm_ascend.sample.rejection_sampler.get_ascend_config", return_value=fallback_config),
+        patch("vllm_ascend.sample.sampler.get_ascend_config", return_value=fallback_config),
+        patch("vllm_ascend.sample.rejection_sampler.get_tp_group", return_value=FakeTPGroup()),
+    ):
+        fallback = fallback_sampler(
+            metadata,
             None,
-            None,
+            logits.clone(),
+            sampling_metadata,
         )
 
     torch.npu.synchronize()
-    assert sampled.cpu().tolist() == [11, 22]
-    torch.testing.assert_close(
-        logits_to_return.cpu(),
-        cand_logits.log_softmax(dim=-1, dtype=torch.float32).cpu(),
-        rtol=0,
-        atol=0,
-    )
+    assert optimized.sampled_token_ids.cpu().tolist() == [[43, 46], [53, 55]]
+    assert optimized.sampled_token_ids.cpu().tolist() == fallback.sampled_token_ids.cpu().tolist()
+    assert optimized.logprobs_tensors is None
+    assert fallback.logprobs_tensors is None
 
 
 @pytest.mark.skipif(not _npu_available(), reason="requires NPU")
-def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
+def test_rejection_sampler_npu_matches_fallback_with_allowed_token_mask():
+    from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+
+    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+
+    torch.npu.set_device(0)
+    init_device_properties_triton()
+    device = torch.device("npu:0")
+
+    vocab_size = 32
+    logits = torch.full((4, vocab_size), -20.0, dtype=torch.float32, device=device)
+    logits[0, 11] = 40.0
+    logits[0, 12] = 35.0
+    logits[1, 14] = 50.0
+    logits[1, 15] = 40.0
+    logits[2, 21] = 42.0
+    logits[3, 23] = 50.0
+    logits[3, 24] = 40.0
+
+    metadata = SpecDecodeMetadata(
+        draft_token_ids=torch.tensor([11, 21], dtype=torch.int32, device=device),
+        num_draft_tokens=[1, 1],
+        cu_num_draft_tokens=torch.tensor([1, 2], dtype=torch.int32, device=device),
+        cu_num_sampled_tokens=torch.tensor([2, 4], dtype=torch.int32, device=device),
+        target_logits_indices=torch.tensor([0, 2], dtype=torch.int32, device=device),
+        bonus_logits_indices=torch.tensor([1, 3], dtype=torch.int32, device=device),
+        logits_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device),
+    )
+    sampling_metadata = _sampling_metadata(device, max_num_logprobs=None)
+    sampling_metadata.temperature.zero_()
+    sampling_metadata.all_greedy = True
+    sampling_metadata.all_random = False
+    mask = torch.zeros((2, vocab_size), dtype=torch.bool, device=device)
+    mask[0, 11] = True
+    mask[0, 14] = True
+    mask[1, 23] = True
+    sampling_metadata.allowed_token_ids_mask = mask
+
+    config = SimpleNamespace(enable_reduce_sample=False, enable_async_exponential=False)
+    fallback_config = SimpleNamespace(enable_reduce_sample=False, enable_async_exponential=True)
+    optimized_sampler = AscendRejectionSampler(AscendSampler())
+    fallback_sampler = AscendRejectionSampler(AscendSampler())
+
+    with (
+        patch("vllm_ascend.sample.rejection_sampler.get_ascend_config", return_value=config),
+        patch("vllm_ascend.sample.sampler.get_ascend_config", return_value=config),
+    ):
+        optimized = optimized_sampler(
+            metadata,
+            None,
+            logits.clone(),
+            sampling_metadata,
+        )
+
+    with (
+        patch("vllm_ascend.sample.rejection_sampler.get_ascend_config", return_value=fallback_config),
+        patch("vllm_ascend.sample.sampler.get_ascend_config", return_value=fallback_config),
+    ):
+        fallback = fallback_sampler(
+            metadata,
+            None,
+            logits.clone(),
+            sampling_metadata,
+        )
+
+    torch.npu.synchronize()
+    assert optimized.sampled_token_ids.cpu().tolist() == [[12, -1], [21, 24]]
+    assert optimized.sampled_token_ids.cpu().tolist() == fallback.sampled_token_ids.cpu().tolist()
+    assert optimized.logprobs_tensors is None
+    assert fallback.logprobs_tensors is None
+
+
+@pytest.mark.skipif(not _npu_available(), reason="requires NPU")
+def test_rejection_sampler_npu_matches_fallback_with_processed_logprobs():
     from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
     from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
@@ -252,29 +445,6 @@ def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
     logits[2, 22] = 2.0
     logits[3, 23] = 36.0
 
-    candidate_logits_all = torch.tensor(
-        [
-            [40.0, 1.0, -2.0],
-            [35.0, 1.0, -2.0],
-            [42.0, 2.0, -3.0],
-            [36.0, 1.0, -2.0],
-        ],
-        dtype=torch.float32,
-        device=device,
-    )
-    candidate_indices_all = torch.tensor(
-        [
-            [11, 12, 13],
-            [14, 12, 13],
-            [21, 22, 24],
-            [23, 22, 24],
-        ],
-        dtype=torch.int64,
-        device=device,
-    )
-    candidate_logits_draft = candidate_logits_all[[0, 2]]
-    candidate_indices_draft = candidate_indices_all[[0, 2]]
-
     metadata = SpecDecodeMetadata(
         draft_token_ids=torch.tensor([11, 21], dtype=torch.int32, device=device),
         num_draft_tokens=[1, 1],
@@ -285,25 +455,21 @@ def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
         logits_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device),
     )
     sampling_metadata = _sampling_metadata(device)
+    sampling_metadata.temperature.fill_(0.5)
     bonus_token_ids = torch.tensor([14, 23], dtype=torch.int32, device=device)
 
-    def fake_apply_sampling_constraints(logits, cu_num_draft_tokens, sampling_metadata, top_k):
-        if logits.shape[0] == candidate_logits_all.shape[0]:
-            return candidate_logits_all.clone(), candidate_indices_all
-        return candidate_logits_draft.clone(), candidate_indices_draft
-
-    config = SimpleNamespace(enable_reduce_sample=True, enable_async_exponential=False)
-    fallback_config = SimpleNamespace(enable_reduce_sample=True, enable_async_exponential=True)
+    config = SimpleNamespace(enable_reduce_sample=False, enable_async_exponential=False)
+    fallback_config = SimpleNamespace(enable_reduce_sample=False, enable_async_exponential=True)
     uniform = torch.full((2,), 1e-4, dtype=torch.float64, device=device)
-    acceptance_uniform = torch.full((2,), 1e-4, dtype=torch.float32, device=device)
-    recovery_gumbel = torch.zeros((2, 3), dtype=torch.float32, device=device)
+    acceptance_uniform = torch.full((4,), 1e-4, dtype=torch.float32, device=device)
+    recovery_gumbel = torch.zeros((2, vocab_size), dtype=torch.float32, device=device)
 
-    optimized_sampler = AscendRejectionSampler(_FakeBonusSampler(bonus_token_ids))
-    fallback_sampler = AscendRejectionSampler(_FakeBonusSampler(bonus_token_ids))
+    optimized_sampler = AscendRejectionSampler(_FakeBonusSampler(bonus_token_ids, logprobs_mode="processed_logprobs"))
+    fallback_sampler = AscendRejectionSampler(_FakeBonusSampler(bonus_token_ids, logprobs_mode="processed_logprobs"))
 
     with (
         patch("vllm_ascend.sample.rejection_sampler.get_ascend_config", return_value=config),
-        patch("vllm_ascend.sample.rejection_sampler.apply_sampling_constraints", fake_apply_sampling_constraints),
+        patch("vllm_ascend.sample.sampler.get_ascend_config", return_value=config),
         patch.object(
             optimized_sampler,
             "_get_rejection_random",
@@ -319,7 +485,7 @@ def test_rejection_sampler_npu_matches_fallback_with_reduce_sample_logprobs():
 
     with (
         patch("vllm_ascend.sample.rejection_sampler.get_ascend_config", return_value=fallback_config),
-        patch("vllm_ascend.sample.rejection_sampler.apply_sampling_constraints", fake_apply_sampling_constraints),
+        patch("vllm_ascend.sample.sampler.get_ascend_config", return_value=fallback_config),
         patch("vllm_ascend.sample.rejection_sampler.generate_uniform_probs", return_value=uniform),
     ):
         fallback = fallback_sampler(

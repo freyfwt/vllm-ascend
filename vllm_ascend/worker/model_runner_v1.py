@@ -2144,12 +2144,6 @@ class NPUModelRunner(GPUModelRunner):
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
 
-        # Clear per-step async speculative state before the current step repopulates it.
-        if self.use_async_scheduling:
-            self._draft_token_ids = None
-            self._draft_token_req_ids = None
-            self.input_batch.prev_sampled_token_ids = None
-
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None # type: ignore[no-redef]
 
         def propose_draft_token_ids(sampled_token_ids):
@@ -2369,7 +2363,6 @@ class NPUModelRunner(GPUModelRunner):
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         self.input_batch.update_async_output_token_ids()
-
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]

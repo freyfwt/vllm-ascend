@@ -119,10 +119,10 @@ class AscendSampler(Sampler):
         b_s: int,
         head_dim: int,
         generators: dict[int, torch.Generator],
-        device: torch.device,
     ) -> None:
         if b_s <= 0 or head_dim <= 0:
             return
+        device = torch.device("npu", torch.npu.current_device())
         with torch.npu.stream(global_stream()):
             global_stream().wait_stream(torch.npu.current_stream())
             if (

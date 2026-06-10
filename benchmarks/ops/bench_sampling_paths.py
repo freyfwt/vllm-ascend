@@ -136,14 +136,14 @@ def make_gumbel(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
 
 def make_rejection_randoms(
     count: int,
-    num_draft_logits: int,
+    num_logits: int,
     batch_size: int,
     vocab_size: int,
     device: torch.device,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.npu.Event]]:
     randoms = []
     for _ in range(count):
-        acceptance_uniform = torch.empty((num_draft_logits,), dtype=torch.float32, device=device)
+        acceptance_uniform = torch.empty((num_logits,), dtype=torch.float32, device=device)
         acceptance_uniform.uniform_()
         acceptance_uniform.clamp_(min=1e-20)
         recovery_gumbel = make_gumbel((batch_size, vocab_size), device)
@@ -276,10 +276,7 @@ def run_batch_size(
             nonlocal spec_random_idx
             acceptance_uniform, recovery_gumbel, event = spec_randoms[spec_random_idx]
             spec_random_idx += 1
-            rejection_sampler._acceptance_uniform = acceptance_uniform
-            rejection_sampler._recovery_gumbel = recovery_gumbel
-            rejection_sampler._random_event = event
-            rejection_sampler._random_ready = True
+            rejection_sampler._set_rejection_random(acceptance_uniform, recovery_gumbel, event)
             return rejection_sampler(
                 spec_metadata,
                 None,
@@ -367,7 +364,6 @@ def main() -> None:
             "v1_native uses the existing sampler calls without the optimized rejection operator.",
             "optimized uses prefetched regular Gumbel/rejection random tensors; "
             "spec bonus tokens are sampled from bonus logits after draft acceptance.",
-            "The benchmark does not include ModelRunnerV2 bridge or FastSampler rows because that design is removed.",
         ],
         "results": results,
     }

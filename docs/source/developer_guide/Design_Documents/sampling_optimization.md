@@ -130,5 +130,4 @@ Unit tests should cover:
 - all-greedy batches do not prepare random tensors.
 
 Benchmarks should compare the existing sampler entry without the optimized
-operator against the optimized sampler entry. They should not include V2 bridge
-or `FastSampler` rows.
+operator against the optimized sampler entry.

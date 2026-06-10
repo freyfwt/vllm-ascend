@@ -159,13 +159,11 @@ class TestNPUModelRunnerAsyncSamplingRandom(unittest.TestCase):
         enable_async_exponential=False,
     ):
         runner = NPUModelRunner.__new__(NPUModelRunner)
-        runner.device = torch.device("cpu")
         runner.model_config = MagicMock()
         runner.model_config.get_vocab_size.return_value = 16
         runner.sampler = MagicMock()
         runner.input_batch = SimpleNamespace(
             sampling_metadata=sampling_metadata,
-            num_reqs=2,
             top_k_cpu=np.array([4, 4], dtype=np.int32),
         )
         runner.ascend_config = SimpleNamespace(
@@ -199,7 +197,6 @@ class TestNPUModelRunnerAsyncSamplingRandom(unittest.TestCase):
             b_s=2,
             head_dim=16,
             generators={},
-            device=torch.device("cpu"),
         )
 
     @patch("vllm_ascend.worker.model_runner_v1.get_ascend_config")
@@ -216,12 +213,9 @@ class TestNPUModelRunnerAsyncSamplingRandom(unittest.TestCase):
 
         runner.rejection_sampler.do_async_rejection_random.assert_called_once_with(
             num_logits=6,
-            num_reqs=2,
             recovery_vocab_size=16,
             num_draft_tokens=[2, 2],
             sampling_metadata=sampling_metadata,
-            device=torch.device("cpu"),
-            include_bonus_logits=True,
         )
 
     def test_prepare_async_sampling_random_preserves_async_exponential(self):

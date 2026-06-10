@@ -86,7 +86,6 @@ def _fake_rejection_sampler(logprobs_mode="raw_logprobs"):
     sampler = AscendRejectionSampler.__new__(AscendRejectionSampler)
     sampler.sampler = SimpleNamespace(logprobs_mode=logprobs_mode)
     sampler.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
-    sampler.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
     return sampler
 
 
@@ -161,7 +160,6 @@ def test_rejection_sampler_optimized_gate_accepts_logprobs_and_reduce_sample():
     sampling_metadata = SimpleNamespace(
         all_greedy=False,
         max_num_logprobs=1,
-        logprob_token_ids={0: [7]},
         no_penalties=True,
         allowed_token_ids_mask=None,
         bad_words_token_ids={},

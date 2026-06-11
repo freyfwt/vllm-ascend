@@ -22,6 +22,7 @@ from vllm.config import KVTransferConfig, VllmConfig
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import (
+    EplbPerfLogMode,
     ShortRequestFirstConfig,
     clear_ascend_config,
     get_ascend_config,
@@ -85,12 +86,13 @@ class TestAscendConfig(TestBase):
                 "fusion_ops_gmmswigluquant": False,
             },
             "multistream_overlap_shared_expert": True,
-            "eplb_config": {"num_redundant_experts": 2},
+            "eplb_config": {"num_redundant_experts": 2, "eplb_perf_log_mode": 2},
             "refresh": True,
             "enable_kv_nz": False,
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
+        self.assertEqual(ascend_config.eplb_config.eplb_perf_log_mode, EplbPerfLogMode.ALL_RANKS.value)
         self.assertTrue(ascend_config.multistream_overlap_shared_expert)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config

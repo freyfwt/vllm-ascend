@@ -15,6 +15,7 @@
 # limitations under the License.
 import json
 import os
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
@@ -22,6 +23,12 @@ from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+
+class EplbPerfLogMode(IntEnum):
+    DISABLED = 0
+    RANK0 = 1
+    ALL_RANKS = 2
 
 
 class AscendConfig:
@@ -804,6 +811,7 @@ class EplbConfig:
         "num_redundant_experts": 0,
         "eplb_policy_type": 2,
         "eplb_heat_collection_stage": "all",
+        "eplb_perf_log_mode": EplbPerfLogMode.DISABLED.value,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -844,6 +852,8 @@ class EplbConfig:
                 raise ValueError(f"{key} must greater than 0; got {self.config[key]} instead")
         if self.eplb_policy_type not in [0, 1, 2, 3]:
             raise ValueError("eplb_policy_type must in [0, 1, 2, 3]")
+        if self.eplb_perf_log_mode not in [mode.value for mode in EplbPerfLogMode]:
+            raise ValueError("eplb_perf_log_mode must be an EplbPerfLogMode value")
         if self.config["dynamic_eplb"]:
             assert (
                 os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")

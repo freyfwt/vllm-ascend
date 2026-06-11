@@ -27,6 +27,7 @@ from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
+from vllm_ascend.eplb.perf_logger import eplb_perf_logger
 
 
 class EplbUpdator:
@@ -50,6 +51,8 @@ class EplbUpdator:
 
     def init_eplb(self, expert_map_path, process):
         self.rank_id = dist.get_rank()
+        self.eplb_cycle_round = 0
+        eplb_perf_logger.configure(self.eplb_config.eplb_perf_log_mode, self.rank_id)
         self.num_expert_load_gather = 10
         self.periodic_load_gather = True
         self.expert_heat_collection_interval: torch.int64 = self.eplb_config.expert_heat_collection_interval
@@ -106,7 +109,9 @@ class EplbUpdator:
     def forward_before(self):
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
+            start_ns = eplb_perf_logger.start()
             self.update_info_all = self.eplb_process.block_update_q.get()
+            eplb_perf_logger.log("planner_result_get", self.eplb_cycle_round, start_ns)
         if self.update_expert_weight_flag():
             with record_function_or_nullcontext("EPLB generate p2p task"):
                 (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = (
@@ -128,6 +133,7 @@ class EplbUpdator:
 
     def forward_end(self, eplb_heat_collection_status: bool = True):
         if self.wakeup_eplb_worker_flag():
+            self.eplb_cycle_round += 1
             with record_function_or_nullcontext("EPLB gather moe load"):
                 self.compute_and_set_moe_load()
                 self.wakeup_eplb_worker()
@@ -144,7 +150,10 @@ class EplbUpdator:
 
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)
+
+        start_ns = eplb_perf_logger.start()
         moe_load = self.comm_group.all_gather(local_load, dim=1).cpu()
+        eplb_perf_logger.log("load_gather_cpu", self.eplb_cycle_round, start_ns)
 
         if self.multi_stage:
             moe_load = moe_load.permute(2, 0, 1, 3)

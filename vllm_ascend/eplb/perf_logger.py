@@ -33,12 +33,21 @@ class EplbPerfLogger:
             log_mode == EplbPerfLogMode.RANK0 and rank == 0
         )
 
-    def log(self, event: str, round_id: int, start_ns: int):
+    def start(self):
+        if not self.enabled:
+            return 0
+        return time.perf_counter_ns()
+
+    def log(self, event: str, cycle_round: int, start_ns: int):
         if not self.enabled:
             return
         duration_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
         logger.info(
-            "[EPLB_PERF] event=%s rank=%s round=%s duration_ms=%.3f", event, self.rank, round_id, duration_ms
+            "[EPLB_PERF] event=%s rank=%s cycle_round=%s duration_ms=%.3f",
+            event,
+            self.rank,
+            cycle_round,
+            duration_ms,
         )
 
 

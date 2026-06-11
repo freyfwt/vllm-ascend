@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from vllm_ascend.ascend_config import EplbPerfLogMode
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 
 
@@ -45,6 +46,7 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
 
         # ====================== 3. Mock EplbUpdator ======================
         self.eplb_config = MagicMock()
+        self.eplb_config.eplb_perf_log_mode = EplbPerfLogMode.DISABLED.value
         self.loader = MagicMock()
         self.eplb_process = MagicMock()
         self.process = MagicMock()

@@ -120,12 +120,15 @@ class EplbUpdator:
                 log2phy_map_this_rank = torch.from_numpy(numpy.array(log2phy_map))
                 self.eplb_loader.set_log2phy_map(log2phy_map_this_rank)
                 updated_expert_map_this_rank = torch.from_numpy(numpy.array(updated_expert_map))
+                self.eplb_loader.eplb_cycle_round = self.eplb_cycle_round
+                start_ns = eplb_perf_logger.start()
                 self.eplb_loader.generate_expert_d2d_transfer_task(
                     expert_send_info,
                     expert_recv_info,
                     updated_expert_map_this_rank,
                     layer_id,
                 )
+                eplb_perf_logger.log("d2d_task_build", self.eplb_cycle_round, start_ns)
 
                 # set asynchronous stream for d2d expert weight update
                 self.reqs = []

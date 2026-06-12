@@ -16,11 +16,13 @@
 #
 from enum import Enum
 
+import torch
 import torch.distributed as dist
 from vllm.logger import logger
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
+from vllm_ascend.eplb.perf_logger import eplb_perf_logger
 
 
 class ExpertWeightUpdateState(Enum):
@@ -39,6 +41,9 @@ class D2DExpertWeightLoader:
         self.recv_expert_list = []
         self.num_layers = 0
         self.comm_group = get_dynamic_eplb_group()
+        self.eplb_cycle_round = 0
+        self.d2d_start_event = None
+        self.d2d_end_event = None
 
     def set_adator(self, eplb_adaptor):
         self.eplb_adaptor = eplb_adaptor
@@ -89,8 +94,14 @@ class D2DExpertWeightLoader:
 
         # set asynchronous stream for d2d expert weight transfer
         if self.comm_op_list:
+            if eplb_perf_logger.enabled:
+                self.d2d_start_event = torch.npu.Event(enable_timing=True)
+                self.d2d_end_event = torch.npu.Event(enable_timing=True)
+                self.d2d_start_event.record()
             ret_list = dist.batch_isend_irecv(self.comm_op_list)
             reqs.extend(ret_list)
+            if eplb_perf_logger.enabled:
+                self.d2d_end_event.record()
 
         self.state = ExpertWeightUpdateState.TRANSFERRING
 
@@ -104,6 +115,12 @@ class D2DExpertWeightLoader:
             with record_function_or_nullcontext("EPLB weight D2D wait"):
                 for req in reqs:
                     req.wait()
+                if self.d2d_start_event is not None and self.d2d_end_event is not None:
+                    eplb_perf_logger.log_npu_event(
+                        "d2d_transfer_execute", self.eplb_cycle_round, self.d2d_start_event, self.d2d_end_event
+                    )
+                    self.d2d_start_event = None
+                    self.d2d_end_event = None
 
         if self.comm_op_list is not None:
             self.comm_op_list = None

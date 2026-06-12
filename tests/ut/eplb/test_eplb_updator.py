@@ -1,9 +1,11 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from vllm_ascend.ascend_config import EplbPerfLogMode
+import vllm_ascend.eplb.eplb_updator as eplb_updator
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 
 
@@ -83,6 +85,56 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
         self.assertEqual(moe_load.shape, (100, 58, self.world_size, 8))
         self.assertTrue("moe_load" in self.updator.shared_dict)
         self.assertEqual(moe_load.device.type, "cpu")
+
+    def test_forward_before_flushes_pending_perf_events(self):
+        self.updator.get_update_info_flag = MagicMock(return_value=False)
+        self.updator.update_expert_weight_flag = MagicMock(return_value=False)
+
+        self.updator.forward_before()
+
+        self.loader.log_ready_perf_events.assert_called_once()
+
+    def test_forward_end_records_perf_event_for_eplb_work(self):
+        self.updator.wakeup_eplb_worker_flag = MagicMock(return_value=False)
+        self.updator.update_expert_weight_flag = MagicMock(return_value=True)
+        self.updator.expert_map_record_path = None
+        self.updator.update_iteration = MagicMock()
+        self.updator.reqs = ["req"]
+        self.loader.pending_perf_events = []
+        start_event = MagicMock()
+        end_event = MagicMock()
+        fake_npu = SimpleNamespace(Event=MagicMock(side_effect=[start_event, end_event]))
+
+        with (
+            patch.object(eplb_updator.eplb_perf_logger, "enabled", True),
+            patch.object(eplb_updator.torch, "npu", fake_npu, create=True),
+        ):
+            self.updator.forward_end()
+
+        start_event.record.assert_called_once()
+        end_event.record.assert_called_once()
+        self.loader.update_expert_map_and_weight.assert_called_once_with(["req"])
+        self.assertEqual(
+            self.loader.pending_perf_events,
+            [("forward_end_execute", self.updator.eplb_cycle_round, start_event, end_event)],
+        )
+
+    def test_forward_end_skips_perf_event_without_eplb_work(self):
+        self.updator.wakeup_eplb_worker_flag = MagicMock(return_value=False)
+        self.updator.update_expert_weight_flag = MagicMock(return_value=False)
+        self.updator.expert_map_record_path = None
+        self.updator.update_iteration = MagicMock()
+        self.loader.pending_perf_events = []
+        event_factory = MagicMock()
+
+        with (
+            patch.object(eplb_updator.eplb_perf_logger, "enabled", True),
+            patch.object(eplb_updator.torch, "npu", SimpleNamespace(Event=event_factory), create=True),
+        ):
+            self.updator.forward_end()
+
+        event_factory.assert_not_called()
+        self.assertEqual(self.loader.pending_perf_events, [])
 
 
 if __name__ == "__main__":

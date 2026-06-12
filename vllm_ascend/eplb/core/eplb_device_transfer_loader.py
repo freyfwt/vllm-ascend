@@ -44,7 +44,7 @@ class D2DExpertWeightLoader:
         self.eplb_cycle_round = 0
         self.d2d_start_event = None
         self.d2d_end_event = None
-        self.pending_update_events = []
+        self.pending_perf_events = []
 
     def set_adator(self, eplb_adaptor):
         self.eplb_adaptor = eplb_adaptor
@@ -106,16 +106,16 @@ class D2DExpertWeightLoader:
 
         self.state = ExpertWeightUpdateState.TRANSFERRING
 
-    def log_ready_update_events(self):
-        if not self.pending_update_events:
+    def log_ready_perf_events(self):
+        if not self.pending_perf_events:
             return
-        pending_update_events = []
-        for event, cycle_round, start_event, end_event in self.pending_update_events:
+        pending_perf_events = []
+        for event, cycle_round, start_event, end_event in self.pending_perf_events:
             if end_event.query():
                 eplb_perf_logger.log_npu_event(event, cycle_round, start_event, end_event)
             else:
-                pending_update_events.append((event, cycle_round, start_event, end_event))
-        self.pending_update_events = pending_update_events
+                pending_perf_events.append((event, cycle_round, start_event, end_event))
+        self.pending_perf_events = pending_perf_events
 
     def update_expert_map_and_weight(self, reqs):
         # Only after send/recv tasks have been launched, expert_map and weight can be updated
@@ -134,7 +134,7 @@ class D2DExpertWeightLoader:
                     self.d2d_start_event = None
                     self.d2d_end_event = None
 
-        self.log_ready_update_events()
+        self.log_ready_perf_events()
 
         if self.comm_op_list is not None:
             self.comm_op_list = None
@@ -152,7 +152,7 @@ class D2DExpertWeightLoader:
         self.eplb_adaptor.do_update_log2phy_map(self.layer_id, self.updated_log2phy_map)
         if eplb_perf_logger.enabled:
             log2phy_end_event.record()
-            self.pending_update_events.append(
+            self.pending_perf_events.append(
                 ("log2phy_update_execute", self.eplb_cycle_round, log2phy_start_event, log2phy_end_event)
             )
 
@@ -167,7 +167,7 @@ class D2DExpertWeightLoader:
             self.eplb_adaptor.do_update_expert_weight(self.layer_id, local_expert_to_replace, buffer_tensor_id)
         if eplb_perf_logger.enabled:
             weight_end_event.record()
-            self.pending_update_events.append(
+            self.pending_perf_events.append(
                 ("expert_weight_update_execute", self.eplb_cycle_round, weight_start_event, weight_end_event)
             )
 

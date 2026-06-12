@@ -107,7 +107,7 @@ class EplbUpdator:
         self.eplb_process.planner_q.put(self.eplb_cycle_round)
 
     def forward_before(self):
-        self.eplb_loader.log_ready_update_events()
+        self.eplb_loader.log_ready_perf_events()
 
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
@@ -137,13 +137,21 @@ class EplbUpdator:
                 self.eplb_loader.asyn_expert_weight_transfer(self.reqs)
 
     def forward_end(self, eplb_heat_collection_status: bool = True):
-        if self.wakeup_eplb_worker_flag():
+        should_wakeup_eplb_worker = self.wakeup_eplb_worker_flag()
+        should_update_expert_weight = self.update_expert_weight_flag() and self.expert_map_record_path is None
+        log_forward_end = eplb_perf_logger.enabled and (should_wakeup_eplb_worker or should_update_expert_weight)
+        if log_forward_end:
+            forward_end_start_event = torch.npu.Event(enable_timing=True)
+            forward_end_end_event = torch.npu.Event(enable_timing=True)
+            forward_end_start_event.record()
+
+        if should_wakeup_eplb_worker:
             self.eplb_cycle_round += 1
             with record_function_or_nullcontext("EPLB gather moe load"):
                 self.compute_and_set_moe_load()
                 self.wakeup_eplb_worker()
 
-        if self.update_expert_weight_flag() and self.expert_map_record_path is None:
+        if should_update_expert_weight:
             self.eplb_loader.update_expert_map_and_weight(self.reqs)
 
         # One circle of eplb update includes expert_heat_collection_interval + algorithm_execution_interval
@@ -152,6 +160,12 @@ class EplbUpdator:
         # TODO(Angazenn): Decouple algorithm execution && weight update with heat collection iterations.
         if self.cur_iterations >= self.expert_heat_collection_interval - 1 or eplb_heat_collection_status:
             self.update_iteration()
+
+        if log_forward_end:
+            forward_end_end_event.record()
+            self.eplb_loader.pending_perf_events.append(
+                ("forward_end_execute", self.eplb_cycle_round, forward_end_start_event, forward_end_end_event)
+            )
 
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)

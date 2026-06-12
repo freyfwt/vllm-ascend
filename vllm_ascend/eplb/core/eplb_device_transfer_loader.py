@@ -88,7 +88,7 @@ class D2DExpertWeightLoader:
     def set_log2phy_map(self, log2phy_map):
         self.updated_log2phy_map = log2phy_map
 
-    def asyn_expert_weight_transfer(self, reqs):
+    def async_expert_weight_transfer(self, reqs):
         # Only when send/recv tasks are parsed into self.comm_op_list, d2d send/recv tasks can be launched
         if self.state != ExpertWeightUpdateState.READY:
             return

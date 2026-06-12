@@ -134,7 +134,7 @@ class EplbUpdator:
 
                 # set asynchronous stream for d2d expert weight update
                 self.reqs = []
-                self.eplb_loader.asyn_expert_weight_transfer(self.reqs)
+                self.eplb_loader.async_expert_weight_transfer(self.reqs)
 
     def forward_end(self, eplb_heat_collection_status: bool = True):
         should_wakeup_eplb_worker = self.wakeup_eplb_worker_flag()

@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.eplb.perf_logger import eplb_perf_logger
 from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEFusedExpertsInput,
@@ -137,9 +138,7 @@ class MoECommMethod(ABC):
         assert moe_comm_method is not None, "Missing communication context"
 
         before_dispatch_evt = torch.npu.current_stream().record_event()
-        routed_topk_ids = fused_experts_input.topk_ids
-        if fused_experts_input.routing.log2phy is not None:
-            routed_topk_ids = fused_experts_input.routing.log2phy[routed_topk_ids]
+        routed_topk_ids = self._apply_log2phy(fused_experts_input.topk_ids, fused_experts_input.routing.log2phy)
 
         token_dispatch_input = build_token_dispatch_input(
             fused_experts_input=fused_experts_input,
@@ -173,6 +172,32 @@ class MoECommMethod(ABC):
 
     def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         return unified_apply_mlp(mlp_compute_input=mlp_compute_input)
+
+    def _log_ready_log2phy_perf_events(self):
+        pending_perf_events = []
+        for perf_event in getattr(self, "_log2phy_perf_events", []):
+            _, _, _, end_event = perf_event
+            if end_event.query():
+                eplb_perf_logger.log_npu_event(perf_event)
+            else:
+                pending_perf_events.append(perf_event)
+        self._log2phy_perf_events = pending_perf_events
+
+    def _apply_log2phy(self, topk_ids: torch.Tensor, log2phy: torch.Tensor | None) -> torch.Tensor:
+        if log2phy is None:
+            return topk_ids
+        if eplb_perf_logger.enabled:
+            self._log_ready_log2phy_perf_events()
+            log2phy_start_event = torch.npu.Event(enable_timing=True)
+            log2phy_end_event = torch.npu.Event(enable_timing=True)
+            log2phy_start_event.record()
+        topk_ids = log2phy[topk_ids]
+        if eplb_perf_logger.enabled:
+            log2phy_end_event.record()
+            self._log2phy_perf_events.append(
+                eplb_perf_logger.perf_event("log2phy_route_execute", log2phy_start_event, log2phy_end_event)
+            )
+        return topk_ids
 
     @abstractmethod
     def _get_token_dispatcher(self) -> MoETokenDispatcher:
@@ -296,9 +321,7 @@ class FusedMC2CommImpl(MoECommMethod):
         )
 
         # Apply log2phy if needed
-        topk_ids = fused_experts_input.topk_ids
-        if fused_experts_input.routing.log2phy is not None:
-            topk_ids = fused_experts_input.routing.log2phy[topk_ids]
+        topk_ids = self._apply_log2phy(fused_experts_input.topk_ids, fused_experts_input.routing.log2phy)
 
         expert_tokens = None
         if get_ascend_config().enable_fused_mc2 == 1:

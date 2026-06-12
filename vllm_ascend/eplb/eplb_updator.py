@@ -113,7 +113,7 @@ class EplbUpdator:
         if self.get_update_info_flag():
             start_ns = eplb_perf_logger.start()
             self.update_info_all = self.eplb_process.block_update_q.get()
-            eplb_perf_logger.log("planner_result_get", self.eplb_cycle_round, start_ns)
+            eplb_perf_logger.log("planner_result_get", start_ns)
         if self.update_expert_weight_flag():
             with record_function_or_nullcontext("EPLB generate p2p task"):
                 (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = (
@@ -122,7 +122,6 @@ class EplbUpdator:
                 log2phy_map_this_rank = torch.from_numpy(numpy.array(log2phy_map))
                 self.eplb_loader.set_log2phy_map(log2phy_map_this_rank)
                 updated_expert_map_this_rank = torch.from_numpy(numpy.array(updated_expert_map))
-                self.eplb_loader.eplb_cycle_round = self.eplb_cycle_round
                 start_ns = eplb_perf_logger.start()
                 self.eplb_loader.generate_expert_d2d_transfer_task(
                     expert_send_info,
@@ -130,7 +129,7 @@ class EplbUpdator:
                     updated_expert_map_this_rank,
                     layer_id,
                 )
-                eplb_perf_logger.log("d2d_task_build", self.eplb_cycle_round, start_ns)
+                eplb_perf_logger.log("d2d_task_build", start_ns)
 
                 # set asynchronous stream for d2d expert weight update
                 self.reqs = []
@@ -147,6 +146,7 @@ class EplbUpdator:
 
         if should_wakeup_eplb_worker:
             self.eplb_cycle_round += 1
+            eplb_perf_logger.cycle_round = self.eplb_cycle_round
             with record_function_or_nullcontext("EPLB gather moe load"):
                 self.compute_and_set_moe_load()
                 self.wakeup_eplb_worker()
@@ -164,7 +164,7 @@ class EplbUpdator:
         if log_forward_end:
             forward_end_end_event.record()
             self.eplb_loader.pending_perf_events.append(
-                ("forward_end_execute", self.eplb_cycle_round, forward_end_start_event, forward_end_end_event)
+                eplb_perf_logger.perf_event("forward_end_execute", forward_end_start_event, forward_end_end_event)
             )
 
     def compute_and_set_moe_load(self):
@@ -178,7 +178,7 @@ class EplbUpdator:
         moe_load = gathered_load.cpu()
         if eplb_perf_logger.enabled:
             gather_end.record()
-            eplb_perf_logger.log_npu_event("load_gather_sync", self.eplb_cycle_round, gather_start, gather_end)
+            eplb_perf_logger.log_npu_event(eplb_perf_logger.perf_event("load_gather_sync", gather_start, gather_end))
 
         if self.multi_stage:
             moe_load = moe_load.permute(2, 0, 1, 3)

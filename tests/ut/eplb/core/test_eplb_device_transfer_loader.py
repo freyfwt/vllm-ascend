@@ -86,6 +86,7 @@ class TestD2DExpertWeightLoader(unittest.TestCase):
         end_event.record.assert_called_once()
         self.assertIs(loader_obj.d2d_start_event, start_event)
         self.assertIs(loader_obj.d2d_end_event, end_event)
+        self.assertEqual(loader_obj.d2d_perf_event, ("d2d_transfer_execute", 0, start_event, end_event))
 
     def test_log_ready_perf_events_keeps_unready_events(self):
         loader_obj = self._new_loader()
@@ -96,7 +97,7 @@ class TestD2DExpertWeightLoader(unittest.TestCase):
         loader_obj.pending_perf_events = [ready_event, pending_event]
         with patch.object(loader.eplb_perf_logger, "log_npu_event") as mock_log_npu_event:
             loader_obj.log_ready_perf_events()
-        mock_log_npu_event.assert_called_once_with(*ready_event)
+        mock_log_npu_event.assert_called_once_with(ready_event)
         self.assertEqual(loader_obj.pending_perf_events, [pending_event])
 
     def test_set_log2phy_map_and_invalid_state(self):

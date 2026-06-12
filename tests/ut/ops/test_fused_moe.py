@@ -722,6 +722,20 @@ class TestAscendFusedMoE:
         )
         assert layer.maybe_all_reduce_tensor_model_parallel(torch.ones(1)) == "reduced"
 
+    def test_log_ready_moe_load_perf_events(self):
+        layer = self._build_layer()
+        ready_end_event = MagicMock(query=MagicMock(return_value=True))
+        pending_end_event = MagicMock(query=MagicMock(return_value=False))
+        ready_event = ("moe_load_update_execute", 1, MagicMock(), ready_end_event)
+        pending_event = ("moe_load_update_execute", 2, MagicMock(), pending_end_event)
+        layer.moe_load_perf_events = [ready_event, pending_event]
+
+        with patch.object(fused_moe_module.eplb_perf_logger, "log_npu_event") as mock_log_npu_event:
+            layer._log_ready_moe_load_perf_events()
+
+        mock_log_npu_event.assert_called_once_with(ready_event)
+        assert layer.moe_load_perf_events == [pending_event]
+
     def test_forward_delegates_to_runner(self):
         layer = self._build_layer()
         hidden_states = torch.randn(2, 4)

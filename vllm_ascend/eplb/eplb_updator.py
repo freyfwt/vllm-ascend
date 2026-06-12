@@ -107,6 +107,8 @@ class EplbUpdator:
         self.eplb_process.planner_q.put(self.eplb_cycle_round)
 
     def forward_before(self):
+        self.eplb_loader.log_ready_update_events()
+
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag():
             start_ns = eplb_perf_logger.start()

@@ -44,6 +44,7 @@ class D2DExpertWeightLoader:
         self.eplb_cycle_round = 0
         self.d2d_start_event = None
         self.d2d_end_event = None
+        self.pending_update_events = []
 
     def set_adator(self, eplb_adaptor):
         self.eplb_adaptor = eplb_adaptor
@@ -122,20 +123,49 @@ class D2DExpertWeightLoader:
                     self.d2d_start_event = None
                     self.d2d_end_event = None
 
+        if self.pending_update_events:
+            pending_update_events = []
+            for event, cycle_round, start_event, end_event in self.pending_update_events:
+                if end_event.query():
+                    eplb_perf_logger.log_npu_event(event, cycle_round, start_event, end_event)
+                else:
+                    pending_update_events.append((event, cycle_round, start_event, end_event))
+            self.pending_update_events = pending_update_events
+
         if self.comm_op_list is not None:
             self.comm_op_list = None
 
         # update expert_map
+        start_ns = eplb_perf_logger.start()
         self.eplb_adaptor.do_update_expert_map(self.layer_id, self.updated_expert_map)
+        eplb_perf_logger.log("expert_map_update", self.eplb_cycle_round, start_ns)
 
         # update log2phy_map
+        if eplb_perf_logger.enabled:
+            log2phy_start_event = torch.npu.Event(enable_timing=True)
+            log2phy_end_event = torch.npu.Event(enable_timing=True)
+            log2phy_start_event.record()
         self.eplb_adaptor.do_update_log2phy_map(self.layer_id, self.updated_log2phy_map)
+        if eplb_perf_logger.enabled:
+            log2phy_end_event.record()
+            self.pending_update_events.append(
+                ("log2phy_update_execute", self.eplb_cycle_round, log2phy_start_event, log2phy_end_event)
+            )
 
         # update expert weight
+        if eplb_perf_logger.enabled:
+            weight_start_event = torch.npu.Event(enable_timing=True)
+            weight_end_event = torch.npu.Event(enable_timing=True)
+            weight_start_event.record()
         buffer_tensor_id = 0
         for recv_expert_info in self.recv_expert_list:
             local_expert_to_replace, buffer_tensor_id = recv_expert_info
             self.eplb_adaptor.do_update_expert_weight(self.layer_id, local_expert_to_replace, buffer_tensor_id)
+        if eplb_perf_logger.enabled:
+            weight_end_event.record()
+            self.pending_update_events.append(
+                ("expert_weight_update_execute", self.eplb_cycle_round, weight_start_event, weight_end_event)
+            )
 
         logger.debug(
             "[eplb/d2d_loader] Layer %s D2D transfer completed, updated_experts=%s",

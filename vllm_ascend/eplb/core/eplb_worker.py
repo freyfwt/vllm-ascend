@@ -72,7 +72,7 @@ class EplbWorker:
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
         start_ns = eplb_perf_logger.start()
         _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
-        eplb_perf_logger.log("rebalance_calculation", cycle_round, start_ns)
+        eplb_perf_logger.log("rebalance_calculation", start_ns)
 
         if self.rank_id == 0:
             if self.multi_stage:
@@ -390,14 +390,15 @@ class EplbProcess:
         while True:
             try:
                 cycle_round = planner_q.get()
+                eplb_perf_logger.cycle_round = cycle_round
 
                 start_ns = eplb_perf_logger.start()
                 packed_update_info = self.worker.do_update(cycle_round)
-                eplb_perf_logger.log("worker_do_update", cycle_round, start_ns)
+                eplb_perf_logger.log("worker_do_update", start_ns)
 
                 start_ns = eplb_perf_logger.start()
                 block_update_q.put(packed_update_info)
-                eplb_perf_logger.log("worker_result_put", cycle_round, start_ns)
+                eplb_perf_logger.log("worker_result_put", start_ns)
 
             except Exception as e:
                 logger.warning(

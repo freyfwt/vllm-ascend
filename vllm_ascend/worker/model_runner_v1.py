@@ -2378,7 +2378,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.dynamic_eplb:
             start_ns = eplb_perf_logger.start()
             self.eplb_updator.forward_before()
-            eplb_perf_logger.log("runner_forward_before", self.eplb_updator.eplb_cycle_round, start_ns)
+            eplb_perf_logger.log("runner_forward_before", start_ns)
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -2432,7 +2432,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
             if self.dynamic_eplb:
-                eplb_perf_logger.log("model_forward_submit_host", self.eplb_updator.eplb_cycle_round, start_ns)
+                eplb_perf_logger.log("model_forward_submit_host", start_ns)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:

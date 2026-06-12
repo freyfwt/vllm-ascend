@@ -50,5 +50,17 @@ class EplbPerfLogger:
             duration_ms,
         )
 
+    def log_npu_event(self, event: str, cycle_round: int, start_event, end_event):
+        if not self.enabled or not end_event.query():
+            return
+        duration_ms = start_event.elapsed_time(end_event)
+        logger.info(
+            "[EPLB_PERF] event=%s rank=%s cycle_round=%s duration_ms=%.3f",
+            event,
+            self.rank,
+            cycle_round,
+            duration_ms,
+        )
+
 
 eplb_perf_logger = EplbPerfLogger()

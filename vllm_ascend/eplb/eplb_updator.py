@@ -104,7 +104,7 @@ class EplbUpdator:
         return weight_update_counter >= 0 and weight_update_counter < self.num_moe_layers
 
     def wakeup_eplb_worker(self):
-        self.eplb_process.planner_q.put(1)
+        self.eplb_process.planner_q.put(self.eplb_cycle_round)
 
     def forward_before(self):
         # Batch after eplb process being triggered, get update info provided by eplb process
@@ -151,9 +151,15 @@ class EplbUpdator:
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)
 
-        start_ns = eplb_perf_logger.start()
-        moe_load = self.comm_group.all_gather(local_load, dim=1).cpu()
-        eplb_perf_logger.log("load_gather_cpu", self.eplb_cycle_round, start_ns)
+        if eplb_perf_logger.enabled:
+            gather_start = torch.npu.Event(enable_timing=True)
+            gather_end = torch.npu.Event(enable_timing=True)
+            gather_start.record()
+        gathered_load = self.comm_group.all_gather(local_load, dim=1)
+        moe_load = gathered_load.cpu()
+        if eplb_perf_logger.enabled:
+            gather_end.record()
+            eplb_perf_logger.log_npu_event("load_gather_sync", self.eplb_cycle_round, gather_start, gather_end)
 
         if self.multi_stage:
             moe_load = moe_load.permute(2, 0, 1, 3)

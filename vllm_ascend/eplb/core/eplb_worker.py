@@ -22,8 +22,10 @@ import torch
 from vllm.distributed import get_ep_group
 from vllm.logger import logger
 
+from vllm_ascend.ascend_config import EplbPerfLogMode
 from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
 from vllm_ascend.eplb.core.policy.policy_factory import PolicyFactory
+from vllm_ascend.eplb.perf_logger import eplb_perf_logger
 
 
 class EplbWorker:
@@ -43,7 +45,7 @@ class EplbWorker:
         self.rank_id = get_ep_group().rank_in_group
         self.multi_stage = policy_type == 3
 
-    def do_update(self):
+    def do_update(self, cycle_round: int = 0):
         # put data in to queue
         # in process self.policy.generate_policy()
         # get epxert table && tensor
@@ -68,7 +70,9 @@ class EplbWorker:
 
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
+        start_ns = eplb_perf_logger.start()
         _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
+        eplb_perf_logger.log("rebalance_calculation", cycle_round, start_ns)
 
         if self.rank_id == 0:
             if self.multi_stage:
@@ -341,6 +345,7 @@ class EplbProcess:
         policy_type: int = 0,
         enable_d2d: bool = True,
         tp_size: int | None = None,
+        eplb_perf_log_mode: int = EplbPerfLogMode.DISABLED.value,
     ):
         """
         Args:
@@ -351,6 +356,7 @@ class EplbProcess:
         self.shared_dict = shared_dict
         self.policy_type = policy_type
         self.enable_d2d = enable_d2d
+        self.eplb_perf_log_mode = eplb_perf_log_mode
         self.planner_q: Queue[Any] = Queue()
         self.block_update_q: Queue[Any] = Queue(maxsize=1)
 
@@ -380,17 +386,18 @@ class EplbProcess:
             from vllm_ascend.eplb.core.policy.policy_flashlb import warm_up
 
             warm_up()
+        eplb_perf_logger.configure(self.eplb_perf_log_mode, self.worker.rank_id)
         while True:
             try:
-                planner_q.get()
+                cycle_round = planner_q.get()
 
-                packed_update_info = self.worker.do_update()
+                start_ns = eplb_perf_logger.start()
+                packed_update_info = self.worker.do_update(cycle_round)
+                eplb_perf_logger.log("worker_do_update", cycle_round, start_ns)
 
-                while True:
-                    if not block_update_q.empty():
-                        continue
-                    block_update_q.put(packed_update_info)
-                    break
+                start_ns = eplb_perf_logger.start()
+                block_update_q.put(packed_update_info)
+                eplb_perf_logger.log("worker_result_put", cycle_round, start_ns)
 
             except Exception as e:
                 logger.warning(

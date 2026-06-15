@@ -32,6 +32,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.eplb.perf_logger import eplb_perf_logger
 from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
@@ -348,6 +349,37 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             num_experts_local.item() if torch.is_tensor(num_experts_local) else int(num_experts_local)
         )
 
+    def _log_ready_expert_map_perf_events(self):
+        pending_perf_events = []
+        for perf_event in getattr(self, "_expert_map_perf_events", []):
+            _, _, _, end_event = perf_event
+            if end_event.query():
+                eplb_perf_logger.log_npu_event(perf_event)
+            else:
+                pending_perf_events.append(perf_event)
+        self._expert_map_perf_events = pending_perf_events
+
+    def _apply_expert_map_mask(
+        self,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor,
+    ) -> torch.Tensor:
+        if eplb_perf_logger.enabled:
+            self._log_ready_expert_map_perf_events()
+            expert_map_start_event = torch.npu.Event(enable_timing=True)
+            expert_map_end_event = torch.npu.Event(enable_timing=True)
+            expert_map_start_event.record()
+        topk_weights = topk_weights * (expert_map[topk_ids] != -1)
+        if eplb_perf_logger.enabled:
+            expert_map_end_event.record()
+            self._expert_map_perf_events.append(
+                eplb_perf_logger.perf_event(
+                    "expert_map_mask_execute", expert_map_start_event, expert_map_end_event
+                )
+            )
+        return topk_weights
+
     def token_dispatch(
         self,
         token_dispatch_input: MoETokenDispatchInput,
@@ -389,8 +421,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
             global_num_experts = len(expert_map) + global_redundant_expert_num
-            mask = expert_map[topk_ids] != -1
-            topk_weights = topk_weights * mask
+            topk_weights = self._apply_expert_map_mask(topk_weights, topk_ids, expert_map)
             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
             last_expert_idx = first_expert_idx + self.num_experts_local
         else:

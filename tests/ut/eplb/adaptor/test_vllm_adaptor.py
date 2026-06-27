@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import torch
 from transformers import DeepseekV2Config
 
-from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
+from vllm_ascend.eplb.adaptor.vllm_adaptor import EPLB_EXPERT_WEIGHT_NAMES, VllmEplbAdaptor
 from vllm_ascend.quantization.quant_type import QuantType
 
 
@@ -139,8 +139,9 @@ class TestVllmAdaptor(unittest.TestCase):
         adaptor = self._build_small_fp16_adaptor()
         adaptor.get_global_expert_map()
         adaptor.init_expert_weight_stats(None)
-        adaptor.buffer_tensor_list[0][0].copy_(torch.tensor([10.0, 20.0]))
-        adaptor.buffer_tensor_list[0][1].copy_(torch.tensor([30.0, 40.0]))
+        expert_weight_key = adaptor.expert_weight_key_per_layer[0]
+        adaptor.buffer_tensor_list[expert_weight_key][0][0].copy_(torch.tensor([10.0, 20.0]))
+        adaptor.buffer_tensor_list[expert_weight_key][0][1].copy_(torch.tensor([30.0, 40.0]))
 
         with patch("vllm_ascend.eplb.adaptor.vllm_adaptor.logger.warning") as mock_warning:
             adaptor.do_update_expert_weight(0, 0, 0, 0)
@@ -156,6 +157,58 @@ class TestVllmAdaptor(unittest.TestCase):
             adaptor.do_update_expert_weight(0, 0, 0, 1)
 
         mock_error.assert_called_once()
+
+    @patch("vllm_ascend.eplb.adaptor.vllm_adaptor.get_ascend_config")
+    def test_init_mixed_quant_type_per_layer(self, mock_get_config):
+        mock_config = MagicMock()
+        mock_config.enable_fused_mc2 = 1
+        mock_get_config.return_value = mock_config
+
+        VllmEplbAdaptor._registered_moe_layers = []
+        num_local_experts = 2
+        w8a8_layer = MagicMock()
+        w8a8_layer.local_num_experts = num_local_experts
+        w8a8_layer.ep_rank = 0
+        w8a8_layer.quant_type = QuantType.W8A8
+        w8a8_layer.w13_weight_list = [torch.randn(2, 2) for _ in range(num_local_experts)]
+        w8a8_layer.w2_weight_list = [torch.randn(2, 2) for _ in range(num_local_experts)]
+        w8a8_layer.w13_weight_scale_fp32_list = [torch.randn(1) for _ in range(num_local_experts)]
+        w8a8_layer.w2_weight_scale_list = [torch.randn(1) for _ in range(num_local_experts)]
+        w8a8_layer.fused_w1_scale_list = [torch.randn(1) for _ in range(num_local_experts)]
+        w8a8_layer.fused_w2_scale_list = [torch.randn(1) for _ in range(num_local_experts)]
+        w8a8_layer.moe_load = torch.zeros(num_local_experts)
+        w8a8_layer.global_expert_map = torch.arange(num_local_experts * 4).reshape(num_local_experts, 4)
+        w8a8_layer.get_log2phy_map.return_value = torch.arange(4)
+
+        mxfp8_layer = MagicMock()
+        mxfp8_layer.local_num_experts = num_local_experts
+        mxfp8_layer.ep_rank = 0
+        mxfp8_layer.quant_type = QuantType.MXFP8
+        mxfp8_layer.w13_weight = torch.randn(num_local_experts, 2, 2)
+        mxfp8_layer.w2_weight = torch.randn(num_local_experts, 2, 2)
+        mxfp8_layer.w13_weight_scale = torch.randn(num_local_experts, 1)
+        mxfp8_layer.w2_weight_scale = torch.randn(num_local_experts, 1)
+        mxfp8_layer.moe_load = torch.zeros(num_local_experts)
+        mxfp8_layer.global_expert_map = torch.arange(num_local_experts * 4).reshape(num_local_experts, 4)
+        mxfp8_layer.get_log2phy_map.return_value = torch.arange(4)
+
+        VllmEplbAdaptor.register_layer(w8a8_layer)
+        VllmEplbAdaptor.register_layer(mxfp8_layer)
+
+        model = MagicMock()
+        model.quant_config = MagicMock()
+        model.config.first_k_dense_replace = 0
+        del model.language_model
+        adaptor = VllmEplbAdaptor(model)
+
+        w8a8_key = (QuantType.W8A8, True)
+        mxfp8_key = (QuantType.MXFP8, True)
+        self.assertEqual(adaptor.expert_weight_key_per_layer[0], w8a8_key)
+        self.assertEqual(adaptor.expert_weight_key_per_layer[1], mxfp8_key)
+        self.assertEqual(len(adaptor.buffer_tensor_list[w8a8_key][0]), len(EPLB_EXPERT_WEIGHT_NAMES[w8a8_key]))
+        self.assertEqual(len(adaptor.buffer_tensor_list[mxfp8_key][0]), len(EPLB_EXPERT_WEIGHT_NAMES[mxfp8_key]))
+        self.assertEqual(len(adaptor.expert_param_per_layer[0][0]), len(EPLB_EXPERT_WEIGHT_NAMES[w8a8_key]))
+        self.assertEqual(len(adaptor.expert_param_per_layer[1][0]), len(EPLB_EXPERT_WEIGHT_NAMES[mxfp8_key]))
 
     def tearDown(self):
         self.mock_rank.stop()

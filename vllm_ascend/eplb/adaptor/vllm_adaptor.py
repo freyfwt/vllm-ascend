@@ -79,6 +79,66 @@ class VllmEplbAdaptor:
                 buffer_tensor = torch.empty_like(expert_tensor)
                 self.buffer_tensor_list[buffer_id].append(buffer_tensor)
 
+    @staticmethod
+    def _get_mapping_keys(value):
+        if isinstance(value, dict):
+            return sorted(value.keys())
+        return []
+
+    @staticmethod
+    def _get_layer_attr_names(layer):
+        try:
+            attr_names = vars(layer).keys()
+        except TypeError:
+            return []
+
+        interesting_tokens = ("weight", "scale", "bias", "expert", "eplb", "quant")
+        return sorted(name for name in attr_names if any(token in name for token in interesting_tokens))
+
+    @staticmethod
+    def _describe_layer_attr(layer, name):
+        if not hasattr(layer, name):
+            return "missing"
+
+        value = getattr(layer, name)
+        if isinstance(value, list):
+            return f"list(len={len(value)})"
+        if isinstance(value, torch.Tensor):
+            return f"tensor(shape={tuple(value.shape)}, dtype={value.dtype})"
+        return type(value).__name__
+
+    def _describe_expected_layer_attrs(self, layer):
+        return {name: self._describe_layer_attr(layer, name) for name in self.expert_weight_names}
+
+    def _log_registered_moe_layers(self):
+        logger.warning(
+            "[eplb/debug] rank=%s registered_moe_layers=%s expert_weight_names=%s",
+            self.rank_id,
+            self.num_moe_layers,
+            self.expert_weight_names,
+        )
+        for layer_idx, layer in enumerate(self.moe_layers):
+            quant_method = getattr(layer, "quant_method", None)
+            logger.warning(
+                "[eplb/debug] rank=%s layer=%s class=%s id=%s layer_name=%s "
+                "quant_type=%s dynamic_eplb=%s local_num_experts=%s ep_rank=%s "
+                "expected_attrs=%s quant_method=%s quant_method_inner=%s attrs=%s parameter_keys=%s",
+                self.rank_id,
+                layer_idx,
+                layer.__class__.__name__,
+                id(layer),
+                getattr(layer, "layer_name", None),
+                getattr(layer, "quant_type", None),
+                getattr(layer, "dynamic_eplb", None),
+                getattr(layer, "local_num_experts", None),
+                getattr(layer, "ep_rank", None),
+                self._describe_expected_layer_attrs(layer),
+                quant_method.__class__.__name__ if quant_method is not None else None,
+                getattr(quant_method, "quant_method", None),
+                self._get_layer_attr_names(layer),
+                self._get_mapping_keys(getattr(layer, "_parameters", None)),
+            )
+
     def init_expert_param_per_layer(self):
         self.param_dict = dict()
 
@@ -121,10 +181,27 @@ class VllmEplbAdaptor:
         else:
             self.expert_weight_names = ["w13_weight", "w2_weight"]
 
+        self._log_registered_moe_layers()
+
         for local_idx, layer in enumerate(self.moe_layers):
             self.expert_param_per_layer[local_idx] = list()
             for name in self.expert_weight_names:
                 param_key = f"{local_idx}.{name}"
+                if not hasattr(layer, name):
+                    logger.error(
+                        "[eplb/debug] Missing expected expert weight attribute before EPLB init. "
+                        "rank=%s layer=%s class=%s id=%s missing_attr=%s expert_weight_names=%s "
+                        "expected_attrs=%s attrs=%s parameter_keys=%s",
+                        self.rank_id,
+                        local_idx,
+                        layer.__class__.__name__,
+                        id(layer),
+                        name,
+                        self.expert_weight_names,
+                        self._describe_expected_layer_attrs(layer),
+                        self._get_layer_attr_names(layer),
+                        self._get_mapping_keys(getattr(layer, "_parameters", None)),
+                    )
                 self.param_dict[param_key] = getattr(layer, name)
             for local_expert_id in range(self.num_local_experts):
                 per_expert_param = list()

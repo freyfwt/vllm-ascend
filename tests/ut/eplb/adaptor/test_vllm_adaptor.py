@@ -57,12 +57,21 @@ class TestVllmAdaptor(unittest.TestCase):
         model.quant_config = None
         model.config.first_k_dense_replace = 0
         del model.language_model
-        return VllmEplbAdaptor(model)
+        with patch("vllm_ascend.eplb.adaptor.vllm_adaptor.get_ascend_config") as mock_get_config:
+            mock_config = MagicMock()
+            mock_config.enable_fused_mc2 = 1
+            mock_get_config.return_value = mock_config
+            return VllmEplbAdaptor(model)
 
     @patch("torch.empty_like", return_value=torch.zeros(16, 32))
-    def test_init_fp16(self, mock_func):
+    @patch("vllm_ascend.eplb.adaptor.vllm_adaptor.get_ascend_config")
+    def test_init_fp16(self, mock_get_config, mock_func):
+        mock_config = MagicMock()
+        mock_config.enable_fused_mc2 = 1
+        mock_get_config.return_value = mock_config
         self.model.quant_config = None
-        VllmEplbAdaptor(self.model)
+        adaptor = VllmEplbAdaptor(self.model)
+        self.assertEqual(adaptor.expert_weight_key_per_layer[0], (QuantType.NONE, True))
 
     @patch("torch.empty_like", return_value=torch.zeros(16, 32))
     @patch("vllm_ascend.eplb.adaptor.vllm_adaptor.get_ascend_config")

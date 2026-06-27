@@ -121,12 +121,8 @@ class VllmEplbAdaptor:
         self.param_dict = dict()
 
         for local_idx, layer in enumerate(self.moe_layers):
-            if self.model.quant_config is None:
-                quant_type = QuantType.NONE
-                expert_weight_key = (quant_type, False)
-            else:
-                quant_type = layer.quant_type
-                expert_weight_key = (quant_type, get_ascend_config().enable_fused_mc2 == 1)
+            quant_type = QuantType.NONE if self.model.quant_config is None else layer.quant_type
+            expert_weight_key = (quant_type, get_ascend_config().enable_fused_mc2 == 1)
             if expert_weight_key not in EPLB_EXPERT_WEIGHT_NAMES:
                 raise ValueError(f"EPLB not support {quant_type} with fused MC2 {expert_weight_key[1]}")
             expert_weight_names = EPLB_EXPERT_WEIGHT_NAMES[expert_weight_key]

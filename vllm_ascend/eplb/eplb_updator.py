@@ -33,6 +33,7 @@ class EplbUpdator:
     def __init__(self, eplb_config, loader: D2DExpertWeightLoader, eplb_process: EplbProcess, process):
         self.eplb_config = eplb_config
         self.multi_stage = eplb_config.eplb_policy_type == 3
+        self.enable_expert_weight_stats_check = eplb_config.enable_expert_weight_stats_check is True
         self.init_eplb(self.eplb_config.expert_map_path, process)
         self.eplb_loader = loader
         self.eplb_process = eplb_process
@@ -157,6 +158,8 @@ class EplbUpdator:
     def warm_up_eplb(self):
         logger.info("[eplb/updator] Starting EPLB warm-up, rank=%s, world_size=%s", self.rank_id, self.world_size)
         self.shared_dict["expert_maps"] = self.adaptor.get_global_expert_map()
+        if self.enable_expert_weight_stats_check:
+            self.adaptor.init_expert_weight_stats(self.comm_group)
         self.compute_and_set_moe_load()
 
         src_tensor = torch.empty((1,), device=self.device)

@@ -729,6 +729,7 @@ class EplbConfig:
         "num_redundant_experts": 0,
         "eplb_policy_type": 2,
         "eplb_heat_collection_stage": "all",
+        "enable_expert_weight_stats_check": False,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -776,6 +777,8 @@ class EplbConfig:
             ), "The environment variable DYNAMIC_EPLB or EXPERT_MAP_RECORD of the EPLB must be set to true."
         if self.eplb_heat_collection_stage not in ["all", "prefill", "decode"]:
             raise ValueError('eplb_heat_collection_stage must be one of ["all", "prefill", "decode"]')
+        if not isinstance(self.enable_expert_weight_stats_check, bool):
+            raise TypeError("enable_expert_weight_stats_check must be a boolean")
 
         logger.info("Dynamic EPLB is %s", self.config["dynamic_eplb"])
         logger.info("The number of redundant experts is %s", self.config["num_redundant_experts"])

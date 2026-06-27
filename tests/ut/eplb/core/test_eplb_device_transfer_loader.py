@@ -61,7 +61,7 @@ def test_asyn_transfer_and_update(mock_adaptor):
     mock_req.wait.return_value = None
     reqs = [mock_req]
 
-    loader_obj.recv_expert_list = [(0, 0)]
+    loader_obj.recv_expert_list = [(20, 0, 0)]
     loader_obj.updated_expert_map = {20: torch.tensor(0)}
     loader_obj.updated_log2phy_map = {"dummy": 1}
     loader_obj.layer_id = 0
@@ -71,7 +71,7 @@ def test_asyn_transfer_and_update(mock_adaptor):
 
     mock_adaptor.do_update_expert_map.assert_called_once()
     mock_adaptor.do_update_log2phy_map.assert_called_once()
-    mock_adaptor.do_update_expert_weight.assert_called_once()
+    mock_adaptor.do_update_expert_weight.assert_called_once_with(0, 0, 0, 20)
 
     assert loader_obj.state == loader.ExpertWeightUpdateState.WAITING
     assert loader_obj.recv_expert_list == []

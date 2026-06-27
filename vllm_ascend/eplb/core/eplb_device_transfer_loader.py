@@ -74,7 +74,7 @@ class D2DExpertWeightLoader:
                     )
                 )
             local_expert_to_replace = self.updated_expert_map[global_expert_id_to_recv].item()
-            self.recv_expert_list.append((local_expert_to_replace, buffer_tensor_id))
+            self.recv_expert_list.append((global_expert_id_to_recv, local_expert_to_replace, buffer_tensor_id))
 
         self.state = ExpertWeightUpdateState.READY
 
@@ -114,10 +114,14 @@ class D2DExpertWeightLoader:
         self.eplb_adaptor.do_update_log2phy_map(self.layer_id, self.updated_log2phy_map)
 
         # update expert weight
-        buffer_tensor_id = 0
         for recv_expert_info in self.recv_expert_list:
-            local_expert_to_replace, buffer_tensor_id = recv_expert_info
-            self.eplb_adaptor.do_update_expert_weight(self.layer_id, local_expert_to_replace, buffer_tensor_id)
+            global_expert_id_to_recv, local_expert_to_replace, buffer_tensor_id = recv_expert_info
+            self.eplb_adaptor.do_update_expert_weight(
+                self.layer_id,
+                local_expert_to_replace,
+                buffer_tensor_id,
+                global_expert_id_to_recv,
+            )
 
         logger.debug(
             "[eplb/d2d_loader] Layer %s D2D transfer completed, updated_experts=%s",

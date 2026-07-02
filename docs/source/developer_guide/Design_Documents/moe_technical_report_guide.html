@@ -1,0 +1,966 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MoE 与 EPLB 技术导读</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --paper: #ffffff;
+      --ink: #1f2933;
+      --muted: #5f6c7b;
+      --line: #d9e1e8;
+      --teal: #0f766e;
+      --blue: #2563eb;
+      --amber: #b45309;
+      --red: #b91c1c;
+      --code: #eef3f7;
+      --shadow: 0 16px 40px rgba(31, 41, 51, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 16px/1.72 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      letter-spacing: 0;
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    code {
+      padding: 0.08rem 0.32rem;
+      border-radius: 4px;
+      background: var(--code);
+      color: #223044;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+      border-right: 1px solid var(--line);
+      background: #fff;
+      padding: 28px 22px;
+    }
+
+    .sidebar h2 {
+      margin: 0 0 16px;
+      font-size: 18px;
+      line-height: 1.35;
+    }
+
+    .sidebar p {
+      margin: 0 0 22px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .nav {
+      display: grid;
+      gap: 6px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .nav a {
+      display: block;
+      padding: 7px 9px;
+      border-radius: 6px;
+      color: #344054;
+      font-size: 14px;
+    }
+
+    .nav a:hover {
+      background: #eef3f7;
+      text-decoration: none;
+    }
+
+    main {
+      min-width: 0;
+      padding: 40px 48px 72px;
+    }
+
+    .article {
+      max-width: 1120px;
+      margin: 0 auto;
+    }
+
+    header {
+      padding: 22px 0 26px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 34px;
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--teal);
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 0 0 14px;
+      font-size: clamp(32px, 4vw, 52px);
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    .lead {
+      max-width: 900px;
+      margin: 0;
+      color: #44515f;
+      font-size: 18px;
+      line-height: 1.75;
+    }
+
+    section {
+      margin: 44px 0 0;
+      padding: 34px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+
+    h2 {
+      margin: 0 0 18px;
+      font-size: 28px;
+      line-height: 1.28;
+    }
+
+    h3 {
+      margin: 32px 0 12px;
+      font-size: 20px;
+      line-height: 1.35;
+    }
+
+    h4 {
+      margin: 22px 0 8px;
+      font-size: 16px;
+    }
+
+    p {
+      margin: 12px 0;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 22px;
+    }
+
+    .summary-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 15px;
+      background: #fbfcfe;
+    }
+
+    .summary-card strong {
+      display: block;
+      margin-bottom: 6px;
+      color: #111827;
+    }
+
+    .summary-card span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .figure {
+      margin: 22px 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .figure img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .figure figcaption {
+      padding: 10px 14px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .note {
+      margin: 18px 0;
+      padding: 14px 16px;
+      border-left: 4px solid var(--teal);
+      border-radius: 6px;
+      background: #ecfdf5;
+      color: #164e46;
+    }
+
+    .warn {
+      border-left-color: var(--amber);
+      background: #fffbeb;
+      color: #7c3f00;
+    }
+
+    .formula {
+      margin: 16px 0;
+      padding: 16px;
+      border: 1px solid #cad5df;
+      border-radius: 8px;
+      background: #f8fafc;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      white-space: nowrap;
+    }
+
+    .table-wrap {
+      margin: 18px 0;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 680px;
+    }
+
+    th,
+    td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #f0f4f8;
+      color: #223044;
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 10px;
+      margin: 18px 0;
+    }
+
+    .step {
+      position: relative;
+      min-height: 88px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #f9fbfd;
+    }
+
+    .step b {
+      display: block;
+      margin-bottom: 6px;
+      color: #111827;
+    }
+
+    .step span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .compare {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin: 18px 0;
+    }
+
+    .policy {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 15px;
+      background: #fbfcfe;
+    }
+
+    .policy h4 {
+      margin-top: 0;
+    }
+
+    .policy ul,
+    .checklist {
+      margin: 8px 0 0;
+      padding-left: 18px;
+    }
+
+    .policy li,
+    .checklist li {
+      margin: 6px 0;
+    }
+
+    .mini-diagram {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      align-items: stretch;
+      margin: 18px 0;
+    }
+
+    .mini-diagram div {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fff;
+      min-height: 82px;
+    }
+
+    .mini-diagram strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--teal);
+    }
+
+    .footer {
+      color: var(--muted);
+      text-align: center;
+      padding: 30px 0 0;
+      font-size: 14px;
+    }
+
+    @media (max-width: 980px) {
+      .layout {
+        display: block;
+      }
+
+      .sidebar {
+        position: static;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      main {
+        padding: 26px 18px 48px;
+      }
+
+      section {
+        padding: 22px;
+      }
+
+      .summary-grid,
+      .compare,
+      .mini-diagram {
+        grid-template-columns: 1fr;
+      }
+
+      .flow {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .flow {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h2>MoE / EPLB 导读</h2>
+      <p>面向新人阅读的版本：先建立概念，再解释为什么需要 EPLB，最后回到 vLLM Ascend 的实现和演进方向。</p>
+      <ul class="nav">
+        <li><a href="#overview">总览</a></li>
+        <li><a href="#moe-ep">1. MoE 与 EP</a></li>
+        <li><a href="#deepseek-flow">2. DeepSeek 数据流</a></li>
+        <li><a href="#latency">3. 耗时模型</a></li>
+        <li><a href="#eplb">4. EPLB 与冗余专家</a></li>
+        <li><a href="#engineering">5. 工程闭环</a></li>
+        <li><a href="#policies">6. 三类策略</a></li>
+        <li><a href="#shared">7. 共享专家混置</a></li>
+        <li><a href="#future">8. 现状与演进</a></li>
+      </ul>
+    </aside>
+
+    <main>
+      <article class="article">
+        <header id="overview">
+          <p class="eyebrow">vLLM Ascend MoE Technical Guide</p>
+          <h1>从 MoE 执行路径理解 EPLB</h1>
+          <p class="lead">
+            这份 HTML 不是 Markdown 原文的逐段搬运，而是把文章主线重新压缩成一条学习路径：
+            MoE 如何把 token 路由到专家，EP 如何把专家分布到 NPU，负载不均衡为什么会变成尾延迟，
+            以及 vLLM Ascend 里的 EPLB 如何通过冗余专家、映射表、热度采集、策略计算和权重迁移来降低这种尾延迟。
+          </p>
+
+          <div class="summary-grid">
+            <div class="summary-card">
+              <strong>MoE 的核心</strong>
+              <span>参数量变大，但每个 token 只激活少量 routed experts。</span>
+            </div>
+            <div class="summary-card">
+              <strong>EP 的核心</strong>
+              <span>专家分布在不同 rank，token 需要 dispatch 到专家所在位置。</span>
+            </div>
+            <div class="summary-card">
+              <strong>EPLB 的核心</strong>
+              <span>不改 gate 语义，只改 logical expert 到 physical expert 的执行映射。</span>
+            </div>
+            <div class="summary-card">
+              <strong>工程难点</strong>
+              <span>动态 map 切换、D2D 权重迁移、量化路径适配必须同时正确。</span>
+            </div>
+          </div>
+        </header>
+
+        <section id="moe-ep">
+          <h2>1. MoE 与 EP：先把“专家在哪里”想清楚</h2>
+          <p>
+            MoE 可以把 Transformer FFN 层理解成一组可选择的子网络。Gate 为每个 token 选择少数几个
+            routed experts，shared experts 则通常对所有 token 都生效。这样做的收益是扩大模型容量；
+            代价是执行路径从普通矩阵乘法变成了“路由、通信、专家计算、聚合”的组合流程。
+          </p>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-1-1-moe-structure.png" alt="MoE 的结构">
+            <figcaption>图 1 MoE 的基本结构：gate 负责选择专家，routed experts 承担稀疏计算，shared experts 承担通用能力。</figcaption>
+          </figure>
+
+          <p>
+            EP（Expert Parallelism）解决的是专家参数如何分布式部署。设 EP world size 为 <code>P</code>，
+            routed expert 总数为 <code>E</code>，没有冗余时每个 rank 理想持有 <code>E/P</code> 个专家。
+            当 token 被 gate 选中某个专家后，它必须被发送到该专家所在 rank，本地计算完成后再回到原 token 顺序。
+          </p>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-1-2-expert-parallelism.png" alt="EP 部署方式">
+            <figcaption>图 2 EP 把专家按 expert id 分布到不同 rank；token 路由结果决定通信方向。</figcaption>
+          </figure>
+
+          <div class="note">
+            新人可以先记住一句话：MoE 决定“token 应该找哪个专家”，EP 决定“这个专家实际在哪个设备上”，EPLB 决定“热点专家是否需要多个物理副本一起分担”。
+          </div>
+        </section>
+
+        <section id="deepseek-flow">
+          <h2>2. DeepSeek-V3.2 MoE 数据流：一条 token 副本的旅程</h2>
+          <p>
+            DeepSeek-V3.2 的 FFN/MoE 部分可按 DeepSeek-V3 系列的 routed experts + shared experts 结构理解。
+            关键配置包括 <code>hidden_size=7168</code>、<code>moe_intermediate_size=2048</code>、
+            <code>n_routed_experts=256</code>、<code>n_shared_experts=1</code>、
+            <code>num_experts_per_tok=8</code>、<code>n_group=8</code>、<code>topk_group=4</code>、
+            <code>routed_scaling_factor=2.5</code>。前 3 层使用 dense FFN，后续层进入 MoE FFN。
+          </p>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-1-3-deepseek-moe-dataflow.png" alt="DeepSeek-V3.2 MoE 数据流">
+            <figcaption>图 3 DeepSeek-V3.2 MoE 的主数据流：gate、dispatch、all-to-all、GMM、combine 与 shared branch 最终相加。</figcaption>
+          </figure>
+
+          <div class="flow" aria-label="MoE routed expert flow">
+            <div class="step"><b>Gate</b><span>从 256 个 routed experts 中为 token 选 top-k。</span></div>
+            <div class="step"><b>Dispatch</b><span>把每个 token 扩展成 K 个专家副本。</span></div>
+            <div class="step"><b>All-to-All</b><span>把副本发到目标专家所在 EP rank。</span></div>
+            <div class="step"><b>Expert FFN</b><span>本地按 expert 分组执行 GMM + SwiGLU + GMM。</span></div>
+            <div class="step"><b>Combine</b><span>按原 token 顺序和 routing weight 聚合。</span></div>
+            <div class="step"><b>Final Add</b><span>输出为 shared branch + 2.5 × routed branch。</span></div>
+          </div>
+
+          <h3>常用符号和典型规模</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>符号</th>
+                  <th>含义</th>
+                  <th>A3 常见示例</th>
+                  <th>为什么重要</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>P</code></td>
+                  <td>EP world size</td>
+                  <td>16</td>
+                  <td>决定专家分布和 all-to-all 的 rank 数。</td>
+                </tr>
+                <tr>
+                  <td><code>T</code></td>
+                  <td>单 rank 输入 token 数</td>
+                  <td>64</td>
+                  <td>决定本 rank 发起多少路由请求。</td>
+                </tr>
+                <tr>
+                  <td><code>K</code></td>
+                  <td>每个 token 选择的 routed experts 数</td>
+                  <td>8</td>
+                  <td>单 rank routed token 副本数为 <code>N=T×K=512</code>。</td>
+                </tr>
+                <tr>
+                  <td><code>H</code></td>
+                  <td>hidden size</td>
+                  <td>7168</td>
+                  <td>决定 token hidden state 和通信 payload 大小。</td>
+                </tr>
+                <tr>
+                  <td><code>I</code></td>
+                  <td>expert intermediate size</td>
+                  <td>2048</td>
+                  <td>决定 expert FFN 的 GMM 计算规模。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>关键 shape 摘要</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>阶段</th>
+                  <th>输入/输出</th>
+                  <th>典型形状</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Gate logits</td>
+                  <td><code>X × W_g</code></td>
+                  <td><code>[64,7168] → [64,256]</code></td>
+                </tr>
+                <tr>
+                  <td>Top-k routing</td>
+                  <td><code>expert_ids</code>、<code>expert_weights</code></td>
+                  <td><code>[64,8]</code></td>
+                </tr>
+                <tr>
+                  <td>Dispatch expand</td>
+                  <td>token 副本</td>
+                  <td><code>[512,7168]</code></td>
+                </tr>
+                <tr>
+                  <td>Local expert grouping</td>
+                  <td>按本地 expert 连续排列</td>
+                  <td><code>[M_r,7168]</code>，均衡时 <code>M_r≈512</code></td>
+                </tr>
+                <tr>
+                  <td>GMM 1 / SwiGLU / GMM 2</td>
+                  <td>本地 expert FFN</td>
+                  <td><code>[M_r,7168] → [M_r,4096] → [M_r,2048] → [M_r,7168]</code></td>
+                </tr>
+                <tr>
+                  <td>Final output</td>
+                  <td>shared 与 routed 聚合</td>
+                  <td><code>Y = Y_shared + 2.5 × Y_routed</code></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>
+            在 vLLM Ascend 中，这条逻辑路径可能被算子融合压缩：例如 <code>npu_moe_distribute_dispatch_v2</code>
+            会融合 dispatch、permute 和部分 all-to-all；A3 W8A8 decode 场景还可能使用
+            <code>dispatch_gmm_combine_decode</code> 把 dispatch、GMM、SwiGLU、combine 放入 fused kernel。
+            但无论融合到什么程度，概念上仍然是“路由到专家、专家计算、再聚合回来”。
+          </p>
+        </section>
+
+        <section id="latency">
+          <h2>3. 耗时模型：为什么负载不均衡会变成尾延迟</h2>
+          <p>
+            MoE 层的尾延迟主要由两块共同决定：本地 expert FFN 计算和跨 rank all-to-all 通信。
+            两者都会被专家热度长尾放大。这里的模型是解释性模型，不是硬件 kernel 的精确性能模型。
+          </p>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-1-latency-source-overview.png" alt="MoE 层耗时来源">
+            <figcaption>图 4 MoE 层的耗时来源：专家计算和通信都会等待最慢路径。</figcaption>
+          </figure>
+
+          <h3>3.1 Expert FFN 计算延迟</h3>
+          <p>
+            设第 <code>p</code> 个 rank 实际处理的 routed token 副本数为 <code>n_p</code>，总副本数为
+            <code>N=sum(n_p)</code>。平均负载是 <code>N/P</code>，expert 侧负载不均衡比定义为：
+          </p>
+          <div class="formula">LIR_exp = max_p(n_p) / (N / P)</div>
+          <p>
+            所以最慢 rank 实际承担的 token 数可以写成 <code>(N/P) × LIR_exp</code>。MoE 需要等最慢 rank
+            完成，因而 FFN 延迟可近似拆成固定开销、主 GEMM 线性项和带宽/缓存/算子效率带来的非理想项：
+          </p>
+          <div class="formula">L_FFN ≈ L_ovh^ffn + c_comp × (N/P) × LIR_exp + c_bw × sqrt((N/P) × LIR_exp)</div>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-2-ffn-latency-slowest-rank.png" alt="Expert FFN 最慢 rank">
+            <figcaption>图 5 Expert FFN 的关键不是平均 rank，而是负载最高的 rank。</figcaption>
+          </figure>
+
+          <h3>3.2 All-to-All 通信延迟</h3>
+          <p>
+            Dispatch 阶段可抽象为流量矩阵 <code>m_i,j</code>：源 rank <code>i</code> 发往目标 rank
+            <code>j</code> 的数据量。单条通信可近似为：
+          </p>
+          <div class="formula">L_i,j = m_i,j / B + L_ovh^comm</div>
+          <p>
+            All-to-all 的整体等待由最慢通信方向主导。当源侧发送近似均匀，而目标侧接收由专家热度决定时，
+            最大 pair 流量可粗略看成 <code>(N/P²) × LIR_exp</code>，因此通信项为：
+          </p>
+          <div class="formula">L_comm ≈ L_ovh^comm + N × LIR_exp / (B × P²)</div>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-3-all-to-all-traffic-matrix.png" alt="All-to-All 流量矩阵">
+            <figcaption>图 6 All-to-All 流量矩阵中的热点目标 rank 会抬高通信尾延迟。</figcaption>
+          </figure>
+
+          <h3>3.3 统一结论</h3>
+          <p>
+            将 FFN 与通信相加后，<code>LIR_exp</code> 同时出现在计算项和通信项里。EPLB 的优化目标因此非常清楚：
+            不一定直接减少 token 总数，而是让同一层中的 routed token 更均匀地落到不同 rank。
+          </p>
+          <div class="formula">L_MoE = L_FFN + L_comm，其中 LIR_exp 是最直接的优化抓手</div>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-4-unified-latency-model.png" alt="统一延迟模型">
+            <figcaption>图 7 统一延迟模型：专家负载不均衡同时放大计算路径和通信路径。</figcaption>
+          </figure>
+        </section>
+
+        <section id="eplb">
+          <h2>4. EPLB 与冗余专家：不改语义，只改执行映射</h2>
+          <p>
+            EPLB 的出发点是：真实请求中的专家访问通常是长尾分布，少数专家持续更热。如果没有冗余，一个
+            logical expert 只能由一个 physical expert 承担，单个热点专家无法拆分；如果有冗余副本，同一个
+            logical expert 的 token 可以被分发到多个 rank。
+          </p>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-5-eplb-motivation-before-after.png" alt="EPLB 优化前后的负载变化">
+            <figcaption>图 8 EPLB 的目标是降低热点 rank 的峰值负载，而不是改变模型输出语义。</figcaption>
+          </figure>
+
+          <h3>logical expert 与 physical expert</h3>
+          <p>
+            Gate 输出的是 logical expert id。运行时通过 <code>log2phy</code> 把 logical id 映射到一个 physical slot，
+            再通过 <code>expert_map</code> 找到该 physical slot 所在 rank。多个 physical slots 可以持有同一个
+            logical expert 的权重副本，这就是冗余专家。
+          </p>
+
+          <div class="mini-diagram">
+            <div><strong>Gate</strong>输出 logical id，例如 <code>E2</code></div>
+            <div><strong>log2phy</strong>选择具体 physical expert 副本</div>
+            <div><strong>expert_map</strong>确定副本属于哪个 rank 和 local slot</div>
+            <div><strong>Dispatch</strong>把 token 发到对应 rank</div>
+            <div><strong>FFN</strong>使用相同权重语义完成计算</div>
+          </div>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-6-redundant-expert-logical-physical-map.png" alt="冗余专家映射">
+            <figcaption>图 9 冗余专家映射：同一个 logical expert 可以拥有多个 physical 副本。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>对象</th>
+                  <th>它描述什么</th>
+                  <th>新人容易误解的点</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>global_expert_map</code></td>
+                  <td>全局 placement：每个 EP rank 放了哪些 logical experts。</td>
+                  <td>里面既可能有原始 expert，也可能有冗余副本。</td>
+                </tr>
+                <tr>
+                  <td><code>expert_map</code></td>
+                  <td>本 rank 的 local expert slot 映射。</td>
+                  <td>它服务于本地执行和 dispatch 判断，不是 gate 的输出。</td>
+                </tr>
+                <tr>
+                  <td><code>log2phy</code></td>
+                  <td>logical expert 到 physical expert 的运行时映射。</td>
+                  <td>它让 gate 语义与物理副本分离，是冗余专家能工作的关键。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="warn">
+            冗余专家不是免费的：副本需要额外显存，动态调整还要搬迁权重。因此策略必须同时考虑负载均衡收益和迁移成本。
+          </div>
+        </section>
+
+        <section id="engineering">
+          <h2>5. vLLM Ascend 的 EPLB 工程闭环</h2>
+          <p>
+            当前实现不是简单地“把专家重新排一下”。完整链路包括初始化 placement、前向执行映射、
+            真实负载采集、策略计算、权重 D2D 迁移，以及最终切换运行时 map。
+          </p>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-7-eplb-runtime-closed-loop.png" alt="EPLB 运行时闭环">
+            <figcaption>图 10 EPLB 在线闭环：采集真实 workload，再把策略结果转换成新的 placement 和权重布局。</figcaption>
+          </figure>
+
+          <div class="flow">
+            <div class="step"><b>建表</b><span><code>init_eplb_config</code> 生成或加载初始 placement。</span></div>
+            <div class="step"><b>路由</b><span>router 仍输出 logical experts，执行前转成 physical ids。</span></div>
+            <div class="step"><b>采集</b><span><code>AscendFusedMoE</code> 累加本地 physical expert token 数。</span></div>
+            <div class="step"><b>聚合</b><span><code>EplbUpdator</code> 周期性 all-gather 各 rank 热度。</span></div>
+            <div class="step"><b>决策</b><span><code>EplbWorker</code> 调 policy 得到新 placement。</span></div>
+            <div class="step"><b>切换</b><span><code>D2DExpertWeightLoader</code> 搬权重并更新 map。</span></div>
+          </div>
+
+          <h3>三种使用模式</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>模式</th>
+                  <th>行为</th>
+                  <th>适用场景</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>动态模式</td>
+                  <td>在线采集热度，周期性计算新 placement，并迁移权重。</td>
+                  <td>专家热度随业务流量变化明显，需要持续调平。</td>
+                </tr>
+                <tr>
+                  <td>录制模式</td>
+                  <td>运行过程中得到较优 expert map，并写到 <code>expert_map_record_path</code>。</td>
+                  <td>先用真实流量找部署，再把结果固化。</td>
+                </tr>
+                <tr>
+                  <td>静态模式</td>
+                  <td>从 <code>expert_map_path</code> 直接加载已有 placement。</td>
+                  <td>希望避免在线重排和权重搬迁成本。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="policies">
+          <h2>6. 三类 EPLB 策略：全局重排、局部修正、历史风险</h2>
+          <p>
+            代码通过 <code>eplb_policy_type</code> 选择策略。三类策略都围绕同一个目标：在不丢专家、
+            不把同一 logical expert 的副本放到同一 rank 的前提下，降低 rank 负载峰值。
+          </p>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-8-eplb-policy-comparison.png" alt="EPLB 策略对比">
+            <figcaption>图 11 三类策略的取舍：重排范围、迁移成本、历史感知能力不同。</figcaption>
+          </figure>
+
+          <div class="compare">
+            <div class="policy">
+              <h4>Policy 1：DefaultEplb</h4>
+              <ul>
+                <li>先把 physical workload 合并成 logical expert 热度 <code>H_e</code>。</li>
+                <li>如果存在冗余 slot，反复给“单副本平均负载最高”的 expert 加副本。</li>
+                <li>按负载从高到低，把 expert 放入当前累计负载最低的合法 rank。</li>
+                <li>没有冗余时仍可重排不同 expert 的 rank 位置，但不能拆分单个热点 expert。</li>
+              </ul>
+            </div>
+            <div class="policy">
+              <h4>Policy 2：SwiftBalanceEplb</h4>
+              <ul>
+                <li>先计算当前层 imbalance，低于 <code>1.01</code> 可跳过。</li>
+                <li>保留第一次出现的 expert，把后续重复位置视为冗余槽。</li>
+                <li>优先重填冗余槽，再做受限 rank 间交换。</li>
+                <li>只有新 imbalance 更低才接受部署，适合在线动态更新。</li>
+              </ul>
+            </div>
+            <div class="policy">
+              <h4>Policy 3：FlashLB</h4>
+              <ul>
+                <li>维护 workload 时间窗口，而不是只看最近一次采样。</li>
+                <li>用均值、方差、协方差估计 expert 风险负载。</li>
+                <li>通过 <code>FlashTree</code> 搜索副本数，再用 LPT 思路放置。</li>
+                <li>用匹配算法减少搬迁量，只更新收益为正的 layer。</li>
+              </ul>
+            </div>
+          </div>
+
+          <h3>Policy 1：贪心装箱</h3>
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-9-default-eplb-greedy-packing.png" alt="DefaultEplb 贪心装箱">
+            <figcaption>图 12 DefaultEplb 的核心：热专家优先处理，每次落到当前最空闲的合法 rank。</figcaption>
+          </figure>
+          <div class="formula">H_e = sum(workload[p,s] where placement[p,s] = e)</div>
+          <div class="formula">平均单副本负载 = H_e / (r_e + 1)</div>
+
+          <h3>Policy 2：少搬一点，也要变好一点</h3>
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-10-swiftbalance-local-adjustment.png" alt="SwiftBalanceEplb 局部调整">
+            <figcaption>图 13 SwiftBalanceEplb 通过冗余槽重填和有限交换减少在线重排成本。</figcaption>
+          </figure>
+          <div class="formula">R_p = sum(H_e / c_e for e in rank(p))</div>
+          <div class="formula">imbalance = max_p(R_p) / average_p(R_p)</div>
+          <p>
+            它的副本收益更新是代码启发式：<code>H̃_e ← H̃_e × (a_e + 2)/(a_e + 3)</code>。
+            这不是理论最优公式，而是用来估计“新增副本后单副本压力下降”。
+          </p>
+
+          <h3>Policy 3：把历史波动也算进去</h3>
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-2-11-flashlb-history-aware-placement.png" alt="FlashLB 历史感知部署">
+            <figcaption>图 14 FlashLB 同时关心谁热、谁波动大、哪些专家经常一起变热。</figcaption>
+          </figure>
+          <div class="formula">W_e = μ_e + z × σ_e</div>
+          <div class="formula">risk_p = μ_p + z × sqrt(var_p)</div>
+          <p>
+            如果两个 experts 的协方差高，说明它们常常一起变热，把它们放到同一 rank 会提高峰值风险。
+            因此 FlashLB 的 placement 不只是均值装箱，还会避开高相关热点组合。
+          </p>
+        </section>
+
+        <section id="shared">
+          <h2>7. 共享专家混置：让 shared expert 进入统一 placement</h2>
+          <p>
+            普通结构里，routed branch 和 shared branch 分开执行，最后相加。共享专家混置的思路是把 shared expert
+            追加成特殊 expert slot，让它也进入 <code>global_expert_map</code>、<code>expert_map</code> 和
+            <code>log2phy</code> 管理。语义上它仍然对所有 token 生效，工程上则复用 MoE 的 dispatch/GMM/combine 链路。
+          </p>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-3-1-shared-expert-mix-placement-principle.png" alt="共享专家混置原理">
+            <figcaption>图 15 共享专家混置把 shared expert 从独立分支转入统一 MoE placement。</figcaption>
+          </figure>
+
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-3-2-shared-expert-mix-placement-implementation.png" alt="共享专家混置工程链路">
+            <figcaption>图 16 工程实现上，mix placement 贯穿模型初始化、专家选择、映射表和权重加载。</figcaption>
+          </figure>
+
+          <ul class="checklist">
+            <li><code>mix_placement</code> 与 shared expert DP、shared expert 多流 overlap 互斥，因为这些路径都会改变 shared branch 执行方式。</li>
+            <li>DeepSeek-V4 相关模型启用混置后，不再创建独立 <code>shared_experts</code> 模块，而是把 <code>n_shared_experts</code> 传给 <code>FusedMoE</code>。</li>
+            <li><code>generate_global_placement</code> 先处理 routed/redundant experts，再把 shared expert id 追加到 local placement。</li>
+            <li>支持混置的量化路径会在 routed top-k 后追加 shared expert id 和固定 routing weight。</li>
+            <li>权重加载需要把 checkpoint 中的 <code>mlp.shared_experts</code> 映射到追加出来的 physical slot。</li>
+          </ul>
+        </section>
+
+        <section id="future">
+          <h2>8. 当前实现的问题与后续设计方向</h2>
+          <p>
+            EPLB 已经形成闭环，但仍有三个工程问题值得持续收敛：MoE 执行路径复杂、EPLB 控制面与上游接口脱节、
+            以及量化方法对 EPLB 的适配成本随格式数量线性增长。
+          </p>
+
+          <h3>8.1 MoE 执行路径过深</h3>
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-4-1-moe-path-complexity.png" alt="MoE 执行路径复杂度">
+            <figcaption>图 17 当前 MoE 路径需要同时处理通信、计算、量化、EPLB 和 overlap 分支。</figcaption>
+          </figure>
+          <p>
+            当前 <code>AscendFusedMoE</code> 沿用上游 <code>FusedMoE</code> 接口形态，同时扩展 NPU 执行逻辑。
+            通信侧有 <code>AllGather</code>、<code>AlltoAll</code>、<code>MC2</code>、<code>FusedMC2</code>；
+            计算侧又受量化格式、fused operator、dynamic EPLB 等条件影响。后续更合理的方向是把 MoE
+            前向拆成稳定阶段：<code>route → dispatch → expert_compute → combine → finalize</code>，
+            再由 capability registry 或 plan builder 选择具体算子组合。
+          </p>
+
+          <h3>8.2 EPLB 控制面需要标准化</h3>
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-4-2-eplb-control-plane-refactor.png" alt="EPLB 控制面重构">
+            <figcaption>图 18 EPLB 应从分散 hook 演进为 MoE 层标准 placement capability。</figcaption>
+          </figure>
+          <p>
+            当前 EPLB 逻辑分布在配置、runner、MoE layer、parallel group 和 adaptor 中。配置上也存在多个布尔开关、
+            路径参数和环境变量组合出的隐式状态。长期看，应定义 <code>ExpertPlacementManager</code> 或
+            <code>EplbRuntime</code> 这样的稳定接口，让 MoE 层统一暴露 placement、映射、负载统计、权重视图和 map 更新。
+            模式也应收敛为 <code>off</code>、<code>static_map</code>、<code>record</code>、<code>dynamic</code> 这类互斥状态。
+          </p>
+
+          <h3>8.3 量化适配需要统一契约</h3>
+          <figure class="figure">
+            <img src="assets/moe_technical_report/fig-4-3-quantization-eplb-contract.png" alt="量化方法与 EPLB 统一契约">
+            <figcaption>图 19 量化方法应声明专家权重 bundle，而不是各自手写 EPLB 迁移适配。</figcaption>
+          </figure>
+          <p>
+            vLLM Ascend 支持 W8A8、W4A8、W4A16、MXFP4、MXFP8、FP8 等 MoE 量化路径。当前每增加一种量化格式，
+            往往也要补 <code>expert_map</code>、<code>log2phy</code>、冗余专家数、weight list 和 D2D 权重名表。
+            后续应把这些依赖压缩到统一的 <code>ExpertWeightBundle</code> 与 <code>MoERoutingContext</code>：
+            前者描述每个 physical expert 的 weight、scale、bias、layout metadata 和可迁移 buffer；
+            后者在量化无关层完成路由映射，让量化方法专注于 local expert MLP 计算。
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>问题</th>
+                  <th>当前风险</th>
+                  <th>推荐演进</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>MoE 路径复杂</td>
+                  <td>组合分支多，覆盖和定位成本高。</td>
+                  <td>阶段化接口 + 执行计划 + 能力注册。</td>
+                </tr>
+                <tr>
+                  <td>EPLB 控制面分散</td>
+                  <td>上游 MoE 重构后多处重新适配。</td>
+                  <td>统一 placement runtime，收敛运行模式。</td>
+                </tr>
+                <tr>
+                  <td>量化适配重复</td>
+                  <td>新增量化方法时 EPLB 代码同步增长。</td>
+                  <td>ExpertWeightBundle + MoERoutingContext + contract tests。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <p class="footer">
+          本页基于 vLLM Ascend MoE 技术文档重新整理，图片复用当前文档 assets，内容按新人阅读顺序重新组织。
+        </p>
+      </article>
+    </main>
+  </div>
+</body>
+</html>

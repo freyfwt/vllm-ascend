@@ -2080,6 +2080,9 @@ class NPUModelRunner(GPUModelRunner):
                         return EMPTY_MODEL_RUNNER_OUTPUT
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+                # Stage selection must use real scheduled tokens; graph/DP padding
+                # can make decode batches look like prefill batches.
+                num_tokens_for_eplb_stage = int(num_scheduled_tokens_np.sum())
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 (
                     logits_indices,
@@ -2140,7 +2143,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
                 if self.dynamic_eplb:
-                    self.update_eplb_heat_collection_status(num_tokens_padded)
+                    self.update_eplb_heat_collection_status(num_tokens_for_eplb_stage)
 
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
@@ -3452,10 +3455,10 @@ class NPUModelRunner(GPUModelRunner):
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
-        
+
         if self.dynamic_eplb:
-            self.update_eplb_heat_collection_status(num_tokens_padded)
-        
+            self.update_eplb_heat_collection_status(num_tokens)
+
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None
         attn_metadata: PerLayerAttnMetadata | None = None
@@ -3681,16 +3684,16 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_updator.set_adaptor(self.eplb_adaptor)
             self.eplb_updator.warm_up_eplb()
 
-    def update_eplb_heat_collection_status(self, num_tokens_padded: int):
+    def update_eplb_heat_collection_status(self, num_tokens: int):
         if self.eplb_heat_collection_stage == "prefill":
             # collect eplb heat for prefill requests.
-            self.eplb_heat_collection_status = num_tokens_padded > self.eplb_pd_thresholds
+            self.eplb_heat_collection_status = num_tokens > self.eplb_pd_thresholds
         elif self.eplb_heat_collection_stage == "decode":
             # collect eplb heat for decode requests.
-            self.eplb_heat_collection_status = num_tokens_padded <= self.eplb_pd_thresholds
+            self.eplb_heat_collection_status = num_tokens <= self.eplb_pd_thresholds
         else:
             # collect eplb heat for all requests.
-            self.eplb_heat_collection_status =  True
+            self.eplb_heat_collection_status = True
 
     def load_model(self) -> None:
         load_model_start_time = time.perf_counter()

@@ -217,6 +217,43 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         self.assertEqual(runner.input_ids.cpu.tolist(), [11, -1, -1, -1])
 
 
+class TestNPUModelRunnerEplbHeatCollection(unittest.TestCase):
+    def _build_runner(self, stage):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.eplb_heat_collection_stage = stage
+        runner.eplb_pd_thresholds = 8
+        runner.eplb_heat_collection_status = False
+        return runner
+
+    def test_decode_stage_collects_actual_decode_tokens(self):
+        runner = self._build_runner("decode")
+
+        runner.update_eplb_heat_collection_status(num_tokens=2)
+
+        self.assertTrue(runner.eplb_heat_collection_status)
+
+    def test_decode_stage_skips_prefill_tokens(self):
+        runner = self._build_runner("decode")
+
+        runner.update_eplb_heat_collection_status(num_tokens=32)
+
+        self.assertFalse(runner.eplb_heat_collection_status)
+
+    def test_prefill_stage_skips_decode_tokens(self):
+        runner = self._build_runner("prefill")
+
+        runner.update_eplb_heat_collection_status(num_tokens=2)
+
+        self.assertFalse(runner.eplb_heat_collection_status)
+
+    def test_all_stage_always_collects(self):
+        runner = self._build_runner("all")
+
+        runner.update_eplb_heat_collection_status(num_tokens=32)
+
+        self.assertTrue(runner.eplb_heat_collection_status)
+
+
 class TestNPUModelRunnerDebugger(unittest.TestCase):
     def _build_runner(self, debugger=None):
         runner = NPUModelRunner.__new__(NPUModelRunner)

@@ -718,9 +718,7 @@ else:
                 if eplb_perf_logger.enabled:
                     moe_load_end_event.record()
                     self.moe_load_perf_events.append(
-                        eplb_perf_logger.perf_event(
-                            "moe_load_update_execute", moe_load_start_event, moe_load_end_event
-                        )
+                        eplb_perf_logger.perf_event("moe_load_update_execute", moe_load_start_event, moe_load_end_event)
                     )
 
             routed_out = _EXTRA_CTX.moe_comm_method.finalize(

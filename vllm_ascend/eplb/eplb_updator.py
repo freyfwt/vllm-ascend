@@ -183,10 +183,30 @@ class EplbUpdator:
         if self.multi_stage:
             moe_load = moe_load.permute(2, 0, 1, 3)
 
+        self._log_moe_load_diagnostics(moe_load)
         self.shared_dict["moe_load"] = moe_load
         logger.debug("[eplb/updator] Updated shared_dict['moe_load'] shape=%s", moe_load.shape)
 
         return moe_load
+
+    def _log_moe_load_diagnostics(self, moe_load: torch.Tensor):
+        if self.rank_id != 0 or moe_load.numel() == 0:
+            return
+
+        layer_dim = 1 if self.multi_stage else 0
+        reduction_dims = tuple(dim for dim in range(moe_load.ndim) if dim != layer_dim)
+        layer_sums = moe_load.sum(dim=reduction_dims)
+        zero_layers = torch.where(layer_sums == 0)[0]
+        logger.info(
+            "[eplb/updator] Gathered moe load diagnostics: "
+            "shape=%s dtype=%s min=%s max=%s zero_layers=%s layer_sums=%s",
+            tuple(moe_load.shape),
+            moe_load.dtype,
+            moe_load.min().item(),
+            moe_load.max().item(),
+            zero_layers.tolist(),
+            layer_sums.tolist(),
+        )
 
     def warm_up_eplb(self):
         logger.info("[eplb/updator] Starting EPLB warm-up, rank=%s, world_size=%s", self.rank_id, self.world_size)

@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from vllm_ascend.ascend_config import EplbPerfLogMode
 import vllm_ascend.eplb.eplb_updator as eplb_updator
+from vllm_ascend.ascend_config import EplbPerfLogMode
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 
 
@@ -85,6 +85,48 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
         self.assertEqual(moe_load.shape, (100, 58, self.world_size, 8))
         self.assertTrue("moe_load" in self.updator.shared_dict)
         self.assertEqual(moe_load.device.type, "cpu")
+
+    def test_compute_and_set_moe_load_logs_zero_layers(self):
+        self.updator.multi_stage = False
+        self.adaptor.get_rank_expert_workload.return_value = torch.tensor([[1, 2], [0, 0]], dtype=torch.int64)
+
+        with patch.object(eplb_updator.logger, "info") as mock_logger:
+            self.updator.compute_and_set_moe_load()
+
+        mock_logger.assert_called_once_with(
+            "[eplb/updator] Gathered moe load diagnostics: "
+            "shape=%s dtype=%s min=%s max=%s zero_layers=%s layer_sums=%s",
+            (2, self.world_size, 2),
+            torch.int64,
+            0,
+            2,
+            [1],
+            [12, 0],
+        )
+
+    def test_moe_load_diagnostics_uses_multi_stage_layer_dimension(self):
+        self.updator.multi_stage = True
+        moe_load = torch.tensor(
+            [
+                [[[1, 0]], [[0, 0]]],
+                [[[0, 2]], [[0, 0]]],
+            ],
+            dtype=torch.int32,
+        )
+
+        with patch.object(eplb_updator.logger, "info") as mock_logger:
+            self.updator._log_moe_load_diagnostics(moe_load)
+
+        mock_logger.assert_called_once_with(
+            "[eplb/updator] Gathered moe load diagnostics: "
+            "shape=%s dtype=%s min=%s max=%s zero_layers=%s layer_sums=%s",
+            (2, 2, 1, 2),
+            torch.int32,
+            0,
+            2,
+            [1],
+            [3, 0],
+        )
 
     def test_forward_before_flushes_pending_perf_events(self):
         self.updator.get_update_info_flag = MagicMock(return_value=False)

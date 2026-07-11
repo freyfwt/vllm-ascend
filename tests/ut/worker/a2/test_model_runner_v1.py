@@ -1,4 +1,7 @@
+import threading
+import time
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,6 +11,57 @@ from vllm.model_executor.layers.attention import MLAAttention
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+
+class TestAsyncLogitsFlightRecorder(unittest.TestCase):
+    @staticmethod
+    def _build_runner(max_records=2):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._async_flight_enabled = True
+        runner._async_flight_records = deque(maxlen=max_records)
+        runner._async_flight_lock = threading.Lock()
+        runner._async_flight_last_progress = time.monotonic()
+        runner._async_flight_last_progress_seq = 0
+        runner._async_flight_seq = 0
+        runner._async_flight_active_iteration = 4
+        runner._async_flight_armed = False
+        runner._async_flight_tp_rank = 3
+        runner.dp_rank = 1
+        return runner
+
+    def test_records_are_bounded_and_keep_latest_phases(self):
+        runner = self._build_runner()
+
+        runner._record_async_flight("first")
+        runner._record_async_flight("second")
+        runner._record_async_flight("third")
+
+        self.assertEqual(runner._async_flight_seq, 3)
+        self.assertEqual(
+            [record["phase"] for record in runner._async_flight_records],
+            ["second", "third"],
+        )
+        self.assertTrue(runner._async_flight_armed)
+
+    def test_tensor_descriptor_is_host_metadata_only(self):
+        tensor = torch.empty((8, 16), dtype=torch.bfloat16)
+
+        descriptor = NPUModelRunner._async_flight_tensor_descriptor(tensor)
+
+        self.assertEqual(descriptor["shape"], (8, 16))
+        self.assertEqual(descriptor["stride"], (16, 1))
+        self.assertEqual(descriptor["dtype"], "torch.bfloat16")
+        self.assertEqual(descriptor["storage_nbytes"], 8 * 16 * 2)
+
+    def test_int_array_summary_has_bounded_edges(self):
+        summary = NPUModelRunner._async_flight_int_array_summary(np.arange(12, dtype=np.int32))
+
+        self.assertEqual(summary["size"], 12)
+        self.assertEqual(summary["sum"], 66)
+        self.assertEqual(summary["min"], 0)
+        self.assertEqual(summary["max"], 11)
+        self.assertEqual(summary["head"], tuple(range(8)))
+        self.assertEqual(summary["tail"], tuple(range(4, 12)))
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):

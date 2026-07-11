@@ -17,11 +17,14 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import faulthandler
 import logging
 import math
 import sys
+import threading
 import time
-from collections import defaultdict
+import weakref
+from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -202,6 +205,11 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+ASYNC_LOGITS_FLIGHT_PREFIX = "[async-logits-flight]"
+ASYNC_LOGITS_FLIGHT_MAX_RECORDS = 256
+ASYNC_LOGITS_FLIGHT_DUMP_RECORDS = 96
+ASYNC_LOGITS_FLIGHT_STALL_SECONDS = 10.0
+ASYNC_LOGITS_FLIGHT_POLL_SECONDS = 1.0
 
 
 @dataclass
@@ -588,6 +596,31 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens: torch.Tensor | None = None
         self.cpu_slot_mapping = None
         self.sampling_done_event: torch.npu.Event | None = None
+        self._async_flight_enabled = bool(
+            self.use_async_scheduling
+            and self.is_kv_producer
+            and not self.is_kv_consumer
+        )
+        self._async_flight_records: deque[dict[str, Any]] = deque(
+            maxlen=ASYNC_LOGITS_FLIGHT_MAX_RECORDS
+        )
+        self._async_flight_lock = threading.Lock()
+        self._async_flight_last_progress = time.monotonic()
+        self._async_flight_last_progress_seq = 0
+        self._async_flight_last_dump_seq = -1
+        self._async_flight_seq = 0
+        self._async_flight_next_iteration = 0
+        self._async_flight_active_iteration = -1
+        self._async_flight_tp_rank = get_tp_group().rank_in_group
+        self._async_flight_armed = False
+        self._async_flight_stop = threading.Event()
+        self._async_flight_storage_owners: dict[int, dict[str, Any]] = {}
+        if getattr(self, "_async_flight_enabled", False):
+            threading.Thread(
+                target=self._async_flight_watchdog,
+                name="async-logits-flight-watchdog",
+                daemon=True,
+            ).start()
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -617,6 +650,216 @@ class NPUModelRunner(GPUModelRunner):
 
     def _sync_device(self) -> None:
         torch.npu.synchronize()
+
+    @staticmethod
+    def _async_flight_stream_id(stream: torch.npu.Stream) -> str:
+        stream_id = getattr(stream, "npu_stream", None)
+        return str(stream_id if stream_id is not None else stream)
+
+    @staticmethod
+    def _async_flight_tensor_descriptor(value: Any) -> dict[str, Any]:
+        if isinstance(value, tuple):
+            value = value[0]
+        if not isinstance(value, torch.Tensor):
+            return {"type": type(value).__name__}
+        storage = value.untyped_storage()
+        return {
+            "object_id": id(value),
+            "shape": tuple(value.shape),
+            "stride": tuple(value.stride()),
+            "dtype": str(value.dtype),
+            "data_ptr": value.data_ptr(),
+            "storage_ptr": storage.data_ptr(),
+            "storage_nbytes": storage.nbytes(),
+            "storage_offset": value.storage_offset(),
+            "python_refcount": sys.getrefcount(value),
+        }
+
+    @staticmethod
+    def _async_flight_int_array_summary(value: np.ndarray) -> dict[str, Any]:
+        flattened = np.asarray(value).reshape(-1)
+        size = flattened.size
+        edge_size = min(size, 8)
+        return {
+            "size": size,
+            "sum": int(flattened.sum()) if size else 0,
+            "min": int(flattened.min()) if size else None,
+            "max": int(flattened.max()) if size else None,
+            "head": tuple(int(item) for item in flattened[:edge_size]),
+            "tail": tuple(int(item) for item in flattened[-edge_size:]),
+        }
+
+    def _record_async_flight(
+        self,
+        phase: str,
+        *,
+        iteration: int | None = None,
+        heartbeat: bool = True,
+        **metadata: Any,
+    ) -> None:
+        if not getattr(self, "_async_flight_enabled", False):
+            return
+        now = time.monotonic()
+        with self._async_flight_lock:
+            self._async_flight_seq += 1
+            self._async_flight_records.append(
+                {
+                    "seq": self._async_flight_seq,
+                    "time_ns": time.monotonic_ns(),
+                    "iteration": (
+                        self._async_flight_active_iteration
+                        if iteration is None
+                        else iteration
+                    ),
+                    "phase": phase,
+                    "dp_rank": self.dp_rank,
+                    "tp_rank": self._async_flight_tp_rank,
+                    **metadata,
+                }
+            )
+            if heartbeat:
+                self._async_flight_last_progress = now
+                self._async_flight_last_progress_seq = self._async_flight_seq
+                self._async_flight_armed = True
+
+    def _track_async_flight_tensor(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        iteration: int,
+    ) -> dict[str, Any]:
+        descriptor = self._async_flight_tensor_descriptor(tensor)
+        storage_ptr = int(descriptor["storage_ptr"])
+        owner = {
+            "iteration": iteration,
+            "name": name,
+            "object_id": descriptor["object_id"],
+            "alive": True,
+        }
+        with self._async_flight_lock:
+            previous_owner = self._async_flight_storage_owners.get(storage_ptr)
+            self._async_flight_storage_owners[storage_ptr] = owner
+        self._record_async_flight(
+            "tensor_track",
+            iteration=iteration,
+            tensor_name=name,
+            tensor=descriptor,
+            previous_storage_owner=(
+                previous_owner.copy() if previous_owner is not None else None
+            ),
+        )
+        weakref.finalize(
+            tensor,
+            NPUModelRunner._async_flight_tensor_finalized,
+            weakref.ref(self),
+            iteration,
+            name,
+            int(descriptor["object_id"]),
+            storage_ptr,
+        )
+        return descriptor
+
+    @staticmethod
+    def _async_flight_tensor_finalized(
+        runner_ref: "weakref.ReferenceType[NPUModelRunner]",
+        iteration: int,
+        name: str,
+        object_id: int,
+        storage_ptr: int,
+    ) -> None:
+        runner = runner_ref()
+        if runner is None or not getattr(runner, "_async_flight_enabled", False):
+            return
+        with runner._async_flight_lock:
+            owner = runner._async_flight_storage_owners.get(storage_ptr)
+            if owner is not None and owner["object_id"] == object_id:
+                owner["alive"] = False
+        runner._record_async_flight(
+            "tensor_finalize",
+            iteration=iteration,
+            heartbeat=False,
+            tensor_name=name,
+            object_id=object_id,
+            storage_ptr=storage_ptr,
+        )
+
+    def _dump_async_flight(self, reason: str, idle_seconds: float = 0.0) -> None:
+        if not getattr(self, "_async_flight_enabled", False):
+            return
+        with self._async_flight_lock:
+            records = list(self._async_flight_records)[
+                -ASYNC_LOGITS_FLIGHT_DUMP_RECORDS:
+            ]
+            sequence = self._async_flight_seq
+            progress_sequence = self._async_flight_last_progress_seq
+            self._async_flight_last_dump_seq = progress_sequence
+        logger.error(
+            "%s DUMP reason=%s idle_seconds=%.3f seq=%d records=%d",
+            ASYNC_LOGITS_FLIGHT_PREFIX,
+            reason,
+            idle_seconds,
+            sequence,
+            len(records),
+        )
+        for record in records:
+            logger.error("%s RECORD %s", ASYNC_LOGITS_FLIGHT_PREFIX, record)
+        try:
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            logger.exception(
+                "%s failed to dump Python thread stacks",
+                ASYNC_LOGITS_FLIGHT_PREFIX,
+            )
+
+    def _async_flight_watchdog(self) -> None:
+        while not self._async_flight_stop.wait(
+            ASYNC_LOGITS_FLIGHT_POLL_SECONDS
+        ):
+            now = time.monotonic()
+            with self._async_flight_lock:
+                armed = self._async_flight_armed
+                idle_seconds = now - self._async_flight_last_progress
+                progress_sequence = self._async_flight_last_progress_seq
+                already_dumped = (
+                    progress_sequence == self._async_flight_last_dump_seq
+                )
+            if (
+                armed
+                and not already_dumped
+                and idle_seconds >= ASYNC_LOGITS_FLIGHT_STALL_SECONDS
+            ):
+                self._dump_async_flight("host_progress_stalled", idle_seconds)
+
+    def _record_async_flight_logits_enqueued(
+        self,
+        hidden_states: torch.Tensor,
+        logits_indices: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        logits: torch.Tensor | None,
+    ) -> None:
+        if not getattr(self, "_async_flight_enabled", False):
+            return
+        iteration = self._async_flight_active_iteration
+        sample_descriptor = self._track_async_flight_tensor(
+            "sample_hidden_states",
+            sample_hidden_states,
+            iteration,
+        )
+        logits_descriptor = (
+            self._track_async_flight_tensor("logits", logits, iteration)
+            if isinstance(logits, torch.Tensor)
+            else None
+        )
+        self._record_async_flight(
+            "logits_enqueued",
+            hidden=self._async_flight_tensor_descriptor(hidden_states),
+            logits_indices=self._async_flight_tensor_descriptor(
+                logits_indices
+            ),
+            sample_hidden_states=sample_descriptor,
+            logits=logits_descriptor,
+            stream=self._async_flight_stream_id(torch.npu.current_stream()),
+        )
 
     def _set_up_drafter(self):
         # Set up speculative decoding.
@@ -687,10 +930,26 @@ class NPUModelRunner(GPUModelRunner):
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
         if self.dp_size == 1:
+            if not is_draft_model:
+                self._record_async_flight(
+                    "target_dp_sync",
+                    local_tokens=num_tokens,
+                    tokens_across_dp=(num_tokens,),
+                    allow_dp_padding=allow_dp_padding,
+                    skipped_reason="dp_size_1",
+                )
             return num_tokens, None, cudagraph_mode
 
         if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
             num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
+            if not is_draft_model:
+                self._record_async_flight(
+                    "target_dp_sync",
+                    local_tokens=num_tokens,
+                    tokens_across_dp=tuple([num_tokens] * self.dp_size),
+                    allow_dp_padding=allow_dp_padding,
+                    skipped_reason="configured_skip_allreduce",
+                )
             return num_tokens, num_tokens_after_padding, cudagraph_mode
 
         # On certain devices, CPU-side all_reduce may return dirty data. 
@@ -712,6 +971,20 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = packed_tensor[0, :]
         max_tokens_across_dp = int(num_tokens_across_dp.max().item())
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
+
+        if not is_draft_model:
+            self._record_async_flight(
+                "target_dp_sync",
+                local_tokens=num_tokens,
+                tokens_across_dp=tuple(
+                    int(value) for value in num_tokens_across_dp.tolist()
+                ),
+                max_tokens_across_dp=max_tokens_across_dp,
+                allow_dp_padding=allow_dp_padding,
+                requested_cudagraph_mode=str(cudagraph_mode),
+                synced_cudagraph_mode=str(synced_cudagraph_mode),
+                metadata_device=device_str,
+            )
 
         # Create a tensor for num_tokens_after_padding
         if allow_dp_padding or is_draft_model:
@@ -2058,6 +2331,27 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if getattr(self, "_async_flight_enabled", False):
+            self._async_flight_active_iteration = (
+                self._async_flight_next_iteration
+            )
+            self._async_flight_next_iteration += 1
+            previous_indices = getattr(self, "logits_indices", None)
+            self._record_async_flight(
+                "execute_enter",
+                scheduler_total_tokens=(
+                    scheduler_output.total_num_scheduled_tokens
+                ),
+                execute_model_state_pending=self.execute_model_state is not None,
+                previous_indices=(
+                    self._async_flight_tensor_descriptor(previous_indices)
+                    if isinstance(previous_indices, torch.Tensor)
+                    else None
+                ),
+                stream=self._async_flight_stream_id(
+                    torch.npu.current_stream()
+                ),
+            )
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -2196,14 +2490,18 @@ class NPUModelRunner(GPUModelRunner):
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-                (
-                    logits_indices,
-                    spec_decode_metadata,
-                    total_num_scheduled_tokens,
-                ) = self._prepare_inputs(
-                    scheduler_output,
-                    num_scheduled_tokens_np,
-                )
+                try:
+                    (
+                        logits_indices,
+                        spec_decode_metadata,
+                        total_num_scheduled_tokens,
+                    ) = self._prepare_inputs(
+                        scheduler_output,
+                        num_scheduled_tokens_np,
+                    )
+                except Exception:
+                    self._dump_async_flight("prepare_inputs_exception")
+                    raise
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
@@ -2233,6 +2531,83 @@ class NPUModelRunner(GPUModelRunner):
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+
+                if getattr(self, "_async_flight_enabled", False):
+                    query_start_loc_cpu = self.query_start_loc.np[
+                        : num_reqs + 1
+                    ]
+                    query_start_loc_summary = (
+                        self._async_flight_int_array_summary(
+                            query_start_loc_cpu
+                        )
+                    )
+                    use_spec_decode = bool(
+                        scheduler_output.scheduled_spec_decode_tokens
+                    )
+                    expected_indices_summary = (
+                        self._async_flight_int_array_summary(
+                            query_start_loc_cpu[1:] - 1
+                        )
+                        if self.pcp_size <= 1 and not use_spec_decode
+                        else None
+                    )
+                    indices_descriptor = self._track_async_flight_tensor(
+                        "logits_indices",
+                        logits_indices,
+                        self._async_flight_active_iteration,
+                    )
+                    runner_indices = getattr(self, "logits_indices", None)
+                    self._record_async_flight(
+                        "inputs_prepared",
+                        scheduler_total_tokens=(
+                            scheduler_output.total_num_scheduled_tokens
+                        ),
+                        prepared_total_tokens=total_num_scheduled_tokens,
+                        padded_tokens=batch_desc.num_tokens,
+                        num_tokens_across_dp=(
+                            tuple(
+                                int(value)
+                                for value in num_tokens_across_dp.tolist()
+                            )
+                            if num_tokens_across_dp is not None
+                            else None
+                        ),
+                        num_reqs=num_reqs,
+                        per_request_tokens=(
+                            self._async_flight_int_array_summary(
+                                num_scheduled_tokens_np
+                            )
+                        ),
+                        query_start_loc_cpu=query_start_loc_summary,
+                        expected_indices=expected_indices_summary,
+                        logits_indices=indices_descriptor,
+                        runner_logits_indices=(
+                            self._async_flight_tensor_descriptor(
+                                runner_indices
+                            )
+                            if isinstance(runner_indices, torch.Tensor)
+                            else None
+                        ),
+                        indices_is_runner_indices=(
+                            logits_indices is self.logits_indices
+                        ),
+                        query_start_loc_gpu=(
+                            self._async_flight_tensor_descriptor(
+                                self.query_start_loc.gpu
+                            )
+                        ),
+                        stream=self._async_flight_stream_id(
+                            torch.npu.current_stream()
+                        ),
+                        prepare_inputs_event_id=(
+                            id(self.prepare_inputs_event)
+                            if self.prepare_inputs_event is not None
+                            else None
+                        ),
+                        enable_sp=enable_sp(self.vllm_config),
+                        enable_sp_by_pass=enable_sp_by_pass(),
+                        cudagraph_mode=str(cudagraph_mode),
+                    )
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
@@ -2423,9 +2798,13 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            try:
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
+            except Exception:
+                self._dump_async_flight("model_forward_exception")
+                raise
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2460,8 +2839,18 @@ class NPUModelRunner(GPUModelRunner):
                     self._finalize_dump_data()
                     return output
 
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                try:
+                    sample_hidden_states = hidden_states[logits_indices]
+                    logits = self.model.compute_logits(sample_hidden_states)
+                except Exception:
+                    self._dump_async_flight("index_or_logits_exception")
+                    raise
+                self._record_async_flight_logits_enqueued(
+                    hidden_states,
+                    logits_indices,
+                    sample_hidden_states,
+                    logits,
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -2473,6 +2862,13 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     sample_hidden_states = hidden_states[logits_indices]
                     logits = self.model.compute_logits(sample_hidden_states)
+
+                self._record_async_flight_logits_enqueued(
+                    hidden_states,
+                    logits_indices,
+                    sample_hidden_states,
+                    logits,
+                )
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -2510,6 +2906,16 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if getattr(self, "_async_flight_enabled", False):
+            self._record_async_flight(
+                "sample_enter",
+                execute_model_state_present=(
+                    self.execute_model_state is not None
+                ),
+                stream=self._async_flight_stream_id(
+                    torch.npu.current_stream()
+                ),
+            )
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
         pp = get_pp_group()
@@ -2555,8 +2961,22 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
-        with record_function_or_nullcontext("sample_token"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+        try:
+            with record_function_or_nullcontext("sample_token"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
+        except Exception:
+            self._dump_async_flight("sampler_exception")
+            raise
+        if getattr(self, "_async_flight_enabled", False):
+            self._record_async_flight(
+                "sampler_enqueued",
+                sampled_token_ids=self._async_flight_tensor_descriptor(
+                    sampler_output.sampled_token_ids
+                ),
+                stream=self._async_flight_stream_id(
+                    torch.npu.current_stream()
+                ),
+            )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -2735,6 +3155,15 @@ class NPUModelRunner(GPUModelRunner):
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
+        if getattr(self, "_async_flight_enabled", False):
+            self._record_async_flight(
+                "sample_return",
+                sampled_token_ids_cpu_object_id=id(
+                    async_output.sampled_token_ids_cpu
+                ),
+            )
+            with self._async_flight_lock:
+                self._async_flight_armed = False
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -2995,8 +3424,82 @@ class NPUModelRunner(GPUModelRunner):
                 forward_context, num_tokens_padded, positions
             )
 
+        raw_hidden_states = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        )
+        flight_enabled = getattr(self, "_async_flight_enabled", False)
+        raw_descriptor = None
+        restore_stream_before = None
+        if flight_enabled:
+            restore_stream_before = self._async_flight_stream_id(
+                torch.npu.current_stream()
+            )
+            raw_descriptor = (
+                self._track_async_flight_tensor(
+                    "hidden_raw",
+                    raw_hidden_states,
+                    self._async_flight_active_iteration,
+                )
+                if isinstance(raw_hidden_states, torch.Tensor)
+                else self._async_flight_tensor_descriptor(raw_hidden_states)
+            )
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+        if flight_enabled:
+            restore_stream_after = self._async_flight_stream_id(
+                torch.npu.current_stream()
+            )
+            restored_hidden_states = (
+                hidden_states[0]
+                if isinstance(hidden_states, tuple)
+                else hidden_states
+            )
+            if isinstance(restored_hidden_states, torch.Tensor):
+                restored_descriptor = (
+                    raw_descriptor
+                    if restored_hidden_states is raw_hidden_states
+                    else self._track_async_flight_tensor(
+                        "hidden_restored",
+                        restored_hidden_states,
+                        self._async_flight_active_iteration,
+                    )
+                )
+            else:
+                restored_descriptor = self._async_flight_tensor_descriptor(
+                    restored_hidden_states
+                )
+            self._record_async_flight(
+                "model_forward_enqueued",
+                raw_hidden=raw_descriptor,
+                restored_hidden=restored_descriptor,
+                flash_comm_v1_enabled=(
+                    forward_context.flash_comm_v1_enabled
+                ),
+                flashcomm_v2_enabled=getattr(
+                    forward_context,
+                    "flashcomm_v2_enabled",
+                    None,
+                ),
+                pad_size=getattr(forward_context, "pad_size", None),
+                padded_length=getattr(
+                    forward_context,
+                    "padded_length",
+                    None,
+                ),
+                num_tokens=getattr(forward_context, "num_tokens", None),
+                max_tokens_across_dp=getattr(
+                    forward_context,
+                    "max_tokens_across_dp",
+                    None,
+                ),
+                padded_num_tokens=getattr(
+                    forward_context,
+                    "padded_num_tokens",
+                    None,
+                ),
+                restore_stream_before=restore_stream_before,
+                restore_stream_after=restore_stream_after,
+            )
         return hidden_states
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:

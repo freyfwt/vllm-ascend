@@ -48,6 +48,11 @@ class TestEplbUpdatorComputeAndSetMoeLoad(unittest.TestCase):
 
         # ====================== 3. Mock EplbUpdator ======================
         self.eplb_config = MagicMock()
+        self.eplb_config.eplb_policy_type = 2
+        self.eplb_config.expert_map_path = None
+        self.eplb_config.expert_heat_collection_interval = 600
+        self.eplb_config.algorithm_execution_interval = 50
+        self.eplb_config.expert_map_record_path = None
         self.eplb_config.eplb_perf_log_mode = EplbPerfLogMode.DISABLED.value
         self.loader = MagicMock()
         self.eplb_process = MagicMock()

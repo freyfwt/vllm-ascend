@@ -44,6 +44,9 @@ class EplbWorker:
         self.tp_size = tp_size
         self.rank_id = get_ep_group().rank_in_group
         self.multi_stage = policy_type == 3
+        self.zero_load_layers: set[int] = set()
+        self.last_current_imbalance: dict[int, float] = {}
+        self.last_update_imbalance: dict[int, float] = {}
 
     def do_update(self, cycle_round: int = 0):
         # put data in to queue
@@ -80,28 +83,26 @@ class EplbWorker:
             else:
                 hotness = self._calculate_hotness(old_placement, load_info)
             # ms-service-metric begin: expose EPLB hotness details for metrics collection.
-            current_mean, current_max, current_imbalance_list = self._compute_imbalance(
-                old_placement, hotness, return_list=True
-            )
-            update_mean, update_max, update_imbalance_list = self._compute_imbalance(
-                new_placement, hotness, return_list=True
-            )
-            self.latest_expert_hotness = {
-                "current_mean": current_mean,
-                "current_max": current_max,
-                "update_mean": update_mean,
-                "update_max": update_max,
-                "current_imbalance_list": current_imbalance_list,
-                "update_imbalance_list": update_imbalance_list,
-            }
+            self._update_hotness_metrics(old_placement, new_placement, hotness)
             # ms-service-metric end.
             logger.info(
                 "[eplb/worker] Expert hotness imbalance, current: mean=%.3f max=%.3f, updated: mean=%.3f max=%.3f",
-                current_mean,
-                current_max,
-                update_mean,
-                update_max,
+                self.latest_expert_hotness["current_mean"],
+                self.latest_expert_hotness["current_max"],
+                self.latest_expert_hotness["update_mean"],
+                self.latest_expert_hotness["update_max"],
             )
+            if self.zero_load_layers:
+                logger.info(
+                    "[eplb/worker] Zero-load group imbalance, layers=%s current_zero_layers=%s, "
+                    "current: mean=%.3f max=%.3f, updated: mean=%.3f max=%.3f",
+                    self.latest_expert_hotness["zero_load_layers"],
+                    self.latest_expert_hotness["current_zero_load_layers"],
+                    self.latest_expert_hotness["zero_group_current_mean"],
+                    self.latest_expert_hotness["zero_group_current_max"],
+                    self.latest_expert_hotness["zero_group_update_mean"],
+                    self.latest_expert_hotness["zero_group_update_max"],
+                )
 
         if not torch.is_tensor(new_placement):
             new_placement = torch.tensor(new_placement)
@@ -304,25 +305,84 @@ class EplbWorker:
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
 
     @staticmethod
-    def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray, return_list: bool = False):
+    def _compute_imbalance(
+        deployment_all_layer,
+        hotness_all_layer: np.ndarray,
+        previous_imbalance: dict[int, float] | None = None,
+    ):
         imbalance_list = []
         deployment_all_layer = np.array(deployment_all_layer)
-        for deployment, hotness in zip(deployment_all_layer, hotness_all_layer):
+        for layer_id, (deployment, hotness) in enumerate(zip(deployment_all_layer, hotness_all_layer)):
             counts = np.bincount(deployment.reshape(-1), minlength=hotness.shape[0])
 
             unit_hotness = np.divide(hotness, counts, out=np.zeros_like(hotness, dtype=float), where=counts != 0)
 
             stage_load = unit_hotness[deployment].sum(-1)
-            stage_par = stage_load.max() / stage_load.mean()
+            mean_load = stage_load.mean()
+            if mean_load == 0:
+                stage_par = 1.0 if previous_imbalance is None else previous_imbalance.get(layer_id, 1.0)
+            else:
+                stage_par = stage_load.max() / mean_load
             imbalance_list.append(stage_par)
 
         max_val = max(imbalance_list)
         mean_val = sum(imbalance_list) / len(imbalance_list)
-        # ms-service-metric begin: optionally expose per-layer imbalance without recomputing it.
-        if return_list:
-            return mean_val, max_val, imbalance_list
-        # ms-service-metric end.
-        return mean_val, max_val
+        return mean_val, max_val, imbalance_list
+
+    @staticmethod
+    def _summarize_imbalance(imbalance_list: list[float], layer_ids: list[int]) -> tuple[float, float]:
+        if not layer_ids:
+            return 1.0, 1.0
+        values = [imbalance_list[layer_id] for layer_id in layer_ids]
+        return sum(values) / len(values), max(values)
+
+    def _update_hotness_metrics(self, old_placement, new_placement, hotness: np.ndarray) -> None:
+        current_zero_load_layers = set(np.flatnonzero(~np.any(hotness, axis=1)).tolist())
+        self.zero_load_layers.update(current_zero_load_layers)
+
+        _, _, current_imbalance_list = self._compute_imbalance(
+            old_placement,
+            hotness,
+            previous_imbalance=self.last_current_imbalance,
+        )
+        _, _, update_imbalance_list = self._compute_imbalance(
+            new_placement,
+            hotness,
+            previous_imbalance=self.last_update_imbalance,
+        )
+
+        for layer_id in range(len(current_imbalance_list)):
+            if layer_id not in current_zero_load_layers:
+                self.last_current_imbalance[layer_id] = current_imbalance_list[layer_id]
+                self.last_update_imbalance[layer_id] = update_imbalance_list[layer_id]
+
+        zero_load_layers = sorted(self.zero_load_layers)
+        normal_layers = [
+            layer_id for layer_id in range(len(current_imbalance_list)) if layer_id not in self.zero_load_layers
+        ]
+        current_mean, current_max = self._summarize_imbalance(current_imbalance_list, normal_layers)
+        update_mean, update_max = self._summarize_imbalance(update_imbalance_list, normal_layers)
+        zero_group_current_mean, zero_group_current_max = self._summarize_imbalance(
+            current_imbalance_list, zero_load_layers
+        )
+        zero_group_update_mean, zero_group_update_max = self._summarize_imbalance(
+            update_imbalance_list, zero_load_layers
+        )
+
+        self.latest_expert_hotness = {
+            "current_mean": current_mean,
+            "current_max": current_max,
+            "update_mean": update_mean,
+            "update_max": update_max,
+            "current_imbalance_list": current_imbalance_list,
+            "update_imbalance_list": update_imbalance_list,
+            "zero_load_layers": zero_load_layers,
+            "current_zero_load_layers": sorted(current_zero_load_layers),
+            "zero_group_current_mean": zero_group_current_mean,
+            "zero_group_current_max": zero_group_current_max,
+            "zero_group_update_mean": zero_group_update_mean,
+            "zero_group_update_max": zero_group_update_max,
+        }
 
     @staticmethod
     def _calculate_hotness(deployment_all_layer, moe_load_all_layer):

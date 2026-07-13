@@ -20,14 +20,14 @@ class TestEplbRebalancePolicies(unittest.TestCase):
     def test_swift_balance_rebalance_experts(self, mock_count):
         swift_policy = PolicyFactory.generate_policy(2)
         _, _, new_placement = swift_policy.rebalance_experts(self.current_expert_table, self.expert_workload.sum(0))
-        update_mean, _ = EplbWorker._compute_imbalance(new_placement, self.hotness)
+        update_mean, _, _ = EplbWorker._compute_imbalance(new_placement, self.hotness)
 
         self.assertLessEqual(update_mean, 1.08)
 
     def test_flashlb_rebalance_experts(self):
         flashlb_policy = PolicyFactory.generate_policy(3)
         _, _, new_placement = flashlb_policy.rebalance_experts(self.current_expert_table, self.expert_workload)
-        update_mean, _ = EplbWorker._compute_imbalance(new_placement, self.hotness)
+        update_mean, _, _ = EplbWorker._compute_imbalance(new_placement, self.hotness)
 
         self.assertLessEqual(update_mean, 1.1)
 

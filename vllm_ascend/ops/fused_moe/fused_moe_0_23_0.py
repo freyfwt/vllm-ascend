@@ -36,7 +36,6 @@ from vllm_ascend.ops.fused_moe.fused_moe import (
     MoERunner,
     QuantType,
     VllmEplbAdaptor,
-    eplb_perf_logger,
     get_ascend_config,
     get_compressed_expert_map,
     get_current_vllm_config,
@@ -249,7 +248,6 @@ class AscendFusedMoE(FusedMoE):
             )
         if self.dynamic_eplb:
             self.multi_stage = False
-            self.moe_load_perf_events = []
             self.moe_load = torch.zeros(self.local_num_experts, dtype=torch.int64).npu()
             if eplb_config.eplb_policy_type == 3:
                 self.multi_stage = True
@@ -379,16 +377,6 @@ class AscendFusedMoE(FusedMoE):
             self.moe_load.zero_()
         if self.multi_stage:
             self.load_counter.zero_()
-
-    def _log_ready_moe_load_perf_events(self):
-        pending_perf_events = []
-        for perf_event in self.moe_load_perf_events:
-            _, _, _, end_event = perf_event
-            if end_event.query():
-                eplb_perf_logger.log_npu_event(perf_event)
-            else:
-                pending_perf_events.append(perf_event)
-        self.moe_load_perf_events = pending_perf_events
 
     def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states: torch.Tensor):
         """NOTE(Yizhou): This is to override the parent class method. In `mc2commimpl`,
@@ -528,11 +516,6 @@ class AscendFusedMoE(FusedMoE):
         )
 
         if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
-            if eplb_perf_logger.enabled:
-                self._log_ready_moe_load_perf_events()
-                moe_load_start_event = torch.npu.Event(enable_timing=True)
-                moe_load_end_event = torch.npu.Event(enable_timing=True)
-                moe_load_start_event.record()
             expert_tokens = fused_experts_results.expert_tokens
             group_list_type = fused_experts_results.group_list_type
             assert expert_tokens is not None and group_list_type is not None, (
@@ -551,11 +534,6 @@ class AscendFusedMoE(FusedMoE):
                 self.load_counter.add_(1)
             else:
                 self.moe_load.add_(local_load)
-            if eplb_perf_logger.enabled:
-                moe_load_end_event.record()
-                self.moe_load_perf_events.append(
-                    eplb_perf_logger.perf_event("moe_load_update_execute", moe_load_start_event, moe_load_end_event)
-                )
 
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,

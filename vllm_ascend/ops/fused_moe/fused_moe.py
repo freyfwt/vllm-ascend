@@ -37,7 +37,6 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
-from vllm_ascend.eplb.perf_logger import eplb_perf_logger
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
@@ -427,7 +426,6 @@ else:
 
             self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
             self.multi_stage = False
-            self.moe_load_perf_events = []
             self.moe_load = torch.zeros(local_num_experts, dtype=torch.int64).npu()
             if self.dynamic_eplb and eplb_config.expert_heat_collection_interval > 1:
                 self.multi_stage = True
@@ -534,16 +532,6 @@ else:
             vllm_config = get_current_vllm_config()
             hf_config = getattr(vllm_config.model_config, "hf_config", None)
             return getattr(hf_config, "model_type", None) == "gpt_oss"
-
-        def _log_ready_moe_load_perf_events(self):
-            pending_perf_events = []
-            for perf_event in self.moe_load_perf_events:
-                _, _, _, end_event = perf_event
-                if end_event.query():
-                    eplb_perf_logger.log_npu_event(perf_event)
-                else:
-                    pending_perf_events.append(perf_event)
-            self.moe_load_perf_events = pending_perf_events
 
         @property
         def is_internal_router(self) -> bool:
@@ -692,11 +680,6 @@ else:
             )
 
             if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
-                if eplb_perf_logger.enabled:
-                    self._log_ready_moe_load_perf_events()
-                    moe_load_start_event = torch.npu.Event(enable_timing=True)
-                    moe_load_end_event = torch.npu.Event(enable_timing=True)
-                    moe_load_start_event.record()
                 expert_tokens = fused_experts_results.expert_tokens
                 group_list_type = fused_experts_results.group_list_type
                 assert expert_tokens is not None and group_list_type is not None, (
@@ -715,11 +698,6 @@ else:
                     self.load_counter.add_(1)
                 else:
                     self.moe_load.add_(local_load)
-                if eplb_perf_logger.enabled:
-                    moe_load_end_event.record()
-                    self.moe_load_perf_events.append(
-                        eplb_perf_logger.perf_event("moe_load_update_execute", moe_load_start_event, moe_load_end_event)
-                    )
 
             routed_out = _EXTRA_CTX.moe_comm_method.finalize(
                 hidden_states=fused_experts_results.routed_out,

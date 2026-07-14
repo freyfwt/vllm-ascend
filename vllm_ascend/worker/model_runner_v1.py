@@ -261,6 +261,9 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+    batch_owned_indices_cpu: torch.Tensor | None
+    batch_owned_indices: torch.Tensor | None
+    proposer_token_indices: torch.Tensor | None
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -800,6 +803,46 @@ class NPUModelRunner(GPUModelRunner):
 
         return num_reqs_padded
 
+    def _make_batch_owned_indices(
+        self,
+        cu_num_tokens: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        indices_cpu = torch.empty(
+            cu_num_tokens.shape,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+        indices_cpu.numpy()[:] = cu_num_tokens - 1
+        indices = indices_cpu.to(
+            self.device,
+            non_blocking=True,
+            copy=True,
+        )
+        return indices_cpu, indices
+
+    @staticmethod
+    def _select_prefill_indices(
+        buffer_indices: torch.Tensor,
+        batch_owned_indices: torch.Tensor | None,
+        target_uses_graph: bool,
+        draft_uses_graph: bool,
+        has_drafter: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        target_indices = (
+            buffer_indices
+            if target_uses_graph or batch_owned_indices is None
+            else batch_owned_indices
+        )
+        if not has_drafter:
+            return target_indices, None
+        draft_indices = (
+            buffer_indices
+            if draft_uses_graph or batch_owned_indices is None
+            else batch_owned_indices
+        )
+        return target_indices, draft_indices
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -808,12 +851,18 @@ class NPUModelRunner(GPUModelRunner):
         torch.Tensor,
         SpecDecodeMetadata | None,
         int,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
     ]:
         """
         :return: tuple[
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
+            batch_owned_indices_cpu,
+            batch_owned_indices,
+            proposer_token_indices,
         ]
         """
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -1249,6 +1298,9 @@ class NPUModelRunner(GPUModelRunner):
             target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
             target.gpu[:, :total_num_scheduled_tokens] += drift
 
+        batch_owned_indices_cpu = None
+        batch_owned_indices = None
+        proposer_token_indices = None
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
@@ -1263,7 +1315,34 @@ class NPUModelRunner(GPUModelRunner):
                 logits_indices = self.pcp_manager.get_logits_indices(cu_num_tokens, num_reqs, tokens_original)
                 logits_indices = logits_indices.pin_memory().to(self.device, non_blocking=True)
             else:
-                logits_indices = self.query_start_loc.gpu[1 : num_reqs + 1] - 1
+                buffer_indices = self.query_start_loc.gpu[1 : num_reqs + 1] - 1
+                drafter = getattr(self, "drafter", None)
+                target_uses_graph = self._use_aclgraph()
+                draft_uses_graph = bool(
+                    drafter is not None
+                    and getattr(drafter, "use_cuda_graph", False)
+                )
+                needs_batch_owned_indices = (
+                    self.use_async_scheduling
+                    and (
+                        not target_uses_graph
+                        or (drafter is not None and not draft_uses_graph)
+                    )
+                )
+                if needs_batch_owned_indices:
+                    (
+                        batch_owned_indices_cpu,
+                        batch_owned_indices,
+                    ) = self._make_batch_owned_indices(cu_num_tokens)
+                logits_indices, proposer_token_indices = (
+                    self._select_prefill_indices(
+                        buffer_indices,
+                        batch_owned_indices,
+                        target_uses_graph,
+                        draft_uses_graph,
+                        drafter is not None,
+                    )
+                )
         else:
             # Get the number of draft tokens for each request.
             # Iterate over the dictionary rather than all requests since not all
@@ -1327,6 +1406,9 @@ class NPUModelRunner(GPUModelRunner):
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
+            batch_owned_indices_cpu,
+            batch_owned_indices,
+            proposer_token_indices,
         )
 
     def _preprocess(
@@ -1630,6 +1712,7 @@ class NPUModelRunner(GPUModelRunner):
         aux_hidden_states: torch.Tensor = None,
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
+        proposer_token_indices: torch.Tensor | None = None,
     ) -> list[list[int]] | None:
         if not self.drafter:
             # Speculative decoding is not enabled.
@@ -1806,7 +1889,7 @@ class NPUModelRunner(GPUModelRunner):
                     if self.use_aux_hidden_state_outputs:
                         target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
                 else:
-                    token_indices_to_sample = None
+                    token_indices_to_sample = proposer_token_indices
                     # input_ids can be None for multimodal models.
                     target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
                     target_positions = self._get_positions(num_scheduled_tokens)
@@ -2050,6 +2133,9 @@ class NPUModelRunner(GPUModelRunner):
                     logits_indices,
                     spec_decode_metadata,
                     total_num_scheduled_tokens,
+                    batch_owned_indices_cpu,
+                    batch_owned_indices,
+                    proposer_token_indices,
                 ) = self._prepare_inputs(
                     scheduler_output,
                     num_scheduled_tokens_np,
@@ -2347,6 +2433,9 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
+                batch_owned_indices_cpu,
+                batch_owned_indices,
+                proposer_token_indices,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -2397,6 +2486,9 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             batch_desc,
+            _batch_owned_indices_cpu,
+            _batch_owned_indices,
+            proposer_token_indices,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -2436,6 +2528,7 @@ class NPUModelRunner(GPUModelRunner):
                 aux_hidden_states,
                 sample_hidden_states,
                 batch_desc,
+                proposer_token_indices=proposer_token_indices,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 

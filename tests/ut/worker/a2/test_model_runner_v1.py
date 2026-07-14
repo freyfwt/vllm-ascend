@@ -143,10 +143,52 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.device = torch.device("cpu")
+        runner.pin_memory = False
         runner.vllm_config = MagicMock()
         runner.model_config = MagicMock()
         runner.use_compress = False
         return runner
+
+    def test_batch_owned_indices_do_not_alias_cumulative_tokens(self):
+        runner = self._build_runner()
+        cumulative_tokens = np.array([2, 7, 10], dtype=np.int32)
+
+        indices_cpu, indices = runner._make_batch_owned_indices(cumulative_tokens)
+        cumulative_tokens[:] = 99
+
+        self.assertEqual(indices_cpu.tolist(), [1, 6, 9])
+        self.assertEqual(indices.tolist(), [1, 6, 9])
+        self.assertNotEqual(indices_cpu.data_ptr(), indices.data_ptr())
+
+    def test_prefill_indices_are_selected_per_model_execution_mode(self):
+        buffer_indices = torch.tensor([10], dtype=torch.int32)
+        batch_owned_indices = torch.tensor([20], dtype=torch.int32)
+
+        for target_graph, draft_graph, expected_target, expected_draft in (
+            (False, False, batch_owned_indices, batch_owned_indices),
+            (False, True, batch_owned_indices, buffer_indices),
+            (True, False, buffer_indices, batch_owned_indices),
+            (True, True, buffer_indices, buffer_indices),
+        ):
+            target_indices, draft_indices = NPUModelRunner._select_prefill_indices(
+                buffer_indices,
+                batch_owned_indices,
+                target_graph,
+                draft_graph,
+                has_drafter=True,
+            )
+            self.assertIs(target_indices, expected_target)
+            self.assertIs(draft_indices, expected_draft)
+
+        target_indices, draft_indices = NPUModelRunner._select_prefill_indices(
+            buffer_indices,
+            batch_owned_indices,
+            target_uses_graph=False,
+            draft_uses_graph=False,
+            has_drafter=False,
+        )
+        self.assertIs(target_indices, batch_owned_indices)
+        self.assertIsNone(draft_indices)
 
     @patch("vllm_ascend.worker.model_runner_v1.get_ascend_config")
     @patch("vllm_ascend.worker.model_runner_v1.lmhead_tp_enable")

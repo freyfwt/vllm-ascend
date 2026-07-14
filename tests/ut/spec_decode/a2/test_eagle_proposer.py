@@ -1484,7 +1484,9 @@ class TestEagleProposerPropose:
             assert torch.equal(self.proposer.query_start_loc_group[1][:4], torch.tensor([0, 1, 2, 3]))
             assert torch.equal(self.proposer.query_start_loc_group[2][:4], torch.tensor([0, 1, 2, 3]))
             assert self.proposer.query_start_loc_group[0].shape == torch.Size([8704])
-            assert torch.equal(self.proposer.token_indices_to_sample[:3], torch.tensor([3, 16, 29]))
+            runnable_token_indices = self.proposer._runnable.call_args.kwargs["token_indices_to_sample"]
+            assert torch.equal(runnable_token_indices, torch.tensor([3, 16, 29]))
+            assert runnable_token_indices.data_ptr() != self.proposer.token_indices_to_sample.data_ptr()
             assert self.proposer.token_indices_to_sample.shape == torch.Size([1024])
 
     # prefill or decode

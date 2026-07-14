@@ -990,8 +990,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
-        self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
-        self.token_indices_to_sample[token_indices_to_sample_len:].fill_(0)
+        if aclgraph_runtime_mode != CUDAGraphMode.NONE:
+            self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
+            self.token_indices_to_sample[token_indices_to_sample_len:].fill_(0)
+            token_indices_to_sample = self.token_indices_to_sample[:token_indices_to_sample_len]
 
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0],
@@ -1015,7 +1017,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             model_inputs: dict[str, Any] = {
                 "num_input_tokens": num_input_tokens,
                 "batch_size": batch_size,
-                "token_indices_to_sample": self.token_indices_to_sample[:token_indices_to_sample_len],
+                "token_indices_to_sample": token_indices_to_sample,
                 "target_positions": target_positions,
                 "inputs_embeds": inputs_embeds,
                 "multi_steps_attn_metadata": multi_steps_attn_metadata,

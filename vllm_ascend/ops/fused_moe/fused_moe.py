@@ -31,13 +31,14 @@ from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,  # noqa: F401
     MoERunner,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
-from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+from vllm_ascend.eplb.core.eplb_utils import EplbLayout, build_eplb_layout
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
@@ -288,9 +289,59 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         return final_hidden_states
 
 
-class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+class AscendRoutedExperts(RoutedExperts):
+    """Create routed expert weights from the Ascend EPLB layout."""
+
     moe_counter = -1
 
+    def __init__(
+        self,
+        layer_name,
+        params_dtype,
+        moe_config,
+        quant_config,
+        expert_map_manager,
+        *args,
+        n_shared_experts: int = 0,
+        **kwargs,
+    ):
+        AscendRoutedExperts.moe_counter += 1
+        layer_id = AscendRoutedExperts.moe_counter
+        ascend_config = get_ascend_config()
+        mix_placement = getattr(ascend_config, "mix_placement", False)
+        if mix_placement:
+            moe_config.num_experts += n_shared_experts
+
+        vllm_config = get_current_vllm_config()
+        eplb_layout = build_eplb_layout(
+            ascend_config.eplb_config,
+            layer_id,
+            moe_config,
+            mix_placement,
+            n_shared_experts,
+            tp_size=vllm_config.parallel_config.tensor_parallel_size,
+        )
+
+        moe_config.global_redundant_expert_num = eplb_layout.num_redundant_experts
+        moe_config.num_local_experts = eplb_layout.num_local_experts
+        # Upstream creates ExpertMapManager before RoutedExperts. Update the
+        # construction-time placement before RoutedExperts allocates weights.
+        expert_map_manager._local_num_experts = eplb_layout.num_local_experts
+        expert_map_manager._expert_map = eplb_layout.local_expert_map
+
+        super().__init__(
+            layer_name,
+            params_dtype,
+            moe_config,
+            quant_config,
+            expert_map_manager,
+            *args,
+            **kwargs,
+        )
+        self.eplb_layout = eplb_layout
+
+
+class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     def __init__(
         self,
         layer_name,
@@ -378,36 +429,30 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self.multistream_overlap_shared_expert = (
             ascend_config.multistream_overlap_shared_expert and shared_experts is not None
         )
-        mix_placement = getattr(ascend_config, "mix_placement", False)
-
-        # EPLB initialization (Ascend-specific; mirrors old AscendFusedMoE logic).
-        AscendMoERunner.moe_counter += 1
-        self.moe_instance_id = AscendMoERunner.moe_counter
-
         eplb_config = ascend_config.eplb_config
+        eplb_layout: EplbLayout | None = getattr(routed_experts, "eplb_layout", None)
+        if eplb_layout is None:
+            if (
+                eplb_config.dynamic_eplb
+                or eplb_config.expert_map_path
+                or getattr(ascend_config, "mix_placement", False)
+            ):
+                raise RuntimeError("Dynamic EPLB requires AscendRoutedExperts to prepare the expert layout.")
+            eplb_layout = EplbLayout(
+                layer_id=-1,
+                global_expert_map=None,
+                local_expert_map=routed_experts.expert_map_manager.expert_map,
+                log2phy=None,
+                num_redundant_experts=0,
+                num_local_experts=routed_experts.local_num_experts,
+            )
 
-        if mix_placement:
-            moe_config.num_experts += n_shared_experts
-
-        (
-            self.global_expert_map,
-            self._expert_map,
-            self.log2phy,
-            self.global_redundant_expert_num,
-        ) = init_eplb_config(
-            eplb_config,
-            AscendMoERunner.moe_counter,
-            moe_config,
-            mix_placement,
-            n_shared_experts,
-            tp_size=vllm_config.parallel_config.tensor_parallel_size,
-        )
-
-        moe_config.global_redundant_expert_num = self.global_redundant_expert_num
-        local_num_experts = (moe_config.num_experts + self.global_redundant_expert_num) // moe_config.ep_size
-        moe_config.num_local_experts = local_num_experts
-        routed_experts.expert_map_manager._local_num_experts = local_num_experts
-        routed_experts.expert_map_manager._expert_map = self._expert_map
+        self.moe_instance_id = eplb_layout.layer_id
+        self.global_expert_map = eplb_layout.global_expert_map
+        self._expert_map = eplb_layout.local_expert_map
+        self.log2phy = eplb_layout.log2phy
+        self.global_redundant_expert_num = eplb_layout.num_redundant_experts
+        local_num_experts = eplb_layout.num_local_experts
 
         self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
         self.multi_stage = False

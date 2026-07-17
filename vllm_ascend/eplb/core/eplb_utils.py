@@ -17,11 +17,22 @@
 # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove eplb utils.
 import json
 from collections import defaultdict
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.expert_map_manager import determine_expert_map
+
+
+@dataclass(frozen=True)
+class EplbLayout:
+    layer_id: int
+    global_expert_map: torch.Tensor | None
+    local_expert_map: torch.Tensor | None
+    log2phy: torch.Tensor | None
+    num_redundant_experts: int
+    num_local_experts: int
 
 
 def expert_file_to_tensor(expert_map_path, layer_id):
@@ -105,6 +116,33 @@ def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num
     )
 
     return torch.stack(global_expert_map), local_expert_map, log2phy, n_redundant
+
+
+def build_eplb_layout(
+    eplb_config,
+    layer_id,
+    moe_config,
+    mix_placement=False,
+    num_shared_experts=0,
+    tp_size=None,
+):
+    global_expert_map, local_expert_map, log2phy, num_redundant_experts = init_eplb_config(
+        eplb_config,
+        layer_id,
+        moe_config,
+        mix_placement,
+        num_shared_experts,
+        tp_size,
+    )
+    num_local_experts = (moe_config.num_experts + num_redundant_experts) // moe_config.ep_size
+    return EplbLayout(
+        layer_id=layer_id,
+        global_expert_map=global_expert_map,
+        local_expert_map=local_expert_map,
+        log2phy=log2phy,
+        num_redundant_experts=num_redundant_experts,
+        num_local_experts=num_local_experts,
+    )
 
 
 def generate_log2phy_map(global_expert_map, ep_rank, tp_size: int | None = None):

@@ -56,6 +56,16 @@ EPLB_EXPERT_WEIGHT_NAMES = {
     (QuantType.W8A8MXFP, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
 }
 
+SWIFT_BALANCE_POLICY_TYPE = 2
+
+
+def _get_expert_buffer_count(num_local_experts: int, world_size: int, policy_type: int) -> int:
+    if policy_type == SWIFT_BALANCE_POLICY_TYPE:
+        # SwiftBalance limits each source/destination rank pair to one
+        # in-flight expert, so a rank can receive from at most every peer.
+        return min(num_local_experts, max(world_size - 1, 0))
+    return num_local_experts
+
 
 class VllmEplbAdaptor:
     _registered_moe_layers: list["torch.nn.Module"] = []
@@ -82,20 +92,28 @@ class VllmEplbAdaptor:
         self.num_dense_layers = getattr(self.config, "first_k_dense_replace", 0)
 
         self.moe_layers = VllmEplbAdaptor._registered_moe_layers
+        self.routed_expert_layers = [layer.routed_experts for layer in self.moe_layers]
         self.num_moe_layers = len(self.moe_layers)
 
         self.expert_map_per_layer_cpu = dict()  # copy of expert map on CPU to avoid device synchronize frequently
 
-        # Get num_local_experts from first real MoE layer
+        # Upstream owns expert placement and weights in RoutedExperts, while
+        # the runner continues to own Ascend EPLB runtime state.
         first_layer = self.moe_layers[0]
-        self.num_local_experts = first_layer.local_num_experts
-        self.ep_rank = first_layer.ep_rank
+        first_routed_experts = self.routed_expert_layers[0]
+        self.num_local_experts = first_routed_experts.local_num_experts
+        self.ep_rank = first_layer.moe_config.ep_rank
 
         self.expert_param_per_layer = dict()
         self.expert_weight_key_per_layer = dict()
         self.init_expert_param_per_layer()
 
-        num_buffer_tensor = self.num_local_experts
+        eplb_policy_type = get_ascend_config().eplb_config.eplb_policy_type
+        num_buffer_tensor = _get_expert_buffer_count(
+            self.num_local_experts,
+            self.world_size,
+            eplb_policy_type,
+        )
         self.buffer_tensor_list: dict[Any, list[list[Any]]] = dict()
         self.init_buffer_tensor(num_buffer_tensor)
 
@@ -126,7 +144,7 @@ class VllmEplbAdaptor:
     def init_expert_param_per_layer(self):
         self.param_dict = dict()
 
-        for local_idx, layer in enumerate(self.moe_layers):
+        for local_idx, (layer, routed_experts) in enumerate(zip(self.moe_layers, self.routed_expert_layers)):
             quant_type = QuantType.NONE if self.model.quant_config is None else layer.quant_type
             expert_weight_key = (quant_type, get_ascend_config().enable_fused_mc2 == 1)
             if expert_weight_key[0] == QuantType.W4A8MXFP:
@@ -138,7 +156,7 @@ class VllmEplbAdaptor:
             self.expert_param_per_layer[local_idx] = list()
             for name in expert_weight_names:
                 param_key = f"{local_idx}.{name}"
-                self.param_dict[param_key] = getattr(layer, name)
+                self.param_dict[param_key] = getattr(routed_experts, name)
             for local_expert_id in range(self.num_local_experts):
                 per_expert_param = list()
                 for name in expert_weight_names:

@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest import TestCase
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from torch import nn
 
 from vllm_ascend.ascend_forward_context import MoECommType
+from vllm_ascend.eplb.core.eplb_utils import EplbLayout
 from vllm_ascend.ops.fused_moe import fused_moe as fused_moe_module
 from vllm_ascend.ops.fused_moe.fused_moe import (
     AscendMoERunner,
+    AscendRoutedExperts,
     AscendUnquantizedFusedMoEMethod,
 )
 from vllm_ascend.quantization.quant_type import QuantType
@@ -42,6 +45,65 @@ def _build_unquantized_method(*, dynamic_eplb: bool = False):
     method.moe = SimpleNamespace(has_bias=False)
     method._maybe_pad_weight = MagicMock(side_effect=lambda weight: weight)
     return method
+
+
+class TestAscendRoutedExperts(TestCase):
+    def test_applies_eplb_layout_before_weight_creation(self):
+        local_expert_map = torch.full((128,), -1, dtype=torch.int32)
+        local_expert_map[:65] = torch.arange(65, dtype=torch.int32)
+        eplb_layout = EplbLayout(
+            layer_id=0,
+            global_expert_map=torch.stack((local_expert_map, local_expert_map)),
+            local_expert_map=local_expert_map,
+            log2phy=torch.arange(128, dtype=torch.int32),
+            num_redundant_experts=2,
+            num_local_experts=65,
+        )
+        moe_config = SimpleNamespace(num_experts=128, num_local_experts=64)
+        expert_map_manager = SimpleNamespace(_local_num_experts=64, _expert_map=None)
+
+        def routed_experts_init(
+            routed_experts,
+            layer_name,
+            params_dtype,
+            received_moe_config,
+            quant_config,
+            received_expert_map_manager,
+            *args,
+            **kwargs,
+        ):
+            nn.Module.__init__(routed_experts)
+            self.assertEqual(received_moe_config.num_local_experts, 65)
+            self.assertEqual(received_expert_map_manager._local_num_experts, 65)
+            self.assertIs(received_expert_map_manager._expert_map, local_expert_map)
+            routed_experts.test_weight = nn.Parameter(torch.empty(received_moe_config.num_local_experts, 1))
+
+        with (
+            patch.object(
+                fused_moe_module,
+                "get_ascend_config",
+                return_value=SimpleNamespace(mix_placement=False, eplb_config=object()),
+            ),
+            patch.object(
+                fused_moe_module,
+                "get_current_vllm_config",
+                return_value=SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=2)),
+            ),
+            patch.object(fused_moe_module, "build_eplb_layout", return_value=eplb_layout) as build_eplb_layout,
+            patch.object(fused_moe_module.RoutedExperts, "__init__", new=routed_experts_init),
+        ):
+            routed_experts = AscendRoutedExperts(
+                "model.layers.0.mlp.experts",
+                torch.bfloat16,
+                moe_config,
+                None,
+                expert_map_manager,
+            )
+
+        self.assertEqual(routed_experts.test_weight.shape[0], 65)
+        self.assertIs(routed_experts.eplb_layout, eplb_layout)
+        self.assertEqual(moe_config.global_redundant_expert_num, 2)
+        build_eplb_layout.assert_called_once()
 
 
 def test_ascend_unquantized_skips_upstream_modular_kernel_init():

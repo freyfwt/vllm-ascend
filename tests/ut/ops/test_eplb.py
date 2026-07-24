@@ -7,7 +7,7 @@ from vllm_ascend.ops.fused_moe.eplb import (
     EPLB_LOOKUP_NUM_ROWS,
     build_physical_id_lookup,
     map_to_physical,
-    record_local_expert_load,
+    normalize_local_expert_load,
 )
 
 
@@ -35,11 +35,10 @@ def test_build_physical_id_lookup_applies_rank_and_expert_offsets():
 
 def test_map_to_physical_uses_periodic_rows():
     logical_map, replica_count = _eplb_inputs()
-    lookup = build_physical_id_lookup(logical_map, replica_count, ep_rank=0)
     topk_ids = torch.zeros((EPLB_LOOKUP_NUM_ROWS + 1, 2), dtype=torch.int64)
     topk_ids[:, 1] = 1
 
-    physical_ids = map_to_physical(topk_ids, lookup)
+    physical_ids = map_to_physical(topk_ids, logical_map, replica_count, ep_rank=0)
 
     assert physical_ids[0, 0] == 0
     assert physical_ids[EPLB_LOOKUP_NUM_ROWS - 1, 0] == 4
@@ -47,29 +46,21 @@ def test_map_to_physical_uses_periodic_rows():
     assert physical_ids[EPLB_LOOKUP_NUM_ROWS, 1] == physical_ids[0, 1]
 
 
-def test_record_local_expert_load_updates_only_current_rank_slice():
-    expert_load = torch.zeros(6, dtype=torch.int32)
-
-    record_local_expert_load(
+def test_normalize_local_expert_load_preserves_non_cumulative_counts():
+    local_load = normalize_local_expert_load(
         expert_tokens=torch.tensor([3, 5], dtype=torch.int64),
         group_list_type=1,
-        expert_load_view=expert_load,
-        ep_rank=1,
-        ep_size=3,
+        num_local_physical_experts=2,
     )
 
-    torch.testing.assert_close(expert_load, torch.tensor([0, 0, 3, 5, 0, 0], dtype=torch.int32))
+    torch.testing.assert_close(local_load, torch.tensor([3, 5], dtype=torch.int64))
 
 
-def test_record_local_expert_load_converts_cumulative_group_list():
-    expert_load = torch.zeros(4, dtype=torch.int32)
-
-    record_local_expert_load(
+def test_normalize_local_expert_load_converts_cumulative_group_list():
+    local_load = normalize_local_expert_load(
         expert_tokens=torch.tensor([2, 7], dtype=torch.int64),
         group_list_type=0,
-        expert_load_view=expert_load,
-        ep_rank=0,
-        ep_size=2,
+        num_local_physical_experts=2,
     )
 
-    torch.testing.assert_close(expert_load, torch.tensor([2, 5, 0, 0], dtype=torch.int32))
+    torch.testing.assert_close(local_load, torch.tensor([2, 5], dtype=torch.int64))

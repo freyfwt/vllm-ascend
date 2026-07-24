@@ -32,77 +32,56 @@ def build_physical_id_lookup(
 
 def map_to_physical(
     topk_ids: torch.Tensor,
-    physical_id_lookup: torch.Tensor,
+    logical_to_physical_map: torch.Tensor,
+    logical_replica_count: torch.Tensor,
+    ep_rank: int,
 ) -> torch.Tensor:
-    """Map logical expert IDs to global physical IDs through a periodic table."""
+    """Map logical expert IDs to global physical IDs with periodic placement."""
     if topk_ids.numel() == 0:
         return topk_ids
     if topk_ids.ndim != 2:
         raise ValueError("topk_ids must be a 2D tensor.")
 
     logical_ids = topk_ids.to(torch.int64) if topk_ids.device.type == "cpu" else topk_ids
-    num_rows, topk = topk_ids.shape
-    num_full_blocks, tail_rows = divmod(num_rows, EPLB_LOOKUP_NUM_ROWS)
-    mapped_blocks = []
-
-    if num_full_blocks:
-        full_rows = num_full_blocks * EPLB_LOOKUP_NUM_ROWS
-        lookup_blocks = physical_id_lookup.view(
-            1,
-            EPLB_LOOKUP_NUM_ROWS,
-            physical_id_lookup.shape[1],
-        ).expand(num_full_blocks, -1, -1)
-        logical_id_blocks = logical_ids[:full_rows].view(
-            num_full_blocks,
-            EPLB_LOOKUP_NUM_ROWS,
-            topk,
-        )
-        mapped_blocks.append(torch.gather(lookup_blocks, 2, logical_id_blocks).reshape(full_rows, topk))
-
-    if tail_rows:
-        mapped_blocks.append(
-            torch.gather(
-                physical_id_lookup[:tail_rows],
-                1,
-                logical_ids[num_full_blocks * EPLB_LOOKUP_NUM_ROWS :],
-            )
-        )
-
-    physical_ids = mapped_blocks[0] if len(mapped_blocks) == 1 else torch.cat(mapped_blocks)
-    return physical_ids if physical_ids.dtype == topk_ids.dtype else physical_ids.to(topk_ids.dtype)
+    valid = (logical_ids >= 0) & (logical_ids < logical_replica_count.shape[0])
+    safe_logical_ids = torch.where(valid, logical_ids, 0)
+    replica_count = logical_replica_count[safe_logical_ids].to(torch.int64).clamp_min(1)
+    token_rows = torch.arange(
+        topk_ids.shape[0],
+        dtype=torch.int64,
+        device=topk_ids.device,
+    )
+    token_rows = torch.remainder(token_rows, EPLB_LOOKUP_NUM_ROWS)
+    replica_indices = (token_rows[:, None] + ep_rank + safe_logical_ids) % replica_count
+    physical_ids = logical_to_physical_map[
+        safe_logical_ids,
+        replica_indices,
+    ].to(topk_ids.dtype)
+    return torch.where(valid, physical_ids, -1)
 
 
-def record_local_expert_load(
+def normalize_local_expert_load(
     expert_tokens: torch.Tensor,
     group_list_type: int,
-    expert_load_view: torch.Tensor,
-    ep_rank: int,
-    ep_size: int,
-) -> None:
-    """Accumulate this rank's local physical-expert load into global slots."""
-    if expert_load_view.numel() % ep_size != 0:
-        raise ValueError("Physical experts must be evenly distributed across EP ranks.")
-
-    num_local_physical_experts = expert_load_view.numel() // ep_size
+    num_local_physical_experts: int,
+) -> torch.Tensor:
+    """Convert device-private GMM counts to normalized local expert load."""
     if expert_tokens.numel() < num_local_physical_experts:
         raise ValueError("expert_tokens has fewer entries than the number of local physical experts.")
 
     local_load = expert_tokens[:num_local_physical_experts]
     if group_list_type != 1:
         local_load = torch.cat((local_load[:1], local_load[1:] - local_load[:-1]))
-
-    local_load_view = expert_load_view.narrow(
-        0,
-        ep_rank * num_local_physical_experts,
-        num_local_physical_experts,
-    )
-    local_load_view.add_(local_load)
+    return local_load
 
 
 def _map_to_physical_fake(
     topk_ids: torch.Tensor,
-    physical_id_lookup: torch.Tensor,
+    logical_to_physical_map: torch.Tensor,
+    logical_replica_count: torch.Tensor,
+    ep_rank: int,
 ) -> torch.Tensor:
+    del logical_to_physical_map, logical_replica_count, ep_rank
     return torch.empty_like(topk_ids)
 
 

@@ -39,7 +39,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.lora.fused_moe import sync_lora_context
-from vllm_ascend.ops.fused_moe.eplb import record_local_expert_load
+from vllm_ascend.ops.fused_moe.eplb import normalize_local_expert_load
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
@@ -755,14 +755,15 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             expert_tokens = fused_experts_results.expert_tokens
             assert expert_tokens is not None, "expert_tokens must be returned when EPLB is enabled."
             eplb_state = self.router.eplb_state
-            assert eplb_state.expert_load_view is not None
-            record_local_expert_load(
+            start = eplb_state.local_physical_expert_start
+            end = eplb_state.local_physical_expert_end
+            assert start is not None and end is not None
+            local_load = normalize_local_expert_load(
                 expert_tokens=expert_tokens,
                 group_list_type=fused_experts_results.group_list_type,
-                expert_load_view=eplb_state.expert_load_view,
-                ep_rank=self.moe_config.ep_rank,
-                ep_size=self.moe_config.ep_size,
+                num_local_physical_experts=end - start,
             )
+            eplb_state.record_local_expert_load(local_load)
         elif self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
             expert_tokens = fused_experts_results.expert_tokens
             group_list_type = fused_experts_results.group_list_type

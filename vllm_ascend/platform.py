@@ -853,6 +853,10 @@ class NPUPlatform(Platform):
         return "vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator"
 
     @classmethod
+    def get_eplb_backend_cls(cls) -> str:
+        return "vllm_ascend.distributed.eplb_platform_backend.AscendEplbPlatformBackend"
+
+    @classmethod
     def is_pin_memory_available(cls):
         return True
 
@@ -1048,16 +1052,8 @@ class NPUPlatform(Platform):
                 raise ValueError("additional_config.eplb_config.load_scope requires --enable-eplb.")
             if vllm_config.parallel_config.enable_eplb:
                 upstream_eplb_config = vllm_config.parallel_config.eplb_config
-                if upstream_eplb_config.use_async:
-                    raise ValueError(
-                        "Async EPLB is not supported by Model Runner V2 on Ascend yet; "
-                        "set eplb_config.use_async to false."
-                    )
-                if upstream_eplb_config.communicator not in (None, "torch_nccl"):
-                    raise ValueError(
-                        "Do not set eplb_config.communicator on Ascend; "
-                        "torch.distributed over HCCL is selected automatically."
-                    )
+                if upstream_eplb_config.communicator not in (None, "platform"):
+                    raise ValueError("Ascend EPLB uses the Platform Backend communicator.")
         elif "load_scope" in eplb_config:
             raise ValueError(
                 "additional_config.eplb_config.load_scope is only supported by Model Runner V2; "

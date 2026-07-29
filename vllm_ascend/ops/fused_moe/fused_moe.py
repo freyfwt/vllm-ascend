@@ -752,12 +752,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             assert expert_tokens is not None, "expert_tokens must be returned when EPLB is enabled."
             eplb_state = self.router.eplb_state
             assert eplb_state.expert_load_view is not None
-            assert eplb_state.should_record_tensor is not None
             record_local_expert_load(
                 expert_tokens=expert_tokens,
                 group_list_type=fused_experts_results.group_list_type,
                 expert_load_view=eplb_state.expert_load_view,
-                record_enabled=eplb_state.should_record_tensor,
                 ep_rank=self.moe_config.ep_rank,
                 ep_size=self.moe_config.ep_size,
             )

@@ -433,6 +433,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         mix_placement = getattr(ascend_config, "mix_placement", False)
 
         self._use_v2_model_runner = bool(vllm_config.use_v2_model_runner)
+        # Model Runner V2 uses upstream EPLB state on the router. Keep the
+        # legacy V1 flag defined so the shared forward path can safely fall
+        # through when upstream EPLB is disabled.
+        self.dynamic_eplb = False
         if not self._use_v2_model_runner:
             self._init_v1_eplb(
                 ascend_config.eplb_config,

@@ -174,7 +174,10 @@ def run_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
     weight_scale_cpu = (
         torch.arange(1, num_experts + 1, dtype=torch.float32).unsqueeze(1).expand(-1, output_size) / 512.0
     ).contiguous()
-    encoded_scale_cpu = encode_int_scale(weight_scale_cpu)
+    # Keep the quantization-group dimension explicit.  For packed INT4, GMM
+    # interprets [E, N] as N quantization groups; [E, 1, N] is the per-channel
+    # representation (and each tensor-list element therefore uses [1, N]).
+    encoded_scale_cpu = encode_int_scale(weight_scale_cpu).unsqueeze(1)
     per_token_scale_cpu = torch.linspace(1.0 / 128.0, 1.0 / 64.0, num_tokens, dtype=torch.float32)
 
     x_npu = x_cpu.npu()

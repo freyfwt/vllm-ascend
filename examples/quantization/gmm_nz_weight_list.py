@@ -94,6 +94,11 @@ def compare(
     )
 
 
+def operator_error_summary(error: RuntimeError) -> str:
+    lines = [line.strip() for line in str(error).splitlines() if line.strip()]
+    return "\n".join(lines[-8:])
+
+
 def validate_dimensions(group_sizes: list[int], hidden_size: int, output_size: int) -> None:
     if len(group_sizes) < 2:
         raise ValueError("GMM requires at least two experts for this tensor-list check.")
@@ -214,12 +219,6 @@ def run_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
         scale=[monolithic_scale],
         **common_kwargs,
     )[0]
-    tensor_list = torch_npu.npu_grouped_matmul(
-        weight=weight_list,
-        scale=scale_list,
-        **common_kwargs,
-    )[0]
-
     reference = int_reference(
         x_cpu,
         logical_weight_cpu,
@@ -228,12 +227,11 @@ def run_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
         group_sizes,
     )
     comparisons = [
-        compare("tensor-list vs monolithic", tensor_list, baseline, rtol=0.0, atol=0.0),
         compare("monolithic vs torch reference", baseline, reference, rtol=2e-2, atol=5e-2),
-        compare("tensor-list vs torch reference", tensor_list, reference, rtol=2e-2, atol=5e-2),
     ]
-    return {
+    result: dict[str, Any] = {
         "mode": args.mode,
+        "tensor_list_supported": False,
         "shapes": {
             "x": list(x_npu.shape),
             "monolithic_weight": list(monolithic_weight.shape),
@@ -248,6 +246,25 @@ def run_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
         },
         "comparisons": [asdict(result) for result in comparisons],
     }
+    try:
+        tensor_list = torch_npu.npu_grouped_matmul(
+            weight=weight_list,
+            scale=scale_list,
+            **common_kwargs,
+        )[0]
+    except RuntimeError as error:
+        result["tensor_list_error"] = operator_error_summary(error)
+        return result
+
+    result["tensor_list_supported"] = True
+    comparisons.extend(
+        [
+            compare("tensor-list vs monolithic", tensor_list, baseline, rtol=0.0, atol=0.0),
+            compare("tensor-list vs torch reference", tensor_list, reference, rtol=2e-2, atol=5e-2),
+        ]
+    )
+    result["comparisons"] = [asdict(comparison) for comparison in comparisons]
+    return result
 
 
 def process_mxfp_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -255,7 +272,7 @@ def process_mxfp_scale(scale: torch.Tensor) -> torch.Tensor:
     num_experts, output_size, num_blocks = scale.shape
     if num_blocks % 2:
         raise ValueError(f"MXFP scale block count must be even, got {num_blocks}")
-    return scale.reshape(num_experts, output_size, num_blocks // 2, 2).transpose(-3, -2).contiguous()
+    return scale.reshape(num_experts, output_size, num_blocks // 2, 2).transpose(-3, -2)
 
 
 def run_mxfp4_w4a8(args: argparse.Namespace) -> dict[str, Any]:
@@ -323,18 +340,13 @@ def run_mxfp4_w4a8(args: argparse.Namespace) -> dict[str, Any]:
         "group_list_type": 1,
         "group_list": group_list_npu,
         "output_dtype": torch.bfloat16,
+        "x_dtype": torch.float8_e4m3fn,
         "weight_dtype": torch_npu.float4_e2m1fn_x2,
-        "scale_dtype": torch_npu.float8_e8m0fnu,
         "per_token_scale_dtype": torch_npu.float8_e8m0fnu,
     }
     baseline = torch_npu.npu_grouped_matmul(
         weight=[monolithic_weight],
-        scale=[monolithic_scale],
-        **common_kwargs,
-    )[0]
-    tensor_list = torch_npu.npu_grouped_matmul(
-        weight=weight_list,
-        scale=scale_list,
+        antiquant_scale=[monolithic_scale],
         **common_kwargs,
     )[0]
 
@@ -347,15 +359,14 @@ def run_mxfp4_w4a8(args: argparse.Namespace) -> dict[str, Any]:
         start = end
     reference = torch.cat(reference_parts, dim=0)
     comparisons = [
-        compare("tensor-list vs monolithic", tensor_list, baseline, rtol=0.0, atol=0.0),
         # This reference starts from the pre-quantized BF16 tensors, so allow
         # normal MXFP4/MXFP8 quantization error while still catching layout or
         # expert-to-scale misalignment.
         compare("monolithic vs torch reference", baseline, reference, rtol=2e-1, atol=2e-1),
-        compare("tensor-list vs torch reference", tensor_list, reference, rtol=2e-1, atol=2e-1),
     ]
-    return {
+    result: dict[str, Any] = {
         "mode": args.mode,
+        "tensor_list_supported": False,
         "shapes": {
             "x": list(x_quantized.shape),
             "monolithic_weight": list(monolithic_weight.shape),
@@ -370,6 +381,25 @@ def run_mxfp4_w4a8(args: argparse.Namespace) -> dict[str, Any]:
         },
         "comparisons": [asdict(result) for result in comparisons],
     }
+    try:
+        tensor_list = torch_npu.npu_grouped_matmul(
+            weight=weight_list,
+            antiquant_scale=scale_list,
+            **common_kwargs,
+        )[0]
+    except RuntimeError as error:
+        result["tensor_list_error"] = operator_error_summary(error)
+        return result
+
+    result["tensor_list_supported"] = True
+    comparisons.extend(
+        [
+            compare("tensor-list vs monolithic", tensor_list, baseline, rtol=0.0, atol=0.0),
+            compare("tensor-list vs torch reference", tensor_list, reference, rtol=2e-1, atol=2e-1),
+        ]
+    )
+    result["comparisons"] = [asdict(comparison) for comparison in comparisons]
+    return result
 
 
 def main() -> None:
@@ -385,7 +415,9 @@ def main() -> None:
 
     result["device"] = args.device
     result["seed"] = args.seed
-    result["all_passed"] = all(comparison["passed"] for comparison in result["comparisons"])
+    result["all_passed"] = result["tensor_list_supported"] and all(
+        comparison["passed"] for comparison in result["comparisons"]
+    )
     print(json.dumps(result, indent=2))
     if not result["all_passed"]:
         raise SystemExit(1)

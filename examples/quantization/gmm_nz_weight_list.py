@@ -235,7 +235,11 @@ def build_real_checkpoint_config(
     ensure_kimi_k3_expert_mapping(model_type)
 
     quant_config = AscendModelSlimConfig.from_config(quant_description)
-    load_config = LoadConfig(load_format="safetensors", use_tqdm_on_load=False)
+    load_config = LoadConfig(
+        load_format="safetensors",
+        use_tqdm_on_load=False,
+        safetensors_load_strategy="lazy",
+    )
     vllm_config = VllmConfig(
         model_config=model_config,
         quant_config=quant_config,
@@ -443,6 +447,12 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
         weight_list = [weight.view(torch.int32) for weight in tensor_list_experts.w13_weight_list]
         scale_list = tensor_list_experts.w13_weight_scale_list
         bias_list = tensor_list_experts.w13_scale_bias_list
+        # The real per-channel post-load path squeezes the quantization-group
+        # axis.  Direct GroupedMatmulWeightNz requires that singleton axis to
+        # distinguish it from per-group scales, so restore it without changing
+        # any loaded or processed scale values.
+        monolithic_gmm_scale = monolithic_scale.unsqueeze(1)
+        gmm_scale_list = [scale.unsqueeze(0) for scale in scale_list]
         require_nz("real monolithic INT weight", [monolithic_weight])
         require_nz("real split INT weight", weight_list)
 
@@ -465,7 +475,7 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
         }
         baseline = torch_npu.npu_grouped_matmul(
             weight=[monolithic_weight],
-            scale=[monolithic_scale],
+            scale=[monolithic_gmm_scale],
             bias=[monolithic_bias],
             **common_gmm_kwargs,
         )[0]
@@ -491,8 +501,8 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                 "per_token_scale": str(per_token_scale.dtype),
                 "monolithic_weight": str(monolithic_weight.dtype),
                 "split_weight": [str(weight.dtype) for weight in weight_list],
-                "monolithic_scale": str(monolithic_scale.dtype),
-                "split_scale": [str(scale.dtype) for scale in scale_list],
+                "monolithic_scale": str(monolithic_gmm_scale.dtype),
+                "split_scale": [str(scale.dtype) for scale in gmm_scale_list],
                 "monolithic_bias": str(monolithic_bias.dtype),
                 "split_bias": [str(bias.dtype) for bias in bias_list],
             },
@@ -500,8 +510,10 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                 "x": list(quantized_hidden_states.shape),
                 "monolithic_weight": list(monolithic_weight.shape),
                 "split_weight": [list(weight.shape) for weight in weight_list],
-                "monolithic_scale": list(monolithic_scale.shape),
-                "split_scale": [list(scale.shape) for scale in scale_list],
+                "processed_monolithic_scale": list(monolithic_scale.shape),
+                "processed_split_scale": [list(scale.shape) for scale in scale_list],
+                "monolithic_scale": list(monolithic_gmm_scale.shape),
+                "split_scale": [list(scale.shape) for scale in gmm_scale_list],
                 "monolithic_bias": list(monolithic_bias.shape),
                 "split_bias": [list(bias.shape) for bias in bias_list],
                 "output": list(baseline.shape),
@@ -515,7 +527,7 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
         try:
             tensor_list = torch_npu.npu_grouped_matmul(
                 weight=weight_list,
-                scale=scale_list,
+                scale=gmm_scale_list,
                 bias=bias_list,
                 **common_gmm_kwargs,
             )[0]

@@ -37,7 +37,6 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
 from vllm_ascend.ascend_config import clear_ascend_config, init_ascend_config
-from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.quantization.modelslim_config import (
     AscendModelSlimConfig,
     packed_modules_model_mapping,
@@ -416,9 +415,9 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
         torch.manual_seed(args.seed)
         num_tokens = sum(args.group_sizes)
         hidden_states = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) * 0.25
-        quantized_hidden_states, per_token_scale = DeviceOperator.npu_dynamic_quant(
+        quantized_hidden_states, per_token_scale = torch_npu.npu_dynamic_quant(
             hidden_states,
-            act_quant_type=torch.int8,
+            dst_type=torch.int8,
         )
         group_list = torch.tensor(args.group_sizes, dtype=torch.int64, device=device)
         common_gmm_kwargs = {
@@ -447,7 +446,7 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                 "DefaultModelLoader.get_all_weights",
                 "RoutedExperts.load_weights",
                 "process_weights_after_loading",
-                "DeviceOperator.npu_dynamic_quant",
+                "torch_npu.npu_dynamic_quant",
                 "torch_npu.npu_grouped_matmul",
             ],
             "source_tensors": source_metadata,

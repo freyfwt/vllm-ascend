@@ -266,6 +266,7 @@ def build_focused_expert_layer(
         quant_config=quant_config,
         tp_size=1,
         dp_size=1,
+        pcp_size=1,
         prefix=layer_prefix,
         ckpt_names=("w1", "w2", "w3"),
     )

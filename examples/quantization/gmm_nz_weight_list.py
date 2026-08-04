@@ -252,15 +252,16 @@ def build_real_checkpoint_config(
     clear_ascend_config()
     init_ascend_config(vllm_config)
     if not torch.distributed.is_initialized():
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
-            local_rank=0,
-            backend="hccl",
-        )
-        ensure_model_parallel_initialized(1, 1, 1, 1)
-        init_ascend_model_parallel(vllm_config.parallel_config)
+        with set_current_vllm_config(vllm_config):
+            init_distributed_environment(
+                world_size=1,
+                rank=0,
+                distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
+                local_rank=0,
+                backend="hccl",
+            )
+            ensure_model_parallel_initialized(1, 1, 1, 1)
+            init_ascend_model_parallel(vllm_config.parallel_config)
     return model_config, vllm_config, quant_config
 
 

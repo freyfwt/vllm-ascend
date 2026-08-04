@@ -243,6 +243,9 @@ def build_real_checkpoint_config(
             "eplb_config": {"dynamic_eplb": False},
         },
     )
+    # The real W4A8 method treats expert-parallel weights as unsharded and
+    # therefore uses tp_size=1 without consulting initialized TP groups.
+    vllm_config.parallel_config.enable_expert_parallel = True
     clear_ascend_config()
     init_ascend_config(vllm_config)
     return model_config, vllm_config, quant_config

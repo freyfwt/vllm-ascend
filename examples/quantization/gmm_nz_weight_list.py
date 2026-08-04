@@ -678,6 +678,30 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                         atol=0.0,
                     )
                 )
+            encoded_one = 0x3F800000
+            uniform_scale = torch.full_like(monolithic_gmm_scale, encoded_one)
+            zero_bias = diagnostic_biases["zero"]
+            monolithic_uniform_scale = torch_npu.npu_grouped_matmul(
+                weight=[monolithic_weight],
+                scale=[uniform_scale],
+                bias=[zero_bias],
+                **common_gmm_kwargs,
+            )[0]
+            list_uniform_scale = torch_npu.npu_grouped_matmul(
+                weight=weight_list,
+                scale=list(uniform_scale.unbind(dim=0)),
+                bias=list(zero_bias.unbind(dim=0)),
+                **common_gmm_kwargs,
+            )[0]
+            bias_routing_comparisons.append(
+                compare(
+                    "list vs monolithic with uniform scale and zero bias",
+                    list_uniform_scale,
+                    monolithic_uniform_scale,
+                    rtol=0.0,
+                    atol=0.0,
+                )
+            )
             result["bias_routing_comparisons"] = [asdict(comparison) for comparison in bias_routing_comparisons]
         try:
             tensor_list_with_monolithic_bias = torch_npu.npu_grouped_matmul(

@@ -32,11 +32,14 @@ import torch_npu
 from torch import nn
 from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.load import LoadConfig
+from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
+from vllm.utils.network_utils import get_open_port
 
 from vllm_ascend.ascend_config import clear_ascend_config, init_ascend_config
+from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.quantization.modelslim_config import (
     AscendModelSlimConfig,
     packed_modules_model_mapping,
@@ -248,6 +251,16 @@ def build_real_checkpoint_config(
     vllm_config.parallel_config.enable_expert_parallel = True
     clear_ascend_config()
     init_ascend_config(vllm_config)
+    if not torch.distributed.is_initialized():
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"tcp://127.0.0.1:{get_open_port()}",
+            local_rank=0,
+            backend="hccl",
+        )
+        ensure_model_parallel_initialized(1, 1, 1, 1)
+        init_ascend_model_parallel(vllm_config.parallel_config)
     return model_config, vllm_config, quant_config
 
 

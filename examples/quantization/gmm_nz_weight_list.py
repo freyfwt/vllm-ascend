@@ -604,6 +604,25 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                 atol=0.0,
             )
         )
+        try:
+            tensor_list_with_monolithic_bias = torch_npu.npu_grouped_matmul(
+                weight=weight_list,
+                scale=gmm_scale_list,
+                bias=[monolithic_bias],
+                **common_gmm_kwargs,
+            )[0]
+        except RuntimeError as error:
+            result["tensor_list_with_monolithic_bias_error"] = operator_error_summary(error)
+        else:
+            comparisons.append(
+                compare(
+                    "real tensor-list with monolithic bias vs real monolithic",
+                    tensor_list_with_monolithic_bias,
+                    baseline,
+                    rtol=0.0,
+                    atol=0.0,
+                )
+            )
         result["comparisons"] = [asdict(comparison) for comparison in comparisons]
         return result
 

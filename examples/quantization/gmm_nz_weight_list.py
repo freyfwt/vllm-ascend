@@ -117,6 +117,8 @@ def require_nz(name: str, tensors: list[torch.Tensor]) -> None:
 def error_metrics(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
     actual_fp32 = actual.detach().cpu().float()
     expected_fp32 = expected.detach().cpu().float()
+    if actual_fp32.numel() == 0 and expected_fp32.numel() == 0:
+        return 0.0, 0.0
     abs_error = (actual_fp32 - expected_fp32).abs()
     denominator = expected_fp32.abs().clamp_min(torch.finfo(torch.float32).eps)
     return abs_error.max().item(), (abs_error / denominator).max().item()
@@ -480,6 +482,37 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
             **common_gmm_kwargs,
         )[0]
 
+        monolithic_weight_cpu = monolithic_weight.detach().cpu()
+        processed_input_comparisons = []
+        for expert_index, (split_weight, split_scale, split_bias) in enumerate(
+            zip(weight_list, scale_list, bias_list, strict=True)
+        ):
+            processed_input_comparisons.extend(
+                [
+                    compare(
+                        f"processed weight expert {expert_index}",
+                        split_weight.detach().cpu(),
+                        monolithic_weight_cpu[expert_index],
+                        rtol=0.0,
+                        atol=0.0,
+                    ),
+                    compare(
+                        f"processed scale expert {expert_index}",
+                        split_scale,
+                        monolithic_scale[expert_index],
+                        rtol=0.0,
+                        atol=0.0,
+                    ),
+                    compare(
+                        f"processed bias expert {expert_index}",
+                        split_bias,
+                        monolithic_bias[expert_index],
+                        rtol=0.0,
+                        atol=0.0,
+                    ),
+                ]
+            )
+
         result: dict[str, Any] = {
             "mode": "int-w4a8-real-checkpoint",
             "model_path": str(model_path),
@@ -522,6 +555,7 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                 "monolithic_weight": npu_format_name(monolithic_weight),
                 "split_weight": [npu_format_name(weight) for weight in weight_list],
             },
+            "processed_input_comparisons": [asdict(comparison) for comparison in processed_input_comparisons],
             "comparisons": [],
         }
         try:
@@ -536,14 +570,51 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
             return result
 
         result["tensor_list_supported"] = True
-        comparison = compare(
-            "real tensor-list vs real monolithic",
-            tensor_list,
-            baseline,
-            rtol=0.0,
-            atol=0.0,
+        comparisons = [
+            compare(
+                "real tensor-list vs real monolithic",
+                tensor_list,
+                baseline,
+                rtol=0.0,
+                atol=0.0,
+            )
+        ]
+        token_offset = 0
+        for expert_index, group_size in enumerate(args.group_sizes):
+            next_token_offset = token_offset + group_size
+            comparisons.append(
+                compare(
+                    f"real tensor-list vs real monolithic expert {expert_index}",
+                    tensor_list[token_offset:next_token_offset],
+                    baseline[token_offset:next_token_offset],
+                    rtol=0.0,
+                    atol=0.0,
+                )
+            )
+            token_offset = next_token_offset
+
+        baseline_without_bias = torch_npu.npu_grouped_matmul(
+            weight=[monolithic_weight],
+            scale=[monolithic_gmm_scale],
+            bias=None,
+            **common_gmm_kwargs,
+        )[0]
+        tensor_list_without_bias = torch_npu.npu_grouped_matmul(
+            weight=weight_list,
+            scale=gmm_scale_list,
+            bias=None,
+            **common_gmm_kwargs,
+        )[0]
+        comparisons.append(
+            compare(
+                "real tensor-list vs real monolithic without bias",
+                tensor_list_without_bias,
+                baseline_without_bias,
+                rtol=0.0,
+                atol=0.0,
+            )
         )
-        result["comparisons"] = [asdict(comparison)]
+        result["comparisons"] = [asdict(comparison) for comparison in comparisons]
         return result
 
 
@@ -851,8 +922,9 @@ def main() -> None:
 
     result["device"] = args.device
     result["seed"] = args.seed
+    all_comparisons = result["comparisons"] + result.get("processed_input_comparisons", [])
     result["all_passed"] = result["tensor_list_supported"] and all(
-        comparison["passed"] for comparison in result["comparisons"]
+        comparison["passed"] for comparison in all_comparisons
     )
     print(json.dumps(result, indent=2))
     if not result["all_passed"]:

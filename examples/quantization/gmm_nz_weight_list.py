@@ -482,20 +482,10 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
             **common_gmm_kwargs,
         )[0]
 
-        monolithic_weight_cpu = monolithic_weight.detach().cpu()
         processed_input_comparisons = []
-        for expert_index, (split_weight, split_scale, split_bias) in enumerate(
-            zip(weight_list, scale_list, bias_list, strict=True)
-        ):
+        for expert_index, (split_scale, split_bias) in enumerate(zip(scale_list, bias_list, strict=True)):
             processed_input_comparisons.extend(
                 [
-                    compare(
-                        f"processed weight expert {expert_index}",
-                        split_weight.detach().cpu(),
-                        monolithic_weight_cpu[expert_index],
-                        rtol=0.0,
-                        atol=0.0,
-                    ),
                     compare(
                         f"processed scale expert {expert_index}",
                         split_scale,

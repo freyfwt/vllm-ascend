@@ -650,6 +650,34 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                         atol=0.0,
                     )
                 )
+            diagnostic_biases = {
+                "zero": torch.zeros_like(monolithic_bias),
+                "expert constants": torch.stack(
+                    [torch.full_like(bias, expert_index + 1) for expert_index, bias in enumerate(bias_list)]
+                ),
+            }
+            for bias_name, diagnostic_bias in diagnostic_biases.items():
+                monolithic_diagnostic = torch_npu.npu_grouped_matmul(
+                    weight=[monolithic_weight],
+                    scale=[monolithic_gmm_scale],
+                    bias=[diagnostic_bias],
+                    **common_gmm_kwargs,
+                )[0]
+                list_diagnostic = torch_npu.npu_grouped_matmul(
+                    weight=weight_list,
+                    scale=gmm_scale_list,
+                    bias=list(diagnostic_bias.unbind(dim=0)),
+                    **common_gmm_kwargs,
+                )[0]
+                bias_routing_comparisons.append(
+                    compare(
+                        f"list vs monolithic with {bias_name} bias",
+                        list_diagnostic,
+                        monolithic_diagnostic,
+                        rtol=0.0,
+                        atol=0.0,
+                    )
+                )
             result["bias_routing_comparisons"] = [asdict(comparison) for comparison in bias_routing_comparisons]
         try:
             tensor_list_with_monolithic_bias = torch_npu.npu_grouped_matmul(

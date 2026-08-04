@@ -101,6 +101,14 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_GROUP_SIZES),
         help="Token count for each expert; zero-token experts are allowed.",
     )
+    parser.add_argument(
+        "--diagnose-bias-routing",
+        action="store_true",
+        help=(
+            "For a real INT W4A8 checkpoint, compare the tensor-list output "
+            "against monolithic calls whose bias rows are remapped."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -604,6 +612,45 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                 atol=0.0,
             )
         )
+        if args.diagnose_bias_routing:
+            token_ranges = []
+            token_offset = 0
+            for group_size in args.group_sizes:
+                next_token_offset = token_offset + group_size
+                token_ranges.append((token_offset, next_token_offset))
+                token_offset = next_token_offset
+
+            bias_routing_comparisons = []
+            for source_expert in range(len(expert_ids)):
+                remapped_bias = monolithic_bias.clone()
+                remapped_bias[:] = monolithic_bias[source_expert]
+                remapped_output = torch_npu.npu_grouped_matmul(
+                    weight=[monolithic_weight],
+                    scale=[monolithic_gmm_scale],
+                    bias=[remapped_bias],
+                    **common_gmm_kwargs,
+                )[0]
+                for target_expert, (start, end) in enumerate(token_ranges):
+                    bias_routing_comparisons.append(
+                        compare(
+                            f"list expert {target_expert} vs monolithic bias expert {source_expert}",
+                            tensor_list[start:end],
+                            remapped_output[start:end],
+                            rtol=0.0,
+                            atol=0.0,
+                        )
+                    )
+            for target_expert, (start, end) in enumerate(token_ranges):
+                bias_routing_comparisons.append(
+                    compare(
+                        f"list expert {target_expert} vs no bias",
+                        tensor_list[start:end],
+                        baseline_without_bias[start:end],
+                        rtol=0.0,
+                        atol=0.0,
+                    )
+                )
+            result["bias_routing_comparisons"] = [asdict(comparison) for comparison in bias_routing_comparisons]
         try:
             tensor_list_with_monolithic_bias = torch_npu.npu_grouped_matmul(
                 weight=weight_list,

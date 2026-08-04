@@ -297,6 +297,20 @@ def get_routed_experts(runner: nn.Module) -> nn.Module:
     return routed_experts
 
 
+def unregister_focused_runner(vllm_config: VllmConfig, runner: nn.Module) -> None:
+    # MoERunner registers every layer name for model-forward lookup.  This
+    # diagnostic never calls that forward op and intentionally constructs two
+    # copies of one real layer, so release each registration after creation.
+    layer_name = getattr(runner, "layer_name", None)
+    if layer_name is None:
+        raise TypeError(f"focused FusedMoE runner has no layer_name: {type(runner).__name__}")
+    forward_context = vllm_config.compilation_config.static_forward_context
+    registered_runner = forward_context.pop(layer_name, None)
+    if registered_runner is not runner:
+        raise RuntimeError(f"unexpected MoE forward registration for {layer_name}")
+    vllm_config.compilation_config.static_all_moe_layers.remove(layer_name)
+
+
 def set_dynamic_eplb_processing(routed_experts: nn.Module, enabled: bool) -> None:
     quant_method = getattr(routed_experts, "quant_method", None)
     scheme = getattr(quant_method, "quant_method", None)
@@ -405,7 +419,9 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
             "quant_config": quant_config,
         }
         monolithic_runner = build_focused_expert_layer(**common_layer_args)
+        unregister_focused_runner(vllm_config, monolithic_runner)
         tensor_list_runner = build_focused_expert_layer(**common_layer_args)
+        unregister_focused_runner(vllm_config, tensor_list_runner)
         monolithic_experts = get_routed_experts(monolithic_runner)
         tensor_list_experts = get_routed_experts(tensor_list_runner)
         set_dynamic_eplb_processing(monolithic_experts, False)

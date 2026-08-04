@@ -656,6 +656,8 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                     [torch.full_like(bias, expert_index + 1) for expert_index, bias in enumerate(bias_list)]
                 ),
             }
+            monolithic_diagnostic_outputs = {}
+            list_diagnostic_outputs = {}
             for bias_name, diagnostic_bias in diagnostic_biases.items():
                 monolithic_diagnostic = torch_npu.npu_grouped_matmul(
                     weight=[monolithic_weight],
@@ -669,6 +671,8 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                     bias=list(diagnostic_bias.unbind(dim=0)),
                     **common_gmm_kwargs,
                 )[0]
+                monolithic_diagnostic_outputs[bias_name] = monolithic_diagnostic
+                list_diagnostic_outputs[bias_name] = list_diagnostic
                 bias_routing_comparisons.append(
                     compare(
                         f"list vs monolithic with {bias_name} bias",
@@ -678,6 +682,25 @@ def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
                         atol=0.0,
                     )
                 )
+            bias_routing_comparisons.append(
+                compare(
+                    "constant bias effect in list vs monolithic",
+                    list_diagnostic_outputs["expert constants"].float() - list_diagnostic_outputs["zero"].float(),
+                    monolithic_diagnostic_outputs["expert constants"].float()
+                    - monolithic_diagnostic_outputs["zero"].float(),
+                    rtol=0.0,
+                    atol=0.0,
+                )
+            )
+            bias_routing_comparisons.append(
+                compare(
+                    "real bias effect in list vs monolithic",
+                    tensor_list.float() - list_diagnostic_outputs["zero"].float(),
+                    baseline.float() - monolithic_diagnostic_outputs["zero"].float(),
+                    rtol=0.0,
+                    atol=0.0,
+                )
+            )
             encoded_one = 0x3F800000
             uniform_scale = torch.full_like(monolithic_gmm_scale, encoded_one)
             zero_bias = diagnostic_biases["zero"]

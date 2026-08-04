@@ -10,6 +10,11 @@ the fused MoE operators.  It has two modes:
 For both modes, the monolithic call uses one 3-D weight and one scale tensor.
 The tensor-list call uses one independently converted 2-D FRACTAL_NZ weight
 and one scale tensor per expert.  Both calls use the same input and group list.
+
+For ``int-w4a8``, ``--model-path`` switches from synthetic weights to a focused
+real-checkpoint flow.  It uses vLLM's safetensors iterator and routed-expert
+weight loader, then invokes the repository's real W4A8 post-load processing for
+both the monolithic and dynamic-EPLB tensor-list layouts before calling GMM1.
 """
 
 from __future__ import annotations
@@ -17,15 +22,38 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+import regex as re
 import torch
 import torch_npu
+from torch import nn
+from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
+from vllm.config.load import LoadConfig
+from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+from vllm_ascend.ascend_config import clear_ascend_config, init_ascend_config
+from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.quantization.modelslim_config import (
+    AscendModelSlimConfig,
+    packed_modules_model_mapping,
+)
 
 ACL_FORMAT_FRACTAL_NZ = 29
 DEFAULT_GROUP_SIZES = (4, 1, 3, 2)
+DEFAULT_REAL_EXPERT_IDS = (0, 1, 2, 3)
+KIMI_K3_EXPERT_MODULES = ("experts.0.w1", "experts.0.w3", "experts.0.w2")
 MXFP_BLOCK_SIZE = 32
+REAL_WEIGHT_SUFFIXES = (
+    "weight",
+    "weight_scale",
+    "weight_offset",
+    "scale_bias",
+)
 
 
 @dataclass
@@ -46,6 +74,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=int, default=0, help="Logical NPU device index.")
     parser.add_argument("--seed", type=int, default=20260803)
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        help="Use a real local ModelSlim checkpoint instead of synthetic INT W4A8 weights.",
+    )
+    parser.add_argument(
+        "--layer-index",
+        type=int,
+        help="MoE layer to load; defaults to the first MoE layer in the quant description.",
+    )
+    parser.add_argument(
+        "--expert-ids",
+        type=int,
+        nargs="+",
+        help="Global expert IDs to load; defaults to 0 1 2 3 for real checkpoints.",
+    )
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--output-size", type=int, default=512)
     parser.add_argument(
@@ -112,6 +156,350 @@ def validate_dimensions(group_sizes: list[int], hidden_size: int, output_size: i
         raise ValueError(f"hidden size must be divisible by {MXFP_BLOCK_SIZE}, got {hidden_size}")
     if output_size % 16 != 0:
         raise ValueError(f"output size must be divisible by 16 for FRACTAL_NZ, got {output_size}")
+
+
+def load_json_object(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as file:
+        value = json.load(file)
+    if not isinstance(value, dict):
+        raise TypeError(f"{path} must contain a JSON object")
+    return value
+
+
+def discover_first_moe_layer(quant_description: dict[str, Any]) -> int:
+    pattern = re.compile(r"^language_model\.model\.layers\.(\d+)\.block_sparse_moe\.experts\.\d+\.w1\.weight$")
+    layer_indices = {int(match.group(1)) for key in quant_description if (match := pattern.match(key)) is not None}
+    if not layer_indices:
+        raise ValueError("no Kimi-K3 block_sparse_moe expert weights were found in the quant description")
+    return min(layer_indices)
+
+
+def validate_real_checkpoint_args(
+    args: argparse.Namespace,
+    quant_description: dict[str, Any],
+    num_checkpoint_experts: int,
+) -> tuple[int, list[int]]:
+    if args.mode != "int-w4a8":
+        raise ValueError("--model-path currently supports only --mode int-w4a8")
+    if len(args.group_sizes) < 2:
+        raise ValueError("GMM requires at least two selected experts for this tensor-list check")
+    if any(group_size < 0 for group_size in args.group_sizes) or sum(args.group_sizes) == 0:
+        raise ValueError(f"invalid group sizes: {args.group_sizes}")
+
+    layer_index = args.layer_index
+    if layer_index is None:
+        layer_index = discover_first_moe_layer(quant_description)
+
+    expert_ids = list(args.expert_ids or DEFAULT_REAL_EXPERT_IDS)
+    if len(expert_ids) != len(args.group_sizes):
+        raise ValueError(
+            "--expert-ids and --group-sizes must contain the same number of entries, "
+            f"got {len(expert_ids)} and {len(args.group_sizes)}"
+        )
+    if len(set(expert_ids)) != len(expert_ids):
+        raise ValueError(f"expert IDs must be unique, got {expert_ids}")
+    if any(expert_id < 0 or expert_id >= num_checkpoint_experts for expert_id in expert_ids):
+        raise ValueError(f"expert IDs must be in [0, {num_checkpoint_experts}), got {expert_ids}")
+    return layer_index, expert_ids
+
+
+def ensure_kimi_k3_expert_mapping(model_type: str) -> None:
+    expected_mapping = list(KIMI_K3_EXPERT_MODULES)
+    model_mapping = packed_modules_model_mapping.setdefault(model_type, {})
+    existing_mapping = model_mapping.get("experts")
+    if existing_mapping is None:
+        model_mapping["experts"] = expected_mapping
+    elif existing_mapping != expected_mapping:
+        raise ValueError(f"unexpected {model_type} expert mapping: {existing_mapping}; expected {expected_mapping}")
+
+
+def build_real_checkpoint_config(
+    model_path: Path,
+    quant_description: dict[str, Any],
+    device: torch.device,
+) -> tuple[ModelConfig, VllmConfig, AscendModelSlimConfig]:
+    # Kimi-K3 is a multimodal wrapper whose text_config uses the upstream
+    # KimiLinear implementation.  This focused loader resolves that supported
+    # text architecture without constructing the vision tower or full model.
+    model_config = ModelConfig(
+        model=str(model_path),
+        trust_remote_code=True,
+        dtype=torch.bfloat16,
+        quantization="ascend",
+        language_model_only=True,
+        hf_overrides={"architectures": ["KimiLinearForCausalLM"]},
+    )
+    model_type = model_config.hf_config.model_type
+    ensure_kimi_k3_expert_mapping(model_type)
+
+    quant_config = AscendModelSlimConfig.from_config(quant_description)
+    load_config = LoadConfig(load_format="safetensors", use_tqdm_on_load=False)
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        quant_config=quant_config,
+        device_config=DeviceConfig(device=device),
+        load_config=load_config,
+        additional_config={
+            "enable_fused_mc2": 0,
+            "eplb_config": {"dynamic_eplb": False},
+        },
+    )
+    clear_ascend_config()
+    init_ascend_config(vllm_config)
+    return model_config, vllm_config, quant_config
+
+
+def build_focused_expert_layer(
+    *,
+    layer_prefix: str,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    model_config: ModelConfig,
+    quant_config: AscendModelSlimConfig,
+) -> nn.Module:
+    runner = FusedMoE(
+        num_experts=num_experts,
+        top_k=1,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        params_dtype=model_config.dtype,
+        quant_config=quant_config,
+        tp_size=1,
+        dp_size=1,
+        prefix=layer_prefix,
+        ckpt_names=("w1", "w2", "w3"),
+    )
+    return runner
+
+
+def get_routed_experts(runner: nn.Module) -> nn.Module:
+    routed_experts = getattr(runner, "routed_experts", None)
+    if routed_experts is None:
+        raise TypeError(f"focused FusedMoE runner has no routed_experts module: {type(runner).__name__}")
+    return routed_experts
+
+
+def set_dynamic_eplb_processing(routed_experts: nn.Module, enabled: bool) -> None:
+    quant_method = getattr(routed_experts, "quant_method", None)
+    scheme = getattr(quant_method, "quant_method", None)
+    if scheme is None or not hasattr(scheme, "dynamic_eplb"):
+        raise TypeError("focused routed experts did not select the Ascend W4A8 MoE quantization scheme")
+    scheme.dynamic_eplb = enabled
+
+
+def make_target_weight_map(
+    layer_prefix: str,
+    expert_ids: list[int],
+    quant_description: dict[str, Any],
+) -> dict[str, str]:
+    target_map: dict[str, str] = {}
+    missing: list[str] = []
+    for local_expert_id, checkpoint_expert_id in enumerate(expert_ids):
+        for projection in ("w1", "w2", "w3"):
+            for suffix in REAL_WEIGHT_SUFFIXES:
+                checkpoint_name = f"{layer_prefix}.{checkpoint_expert_id}.{projection}.{suffix}"
+                if checkpoint_name not in quant_description:
+                    missing.append(checkpoint_name)
+                    continue
+                target_map[checkpoint_name] = f"{local_expert_id}.{projection}.{suffix}"
+    if missing:
+        raise KeyError(f"real checkpoint is missing {len(missing)} required expert tensors: {missing[:4]}")
+    return target_map
+
+
+def load_real_expert_weights(
+    *,
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+    monolithic_runner: nn.Module,
+    tensor_list_runner: nn.Module,
+    target_map: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    loader = DefaultModelLoader(load_config)
+    weights = loader.get_all_weights(model_config, nn.Module())
+    monolithic_experts = get_routed_experts(monolithic_runner)
+    tensor_list_experts = get_routed_experts(tensor_list_runner)
+    loaded: set[str] = set()
+    source_metadata: dict[str, dict[str, Any]] = {}
+    try:
+        for checkpoint_name, tensor in weights:
+            local_name = target_map.get(checkpoint_name)
+            if local_name is None:
+                continue
+            loaded.add(checkpoint_name)
+            source_metadata[local_name] = {
+                "checkpoint_name": checkpoint_name,
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+            }
+            for routed_experts in (monolithic_experts, tensor_list_experts):
+                loaded_parameters = list(routed_experts.load_weights(((local_name, tensor),)))
+                if not loaded_parameters:
+                    raise RuntimeError(f"vLLM routed-expert loader did not accept {checkpoint_name}")
+            if len(loaded) == len(target_map):
+                break
+    finally:
+        weights.close()
+
+    missing = sorted(set(target_map) - loaded)
+    if missing:
+        raise KeyError(f"safetensors loader did not yield {len(missing)} required tensors: {missing[:4]}")
+    torch.npu.synchronize()
+    return source_metadata
+
+
+def run_real_int_w4a8(args: argparse.Namespace) -> dict[str, Any]:
+    model_path = args.model_path.resolve()
+    config_path = model_path / "config.json"
+    quant_description_path = model_path / "quant_model_description.json"
+    if not config_path.is_file() or not quant_description_path.is_file():
+        raise FileNotFoundError(f"{model_path} must contain config.json and quant_model_description.json")
+
+    hf_config = load_json_object(config_path)
+    text_config = hf_config.get("text_config")
+    if not isinstance(text_config, dict):
+        raise TypeError("Kimi-K3 config.json must contain a text_config object")
+    quant_description = load_json_object(quant_description_path)
+    num_checkpoint_experts = int(text_config["num_experts"])
+    layer_index, expert_ids = validate_real_checkpoint_args(
+        args,
+        quant_description,
+        num_checkpoint_experts,
+    )
+    hidden_size = int(text_config.get("routed_expert_hidden_size", text_config["hidden_size"]))
+    intermediate_size = int(text_config["moe_intermediate_size"])
+    layer_prefix = f"language_model.model.layers.{layer_index}.block_sparse_moe.experts"
+    target_map = make_target_weight_map(layer_prefix, expert_ids, quant_description)
+    device = torch.device(f"npu:{args.device}")
+    model_config, vllm_config, quant_config = build_real_checkpoint_config(
+        model_path,
+        quant_description,
+        device,
+    )
+
+    with set_current_vllm_config(vllm_config), torch.device(device):
+        common_layer_args = {
+            "layer_prefix": layer_prefix,
+            "num_experts": len(expert_ids),
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "model_config": model_config,
+            "quant_config": quant_config,
+        }
+        monolithic_runner = build_focused_expert_layer(**common_layer_args)
+        tensor_list_runner = build_focused_expert_layer(**common_layer_args)
+        monolithic_experts = get_routed_experts(monolithic_runner)
+        tensor_list_experts = get_routed_experts(tensor_list_runner)
+        set_dynamic_eplb_processing(monolithic_experts, False)
+        set_dynamic_eplb_processing(tensor_list_experts, True)
+
+        source_metadata = load_real_expert_weights(
+            model_config=model_config,
+            load_config=vllm_config.load_config,
+            monolithic_runner=monolithic_runner,
+            tensor_list_runner=tensor_list_runner,
+            target_map=target_map,
+        )
+        process_weights_after_loading(monolithic_runner, model_config, device)
+        process_weights_after_loading(tensor_list_runner, model_config, device)
+
+        monolithic_weight = monolithic_experts.w13_weight
+        monolithic_scale = monolithic_experts.w13_weight_scale
+        monolithic_bias = monolithic_experts.w13_scale_bias
+        weight_list = [weight.view(torch.int32) for weight in tensor_list_experts.w13_weight_list]
+        scale_list = tensor_list_experts.w13_weight_scale_list
+        bias_list = tensor_list_experts.w13_scale_bias_list
+        require_nz("real monolithic INT weight", [monolithic_weight])
+        require_nz("real split INT weight", weight_list)
+
+        torch.manual_seed(args.seed)
+        num_tokens = sum(args.group_sizes)
+        hidden_states = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) * 0.25
+        quantized_hidden_states, per_token_scale = DeviceOperator.npu_dynamic_quant(
+            hidden_states,
+            act_quant_type=torch.int8,
+        )
+        group_list = torch.tensor(args.group_sizes, dtype=torch.int64, device=device)
+        common_gmm_kwargs = {
+            "x": [quantized_hidden_states],
+            "per_token_scale": [per_token_scale],
+            "split_item": 2,
+            "group_type": 0,
+            "group_list_type": 1,
+            "group_list": group_list,
+            "output_dtype": torch.bfloat16,
+        }
+        baseline = torch_npu.npu_grouped_matmul(
+            weight=[monolithic_weight],
+            scale=[monolithic_scale],
+            bias=[monolithic_bias],
+            **common_gmm_kwargs,
+        )[0]
+
+        result: dict[str, Any] = {
+            "mode": "int-w4a8-real-checkpoint",
+            "model_path": str(model_path),
+            "layer_index": layer_index,
+            "checkpoint_expert_ids": expert_ids,
+            "group_sizes": args.group_sizes,
+            "loading_flow": [
+                "DefaultModelLoader.get_all_weights",
+                "RoutedExperts.load_weights",
+                "process_weights_after_loading",
+                "DeviceOperator.npu_dynamic_quant",
+                "torch_npu.npu_grouped_matmul",
+            ],
+            "source_tensors": source_metadata,
+            "tensor_list_supported": False,
+            "dtypes": {
+                "x_before_quant": str(hidden_states.dtype),
+                "x": str(quantized_hidden_states.dtype),
+                "per_token_scale": str(per_token_scale.dtype),
+                "monolithic_weight": str(monolithic_weight.dtype),
+                "split_weight": [str(weight.dtype) for weight in weight_list],
+                "monolithic_scale": str(monolithic_scale.dtype),
+                "split_scale": [str(scale.dtype) for scale in scale_list],
+                "monolithic_bias": str(monolithic_bias.dtype),
+                "split_bias": [str(bias.dtype) for bias in bias_list],
+            },
+            "shapes": {
+                "x": list(quantized_hidden_states.shape),
+                "monolithic_weight": list(monolithic_weight.shape),
+                "split_weight": [list(weight.shape) for weight in weight_list],
+                "monolithic_scale": list(monolithic_scale.shape),
+                "split_scale": [list(scale.shape) for scale in scale_list],
+                "monolithic_bias": list(monolithic_bias.shape),
+                "split_bias": [list(bias.shape) for bias in bias_list],
+                "output": list(baseline.shape),
+            },
+            "formats": {
+                "monolithic_weight": npu_format_name(monolithic_weight),
+                "split_weight": [npu_format_name(weight) for weight in weight_list],
+            },
+            "comparisons": [],
+        }
+        try:
+            tensor_list = torch_npu.npu_grouped_matmul(
+                weight=weight_list,
+                scale=scale_list,
+                bias=bias_list,
+                **common_gmm_kwargs,
+            )[0]
+        except RuntimeError as error:
+            result["tensor_list_error"] = operator_error_summary(error)
+            return result
+
+        result["tensor_list_supported"] = True
+        comparison = compare(
+            "real tensor-list vs real monolithic",
+            tensor_list,
+            baseline,
+            rtol=0.0,
+            atol=0.0,
+        )
+        result["comparisons"] = [asdict(comparison)]
+        return result
 
 
 def pack_nonnegative_int4(weight: torch.Tensor) -> torch.Tensor:
@@ -404,13 +792,16 @@ def run_mxfp4_w4a8(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    validate_dimensions(args.group_sizes, args.hidden_size, args.output_size)
     torch_npu.npu.set_device(args.device)
     torch_npu.npu.config.allow_internal_format = True
 
-    if args.mode == "int-w4a8":
+    if args.model_path is not None:
+        result = run_real_int_w4a8(args)
+    elif args.mode == "int-w4a8":
+        validate_dimensions(args.group_sizes, args.hidden_size, args.output_size)
         result = run_int_w4a8(args)
     else:
+        validate_dimensions(args.group_sizes, args.hidden_size, args.output_size)
         result = run_mxfp4_w4a8(args)
 
     result["device"] = args.device

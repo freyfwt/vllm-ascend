@@ -115,6 +115,10 @@ def test_from_mapping_refreshes_final_mapping(monkeypatch):
 def test_init_sets_cuda_device_index_for_npu(monkeypatch):
     parallel_config = MagicMock()
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 5)
+    # CpuGpuEvent (created in upstream EplbState.__init__) uses torch.cuda.Event,
+    # which the MRv2 torch_cuda_wrapper remaps to torch.npu.Event at runtime.
+    # Simulate that remapping for this unit test.
+    monkeypatch.setattr(torch.cuda, "Event", torch.npu.Event)
 
     state = AscendEplbState(parallel_config, torch.device("cpu"))
 

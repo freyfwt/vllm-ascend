@@ -107,11 +107,11 @@ MRv2 uses the upstream `EPLBConfig` fields:
 | `window_size` | `1000` | Number of recent steps used for expert-load recording. |
 | `step_interval` | `3000` | Interval between expert rearrangements. |
 | `num_redundant_experts` | `0` | Number of redundant physical experts. |
-| `use_async` | `true` | Must be set to `false` on Ascend MRv2. |
-| `policy` | `default` | Upstream EPLB placement policy. |
+| `use_async` | `true` | Synchronous (`false`) uses `HcclEplbCommunicator` over HCCL. Asynchronous (`true`) uses the upstream `torch_gloo` backend (CPU staging) to avoid HCCL multi-stream conflicts. |
+| `policy` | `default` | Upstream EPLB placement policy. Async mode requires `default`. |
 | `log_balancedness` | `false` | Log expert balancedness metrics. |
 | `log_balancedness_interval` | `1` | Interval between balancedness log entries. |
-| `communicator` | `None` | Do not set this on Ascend; HCCL is selected automatically. |
+| `communicator` | `None` | Do not set this on Ascend. Sync mode auto-selects HCCL; async mode auto-selects `torch_gloo`. |
 
 These fields may also be passed together as JSON through `--eplb-config`.
 They must not be placed in `--additional-config` for MRv2.
@@ -136,7 +136,7 @@ not advance the EPLB load window. It still participates in the global EPLB
 scheduling and communication sequence so that data-parallel ranks remain
 synchronized.
 
-For example, to collect only prefill load:
+For example, to collect only prefill load with synchronous EPLB:
 
 ```bash
 vllm serve Qwen/Qwen3-30B-A3B \
@@ -146,13 +146,30 @@ vllm serve Qwen/Qwen3-30B-A3B \
   --additional-config '{"eplb_config":{"load_collection_phase":"prefill"}}'
 ```
 
+To use asynchronous EPLB (default), simply omit `--eplb-config.use_async` or
+set it to `true`. The async worker thread transfers expert weights in the
+background using `torch_gloo` CPU staging while the main thread continues
+MoE forward execution:
+
+```bash
+vllm serve Qwen/Qwen3-30B-A3B \
+  --enable-expert-parallel \
+  --enable-eplb \
+  --eplb-config.use_async true \
+  --additional-config '{"eplb_config":{"load_collection_phase":"prefill"}}'
+```
+
 > [!IMPORTANT]
-> MRv2 currently supports synchronous EPLB only. It rejects legacy
-> `dynamic_eplb`, recording/static-map fields, `DYNAMIC_EPLB`, and
-> `EXPERT_MAP_RECORD`. It also rejects an explicitly selected communicator.
-> The initial validated execution scope is eager mode with the standard
-> non-fused MoE communication path. Validate graph, multi-node, speculative
-> decoding, and other communication combinations independently before use.
+> MRv2 supports both synchronous and asynchronous EPLB. Synchronous mode uses
+> `HcclEplbCommunicator` over HCCL for fast weight transfer. Asynchronous mode
+> uses the upstream `torch_gloo` backend (CPU staging) to avoid HCCL
+> multi-stream conflicts between the async worker thread and the main thread's
+> MoE forward. It rejects legacy `dynamic_eplb`, recording/static-map fields,
+> `DYNAMIC_EPLB`, and `EXPERT_MAP_RECORD`. Async + elastic EP is rejected at
+> startup. The initial validated execution scope is eager mode with the
+> standard non-fused MoE communication path. Validate graph, multi-node,
+> speculative decoding, and other communication combinations independently
+> before use.
 
 ### Model Runner V1: Legacy EPLB
 

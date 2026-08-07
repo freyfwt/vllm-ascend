@@ -127,11 +127,19 @@ process group even though the upstream configuration names its generic
 torch-distributed communicator backend. Ascend-specific capability differences,
 such as profiling-buffer reservation, stay inside the communicator.
 
-The supported path is synchronous: weight movement and placement commit finish
-before inference continues. Asynchronous EPLB configuration is rejected at
-startup. The layer-state refresh hook is attached to the commit boundary so a
-future asynchronous implementation can preserve the same reader guarantee,
-but it does not enable asynchronous execution today.
+The supported path includes both synchronous and asynchronous rearrangement.
+Synchronous mode uses `HcclEplbCommunicator` over HCCL: weight movement and
+placement commit finish before inference continues. Asynchronous mode uses
+the upstream `torch_gloo` backend (CPU staging) to avoid HCCL multi-stream
+conflicts between the async worker thread and the main thread's MoE forward.
+The async worker transfers expert weights in a background daemon thread using
+a single-slot pipeline: it fills `expert_buffer` for one layer, signals the
+main thread via `pending_result`, and waits for `consumed_event` before
+proceeding to the next layer. The main thread consumes each layer in
+`_move_to_workspace`, which commits the placement and refreshes the device
+routing table. The layer-state refresh hook is attached to the commit
+boundary so the stable reader guarantee is preserved across both sync and
+async rearrangements.
 
 ## Invariants
 

@@ -10,7 +10,10 @@ from vllm.config import parallel as _parallel_config
 from vllm.distributed.eplb import eplb_communicator as _eplb_communicator
 from vllm.distributed.eplb import eplb_state as _eplb_state
 
-from vllm_ascend.distributed.eplb_communicator import HcclEplbCommunicator
+from vllm_ascend.distributed.eplb_communicator import (
+    AscendGlooEplbCommunicator,
+    HcclEplbCommunicator,
+)
 from vllm_ascend.distributed.eplb_state import refresh_model_routing_tables
 
 _PATCH_MARKER = "_vllm_ascend_eplb_patch"
@@ -66,8 +69,10 @@ def _wrap_communicator_factory(original_factory):
                 # pick the process group, but Ascend's EplbExpertTensorList
                 # wraps per-expert tensors and does not expose .device at the
                 # top level. Create the gloo communicator directly with the
-                # cpu_group to bypass that device-type probe.
-                return _eplb_communicator.TorchDistGlooStagedEplbCommunicator(
+                # cpu_group to bypass that device-type probe. The Ascend
+                # subclass also disables the profile buffer reservation
+                # collective, which is incompatible with EplbExpertTensorList.
+                return AscendGlooEplbCommunicator(
                     cpu_group=group_coordinator.cpu_group,
                 )
         return original_factory(*args, **kwargs)

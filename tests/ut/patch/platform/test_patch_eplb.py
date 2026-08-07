@@ -74,11 +74,7 @@ def test_communicator_factory_maps_tensor_lists_to_hccl(monkeypatch):
 def test_communicator_factory_maps_gloo_to_staged_on_npu(monkeypatch):
     communicator = object()
     gloo_cls = MagicMock(return_value=communicator)
-    monkeypatch.setattr(
-        patch_eplb._eplb_communicator,
-        "TorchDistGlooStagedEplbCommunicator",
-        gloo_cls,
-    )
+    monkeypatch.setattr(patch_eplb, "AscendGlooEplbCommunicator", gloo_cls)
     coordinator = MagicMock()
 
     with _npu_parallel_config_platform():

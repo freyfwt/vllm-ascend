@@ -71,6 +71,28 @@ def test_communicator_factory_maps_tensor_lists_to_hccl(monkeypatch):
     communicator_cls.assert_called_once_with(coordinator.device_group)
 
 
+def test_communicator_factory_maps_gloo_to_staged_on_npu(monkeypatch):
+    communicator = object()
+    gloo_cls = MagicMock(return_value=communicator)
+    monkeypatch.setattr(
+        patch_eplb._eplb_communicator,
+        "TorchDistGlooStagedEplbCommunicator",
+        gloo_cls,
+    )
+    coordinator = MagicMock()
+
+    with _npu_parallel_config_platform():
+        result = patch_eplb._eplb_communicator.create_eplb_communicator(
+            coordinator,
+            "torch_gloo",
+            [[object()]],
+            [object()],
+        )
+
+    assert result is communicator
+    gloo_cls.assert_called_once_with(cpu_group=coordinator.cpu_group)
+
+
 def test_communicator_factory_forwards_other_backends_and_additive_parameters():
     sentinel = object()
     calls = []
@@ -102,7 +124,7 @@ def test_communicator_factory_forwards_other_backends_and_additive_parameters():
     with _npu_parallel_config_platform():
         result = wrapped_factory(
             coordinator,
-            "torch_gloo",
+            "nixl",
             expert_weights,
             expert_buffer,
             transport_options={"mode": "future"},
@@ -112,7 +134,7 @@ def test_communicator_factory_forwards_other_backends_and_additive_parameters():
     assert calls == [
         (
             coordinator,
-            "torch_gloo",
+            "nixl",
             expert_weights,
             expert_buffer,
             {"mode": "future"},

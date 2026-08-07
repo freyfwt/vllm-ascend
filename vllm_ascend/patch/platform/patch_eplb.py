@@ -56,9 +56,20 @@ def _wrap_communicator_factory(original_factory):
     def _create_eplb_communicator(*args, **kwargs):
         bound = factory_signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        if bound.arguments["backend"] == "torch_nccl" and _is_npu_platform(_parallel_config.current_platform):
+        backend = bound.arguments["backend"]
+        if _is_npu_platform(_parallel_config.current_platform):
             group_coordinator = bound.arguments["group_coordinator"]
-            return HcclEplbCommunicator(group_coordinator.device_group)
+            if backend == "torch_nccl":
+                return HcclEplbCommunicator(group_coordinator.device_group)
+            if backend == "torch_gloo":
+                # The upstream factory accesses expert_weights[0][0].device to
+                # pick the process group, but Ascend's EplbExpertTensorList
+                # wraps per-expert tensors and does not expose .device at the
+                # top level. Create the gloo communicator directly with the
+                # cpu_group to bypass that device-type probe.
+                return _eplb_communicator.TorchDistGlooStagedEplbCommunicator(
+                    cpu_group=group_coordinator.cpu_group,
+                )
         return original_factory(*args, **kwargs)
 
     setattr(_create_eplb_communicator, _PATCH_MARKER, True)

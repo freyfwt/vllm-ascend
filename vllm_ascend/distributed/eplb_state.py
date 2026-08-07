@@ -84,6 +84,11 @@ class AscendEplbState(_eplb_state.EplbState):
     def __init__(self, parallel_config, device: torch.device) -> None:
         super().__init__(parallel_config, device)
         self._has_fresh_recorded_load = False
+        # The upstream EplbState only sets cuda_device_index for CUDA devices.
+        # The async worker thread needs a valid device index to set the
+        # accelerator device and create an NPU stream.
+        if self.cuda_device_index is None:
+            self.cuda_device_index = torch.accelerator.current_device_index()
 
     def step(
         self,

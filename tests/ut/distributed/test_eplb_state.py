@@ -110,3 +110,12 @@ def test_from_mapping_refreshes_final_mapping(monkeypatch):
 
     assert isinstance(state, AscendEplbState)
     refresh.assert_called_once_with(model_state)
+
+
+def test_init_sets_cuda_device_index_for_npu(monkeypatch):
+    parallel_config = MagicMock()
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 5)
+
+    state = AscendEplbState(parallel_config, torch.device("cpu"))
+
+    assert state.cuda_device_index == 5

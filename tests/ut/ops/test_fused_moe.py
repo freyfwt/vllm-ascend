@@ -474,6 +474,30 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
     )
 
 
+def test_deferred_eplb_load_uses_local_tp_token_count():
+    routed_experts = AscendRoutedExperts.__new__(AscendRoutedExperts)
+    routed_experts._defer_v2_eplb_recording = True
+    routed_experts._v2_eplb_load_buffers = {
+        70: (torch.tensor([3, 5]), 1),
+    }
+    routed_experts._v2_eplb_token_split_size = 2
+    routed_experts.moe_config = SimpleNamespace(
+        ep_rank=1,
+        ep_size=2,
+    )
+    expert_load = torch.zeros(4, dtype=torch.int32)
+    routed_experts.router = SimpleNamespace(
+        eplb_state=SimpleNamespace(expert_load_view=expert_load),
+    )
+
+    routed_experts.record_deferred_eplb_load(num_tokens=141)
+
+    torch.testing.assert_close(
+        expert_load,
+        torch.tensor([0, 0, 3, 5], dtype=torch.int32),
+    )
+
+
 class _Projection(nn.Module):
     def forward(self, hidden_states):
         return hidden_states * 2.0 + 1.0, None

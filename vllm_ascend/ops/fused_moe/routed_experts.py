@@ -250,6 +250,11 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             "enable_dbo",
             False,
         )
+        self._v2_eplb_token_split_size = getattr(
+            getattr(vllm_config, "parallel_config", None),
+            "tensor_parallel_size",
+            1,
+        )
         self._v2_eplb_load_buffers: dict[int, tuple[torch.Tensor, int]] = {}
         self.dynamic_eplb = False
         self.multi_stage = False
@@ -314,7 +319,22 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             return
         load_buffer = self._v2_eplb_load_buffers.get(num_tokens)
         if load_buffer is None:
-            raise RuntimeError(f"No captured EPLB load buffer for {num_tokens} tokens.")
+            # Ascend's TP+EP prepare path splits the token dimension across
+            # TP ranks before routing. Dynamic PIECEWISE graphs therefore
+            # publish their local routed-token count, while the model runner
+            # observes the global padded count. Keep the exact lookup first
+            # for paths that do not split tokens (for example shared-expert
+            # DP), then fall back to the local TP shard size.
+            split_size = self._v2_eplb_token_split_size
+            split_rank = self.moe_config.ep_rank % split_size
+            quotient, remainder = divmod(num_tokens, split_size)
+            local_num_tokens = quotient + int(split_rank < remainder)
+            load_buffer = self._v2_eplb_load_buffers.get(local_num_tokens)
+        if load_buffer is None:
+            raise RuntimeError(
+                f"No captured EPLB load buffer for {num_tokens} tokens; "
+                f"available keys: {list(self._v2_eplb_load_buffers)}."
+            )
         expert_tokens, group_list_type = load_buffer
         eplb_state = self.router.eplb_state
         assert eplb_state is not None and eplb_state.expert_load_view is not None

@@ -246,7 +246,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         self._use_v2_model_runner = bool(vllm_config.use_v2_model_runner)
         self._defer_v2_eplb_recording = self._use_v2_model_runner and not getattr(
-            vllm_config.parallel_config,
+            getattr(vllm_config, "parallel_config", None),
             "enable_dbo",
             False,
         )

@@ -7,6 +7,7 @@ from vllm_ascend.ops.fused_moe.eplb import (
     EXPERT_REPLICA_ROUTING_TABLE_NUM_ROWS,
     build_expert_replica_routing_table,
     map_to_physical,
+    map_to_physical_and_record,
     record_local_expert_load,
 )
 
@@ -66,6 +67,43 @@ def test_map_to_physical_uses_periodic_rows():
     assert physical_ids[EXPERT_REPLICA_ROUTING_TABLE_NUM_ROWS - 1, 0] == 4
     assert physical_ids[EXPERT_REPLICA_ROUTING_TABLE_NUM_ROWS, 0] == physical_ids[0, 0]
     assert physical_ids[EXPERT_REPLICA_ROUTING_TABLE_NUM_ROWS, 1] == physical_ids[0, 1]
+
+
+def test_map_to_physical_and_record_honors_window_and_padding():
+    logical_map, replica_count = _eplb_inputs()
+    routing_table = build_expert_replica_routing_table(
+        logical_map,
+        replica_count,
+        ep_rank=0,
+    )
+    topk_ids = torch.tensor([[0, 1], [0, 1], [0, 1]], dtype=torch.int32)
+    expert_load = torch.zeros(6, dtype=torch.int32)
+
+    physical_ids = map_to_physical_and_record(
+        topk_ids,
+        routing_table,
+        expert_load,
+        record_enabled=torch.tensor(True),
+        num_unpadded_tokens=torch.tensor(2, dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(physical_ids, map_to_physical(topk_ids, routing_table))
+    torch.testing.assert_close(
+        expert_load,
+        torch.tensor([1, 1, 0, 0, 1, 1], dtype=torch.int32),
+    )
+
+    map_to_physical_and_record(
+        topk_ids,
+        routing_table,
+        expert_load,
+        record_enabled=torch.tensor(False),
+        num_unpadded_tokens=torch.tensor(3, dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        expert_load,
+        torch.tensor([1, 1, 0, 0, 1, 1], dtype=torch.int32),
+    )
 
 
 def test_record_local_expert_load_updates_only_current_rank_slice():

@@ -75,11 +75,10 @@ class TestEplbLoadCollectionPhase(unittest.TestCase):
 
                 state.step.assert_called_once_with(expected_dummy, False, log_stats=True)
 
-    def test_closed_upstream_window_discards_recorded_load(self):
+    def test_closed_upstream_window_relies_on_device_recording_gate(self):
         controller = self._make_controller()
         expert_load_pass = torch.ones(2, dtype=torch.int32)
         state = MagicMock()
-        state._should_record_current_step.return_value = False
         state.model_states = {"model": SimpleNamespace(expert_load_pass=expert_load_pass)}
         controller.state = state
 
@@ -87,7 +86,7 @@ class TestEplbLoadCollectionPhase(unittest.TestCase):
 
         torch.testing.assert_close(
             expert_load_pass,
-            torch.zeros_like(expert_load_pass),
+            torch.ones_like(expert_load_pass),
         )
         state.step.assert_called_once_with(False, False, log_stats=False)
 

@@ -373,7 +373,7 @@ class NPUModelRunner(GPUModelRunner):
         num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
         batch_has_prefill = bool(np.any(is_prefilling_np))
-        self.eplb.set_batch_phase(batch_has_prefill)
+        self.eplb.set_batch_phase(batch_has_prefill, num_tokens_after_padding)
 
         # Get prefill tokens if any.
         if batch_has_prefill:

@@ -68,6 +68,7 @@ class TestEplbLoadCollectionPhase(unittest.TestCase):
                 )
                 state = MagicMock()
                 state._should_record_current_step.return_value = True
+                state.model_states = {}
                 controller.state = state
                 controller.set_batch_phase(batch_has_prefill=batch_has_prefill)
 
@@ -75,10 +76,11 @@ class TestEplbLoadCollectionPhase(unittest.TestCase):
 
                 state.step.assert_called_once_with(expected_dummy, False, log_stats=True)
 
-    def test_closed_upstream_window_relies_on_device_recording_gate(self):
+    def test_closed_upstream_window_skips_deferred_recording(self):
         controller = self._make_controller()
         expert_load_pass = torch.ones(2, dtype=torch.int32)
         state = MagicMock()
+        state._should_record_current_step.return_value = False
         state.model_states = {"model": SimpleNamespace(expert_load_pass=expert_load_pass)}
         controller.state = state
 
@@ -88,6 +90,25 @@ class TestEplbLoadCollectionPhase(unittest.TestCase):
             expert_load_pass,
             torch.ones_like(expert_load_pass),
         )
+        state.step.assert_called_once_with(False, False, log_stats=False)
+
+    def test_open_upstream_window_records_captured_load_buffers(self):
+        controller = self._make_controller()
+        recorder = MagicMock()
+        layer = SimpleNamespace(routed_experts=SimpleNamespace(record_deferred_eplb_load=recorder))
+        state = MagicMock()
+        state._should_record_current_step.return_value = True
+        state.model_states = {
+            "model": SimpleNamespace(
+                model=SimpleNamespace(moe_layers=[layer]),
+            )
+        }
+        controller.state = state
+        controller.set_batch_phase(batch_has_prefill=False, num_tokens=8)
+
+        controller.step()
+
+        recorder.assert_called_once_with(8)
         state.step.assert_called_once_with(False, False, log_stats=False)
 
     def test_suppressed_controller_does_not_touch_state(self):

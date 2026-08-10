@@ -43,6 +43,7 @@ class AscendEPLBController(EPLBController):
         super().__init__(parallel_config, device)
         self.load_collection_phase = load_collection_phase
         self._load_collection_phase_matched = True
+        self._current_num_tokens = 0
 
     def prepare_load(self) -> None:
         self.state = None
@@ -50,11 +51,12 @@ class AscendEPLBController(EPLBController):
         if self.parallel_config.enable_eplb:
             self.state = AscendEplbState(self.parallel_config, self.device)
 
-    def set_batch_phase(self, batch_has_prefill: bool) -> None:
+    def set_batch_phase(self, batch_has_prefill: bool, num_tokens: int = 0) -> None:
         self._load_collection_phase_matched = is_eplb_load_collection_phase_matched(
             self.load_collection_phase,
             batch_has_prefill,
         )
+        self._current_num_tokens = num_tokens
 
     def step(
         self,
@@ -66,6 +68,18 @@ class AscendEPLBController(EPLBController):
             return
 
         discard_current_load = not is_profile and not self._load_collection_phase_matched
+        log_stats = self.parallel_config.eplb_config.log_balancedness
+        should_record = (
+            not is_dummy
+            and not is_profile
+            and not discard_current_load
+            and state._should_record_current_step(log_stats=log_stats)
+        )
+        if should_record:
+            for model_state in state.model_states.values():
+                for layer in model_state.model.moe_layers:
+                    layer.routed_experts.record_deferred_eplb_load(self._current_num_tokens)
+
         # Phase selection may change the load submitted by each rank, but all
         # ranks must advance the EPLB state machine and enter collectives in
         # the same order. Treat a non-matching batch as an EPLB dummy step and

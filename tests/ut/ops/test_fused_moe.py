@@ -399,6 +399,8 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
     routed_experts.global_redundant_expert_num = 0
     routed_experts.n_shared_experts = 0
     routed_experts._use_v2_model_runner = v2_eplb
+    routed_experts._defer_v2_eplb_recording = v2_eplb
+    routed_experts._v2_eplb_load_buffers = {}
     routed_experts.dynamic_eplb = False
     routed_experts.return_with_event = return_with_event
     moe_comm_method = MagicMock()
@@ -456,6 +458,15 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
     )
     expected_load = torch.zeros_like(expert_load)
     torch.testing.assert_close(expert_load, expected_load)
+    if v2_eplb:
+        buffered_tokens, group_list_type = routed_experts._v2_eplb_load_buffers[2]
+        torch.testing.assert_close(buffered_tokens, torch.tensor([3, 5]))
+        assert group_list_type == 1
+        routed_experts.record_deferred_eplb_load(2)
+        torch.testing.assert_close(
+            expert_load,
+            torch.tensor([0, 0, 3, 5], dtype=torch.int32),
+        )
     moe_comm_method.finalize.assert_called_once_with(
         hidden_states=routed_out,
         reduce_results=False,

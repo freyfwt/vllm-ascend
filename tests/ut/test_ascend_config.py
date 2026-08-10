@@ -119,7 +119,8 @@ class TestAscendConfig(TestBase):
     def test_eplb_placement_policy_validation(self):
         self.assertIsNone(EplbConfig().placement_policy)
         self.assertEqual(EplbConfig({"placement_policy": "swift"}).placement_policy, "swift")
-        with self.assertRaisesRegex(ValueError, "placement_policy must be null or"):
+        self.assertEqual(EplbConfig({"placement_policy": "flashlb"}).placement_policy, "flashlb")
+        with self.assertRaisesRegex(ValueError, "placement_policy must be null"):
             EplbConfig({"placement_policy": "unknown"})
 
     @_clean_up_ascend_config

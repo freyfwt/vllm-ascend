@@ -109,6 +109,16 @@ class TestNPUPlatform(TestBase):
         with patch.dict("os.environ", {}, clear=True):
             _validate_eplb_config(vllm_config)
 
+    def test_validate_eplb_config_allows_v2_flashlb_placement_policy(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.enable_elastic_ep = False
+        vllm_config.additional_config = {"eplb_config": {"placement_policy": "flashlb"}}
+
+        with patch.dict("os.environ", {}, clear=True):
+            _validate_eplb_config(vllm_config)
+
     def test_validate_eplb_config_requires_eplb_for_placement_policy(self):
         vllm_config = self.mock_vllm_config()
         vllm_config.use_v2_model_runner = True

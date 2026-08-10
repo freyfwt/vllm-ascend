@@ -874,8 +874,8 @@ class EplbConfig:
             raise ValueError('eplb_heat_collection_stage must be one of ["all", "prefill", "decode"]')
         if self.load_collection_phase not in ["all", "prefill", "decode"]:
             raise ValueError('load_collection_phase must be one of ["all", "prefill", "decode"]')
-        if self.placement_policy not in [None, "swift"]:
-            raise ValueError('placement_policy must be null or "swift"')
+        if self.placement_policy not in [None, "swift", "flashlb"]:
+            raise ValueError('placement_policy must be null, "swift", or "flashlb"')
 
         logger.info("Dynamic EPLB is %s", self.config["dynamic_eplb"])
         logger.info("The number of redundant experts is %s", self.config["num_redundant_experts"])

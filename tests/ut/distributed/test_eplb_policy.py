@@ -4,8 +4,11 @@
 import torch
 
 from vllm_ascend.distributed.eplb_policy import (
+    FlashLBEplbPolicyAdapter,
     SwiftEplbPolicyAdapter,
     _expand_logical_load_to_slots,
+    _expand_logical_load_window_to_slots,
+    _reject_invalid_flashlb_layers,
 )
 from vllm_ascend.eplb.core.policy.policy_swift_balancer import SwiftBalanceEplb
 
@@ -19,6 +22,83 @@ def test_expand_logical_load_to_slots_preserves_logical_load():
     reconstructed.scatter_add_(1, placement, slot_load)
 
     torch.testing.assert_close(reconstructed, logical_load.to(torch.float64))
+
+
+def test_expand_logical_load_window_to_slots_preserves_each_sample():
+    logical_load_window = torch.tensor(
+        [[[10, 20, 30, 40]], [[50, 60, 70, 80]]],
+        dtype=torch.int32,
+    )
+    placement = torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.long)
+
+    slot_load_window = _expand_logical_load_window_to_slots(logical_load_window, placement)
+    reconstructed = torch.zeros_like(logical_load_window, dtype=slot_load_window.dtype)
+    reconstructed.scatter_add_(
+        2,
+        placement.unsqueeze(0).expand(logical_load_window.shape[0], -1, -1),
+        slot_load_window,
+    )
+
+    torch.testing.assert_close(reconstructed, logical_load_window.to(torch.float64))
+
+
+def test_flashlb_adapter_preserves_v2_contract_and_only_applies_priority_layers(monkeypatch):
+    class FakeFlashLB:
+        def rebalance_experts(self, placement, workload):
+            assert placement.shape == (2, 2, 3)
+            assert workload.shape == (3, 2, 2, 3)
+            proposal = placement.clone()
+            proposal[0] = torch.tensor([[0, 1, 3], [2, 0, 1]])
+            proposal[1] = torch.tensor([[1, 0, 2], [3, 0, 1]])
+            return True, [0], proposal
+
+    logical_load_window = torch.ones((3, 2, 4), dtype=torch.int32)
+    placement = torch.tensor(
+        [[0, 1, 2, 3, 0, 1], [0, 1, 2, 3, 0, 1]],
+        dtype=torch.long,
+    )
+    monkeypatch.setattr(FlashLBEplbPolicyAdapter, "_policy", FakeFlashLB())
+
+    result = FlashLBEplbPolicyAdapter.rebalance_experts(
+        logical_load_window,
+        num_replicas=6,
+        num_groups=1,
+        num_nodes=1,
+        num_ranks=2,
+        old_global_expert_indices=placement,
+    )
+
+    assert FlashLBEplbPolicyAdapter.uses_expert_load_time_series
+    assert result.shape == placement.shape
+    assert result.dtype == torch.long
+    assert result.device.type == "cpu"
+    assert result.is_contiguous()
+    torch.testing.assert_close(result[0], torch.tensor([0, 1, 3, 2, 0, 1]))
+    torch.testing.assert_close(result[1], placement[1])
+
+
+def test_reject_invalid_flashlb_layers_matches_v1_worker_constraints():
+    old_placement = torch.tensor(
+        [[0, 1, 2, 3, 0, 1], [0, 1, 2, 3, 0, 1]],
+        dtype=torch.long,
+    )
+    proposed_placement = torch.tensor(
+        [
+            [0, 1, 3, 2, 0, 1],
+            [0, 2, 1, 3, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+
+    rejected = _reject_invalid_flashlb_layers(
+        old_placement,
+        proposed_placement,
+        num_ranks=2,
+    )
+
+    assert rejected == [1]
+    torch.testing.assert_close(proposed_placement[0], torch.tensor([0, 1, 3, 2, 0, 1]))
+    torch.testing.assert_close(proposed_placement[1], old_placement[1])
 
 
 def test_swift_adapter_preserves_inputs_and_v2_output_contract():

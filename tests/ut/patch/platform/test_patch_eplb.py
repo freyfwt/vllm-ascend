@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+import torch
 from vllm.config import EPLBConfig, ParallelConfig, VllmConfig
 from vllm.config import parallel as parallel_module
 from vllm.platforms import current_platform
@@ -155,3 +157,112 @@ def test_async_workspace_wrapper_refreshes_committed_layer(monkeypatch):
 
     assert result == "moved"
     refresh.assert_called_once_with(model_state, 3)
+
+
+class _CycleComplete(Exception):
+    pass
+
+
+class _OneCycleEvent:
+    def __init__(self):
+        self.wait_count = 0
+
+    def wait(self, stream):
+        self.wait_count += 1
+        if self.wait_count > 1:
+            raise _CycleComplete
+
+
+def _run_one_async_cycle(monkeypatch, old_map, new_map):
+    pending_layers = []
+    transfer_metadata = object()
+    transfer_layer = MagicMock(return_value=transfer_metadata)
+    all_reduce = MagicMock()
+
+    class _ConsumedEvent:
+        def wait(self, stream):
+            pending_layers.append(model_state.pending_result.layer_idx)
+            model_state.pending_result = None
+
+    stream = MagicMock()
+    communicator = MagicMock()
+    model_state = SimpleNamespace(
+        communicator=communicator,
+        model=SimpleNamespace(
+            num_moe_layers=old_map.shape[0],
+            expert_weights=[[object()]] * old_map.shape[0],
+        ),
+        physical_to_logical_map=old_map,
+        expert_buffer=[object()],
+        rebalanced=True,
+        pending_result=None,
+    )
+    state = SimpleNamespace(
+        rearrange_event=_OneCycleEvent(),
+        is_async=True,
+        model_states={"model": model_state},
+    )
+    device_group = MagicMock()
+    device_group.rank.return_value = 0
+    cpu_group = MagicMock()
+    cpu_group.size.return_value = 1
+    group = SimpleNamespace(device_group=device_group, cpu_group=cpu_group)
+
+    monkeypatch.setattr(patch_eplb._eplb_async_worker, "get_eplb_group", lambda: group)
+    monkeypatch.setattr(
+        patch_eplb._eplb_async_worker,
+        "run_rebalance_experts",
+        lambda *args, **kwargs: new_map,
+    )
+    monkeypatch.setattr(patch_eplb._eplb_async_worker, "transfer_layer", transfer_layer)
+    monkeypatch.setattr(patch_eplb._eplb_async_worker, "CpuGpuEvent", _ConsumedEvent)
+    monkeypatch.setattr(patch_eplb._eplb_async_worker.torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(patch_eplb._eplb_async_worker.torch.distributed, "all_reduce", all_reduce)
+
+    with pytest.raises(_CycleComplete):
+        patch_eplb._transfer_run_periodically(state, stream)
+
+    return model_state, stream, communicator, transfer_layer, all_reduce, pending_layers
+
+
+def test_async_worker_skips_fully_unchanged_cycle(monkeypatch):
+    placement = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+
+    model_state, stream, communicator, transfer_layer, all_reduce, pending_layers = _run_one_async_cycle(
+        monkeypatch, placement, placement.clone()
+    )
+
+    communicator.set_stream.assert_called_once_with(stream)
+    transfer_layer.assert_not_called()
+    stream.synchronize.assert_not_called()
+    all_reduce.assert_not_called()
+    assert pending_layers == []
+    assert model_state.pending_result is None
+    assert model_state.rebalanced is False
+
+
+def test_async_worker_transfers_only_changed_layers_and_completes_cycle(monkeypatch):
+    old_map = torch.tensor([[0, 1], [0, 1], [1, 0]], dtype=torch.int32)
+    new_map = torch.tensor([[0, 1], [1, 0], [1, 0]], dtype=torch.int32)
+
+    model_state, stream, _, transfer_layer, all_reduce, pending_layers = _run_one_async_cycle(
+        monkeypatch,
+        old_map,
+        new_map,
+    )
+
+    transfer_layer.assert_called_once()
+    assert transfer_layer.call_args.kwargs["layer_idx"] == 1
+    torch.testing.assert_close(
+        transfer_layer.call_args.kwargs["old_layer_indices"],
+        old_map[1],
+    )
+    torch.testing.assert_close(
+        transfer_layer.call_args.kwargs["new_layer_indices"],
+        new_map[1],
+    )
+    stream.synchronize.assert_called_once_with()
+    all_reduce.assert_called_once()
+    assert pending_layers == [1]
+    assert model_state.pending_result is None
+    assert model_state.rebalanced is False

@@ -7,6 +7,7 @@ from functools import wraps
 from inspect import signature
 
 from vllm.config import parallel as _parallel_config
+from vllm.distributed.eplb import async_worker as _eplb_async_worker
 from vllm.distributed.eplb import eplb_communicator as _eplb_communicator
 from vllm.distributed.eplb import eplb_state as _eplb_state
 
@@ -118,6 +119,115 @@ def _patch_async_move_to_workspace() -> None:
         _eplb_state._move_to_workspace = _wrap_move_to_workspace(original_move)
 
 
+def _transfer_run_periodically(
+    state,
+    cuda_stream,
+    is_profile: bool = False,
+) -> None:
+    """Run upstream async EPLB while omitting unchanged layers entirely."""
+    while True:
+        state.rearrange_event.wait(stream=cuda_stream)
+
+        eplb_group = _eplb_async_worker.get_eplb_group().device_group
+        eplb_cpu_group = _eplb_async_worker.get_eplb_group().cpu_group
+        ep_rank = eplb_group.rank()
+
+        assert state.is_async
+        for model_state in state.model_states.values():
+            layer_idx = 0
+            model_state.communicator.set_stream(cuda_stream)
+            num_layers = model_state.model.num_moe_layers
+
+            with _eplb_async_worker.torch.cuda.stream(cuda_stream):
+                physical_to_logical_map_cpu = model_state.physical_to_logical_map.cpu()
+
+            new_physical_to_logical_map = _eplb_async_worker.run_rebalance_experts(
+                model_state,
+                state,
+                physical_to_logical_map_cpu,
+                cuda_stream,
+            )
+
+            while layer_idx < num_layers:
+                old_layer_indices = physical_to_logical_map_cpu[layer_idx]
+                new_layer_indices = new_physical_to_logical_map[layer_idx]
+
+                # Both tensors contain the complete global placement, so every
+                # rank makes the same decision without another collective. An
+                # unchanged layer needs no transfer, map commit, routing-table
+                # refresh, stream synchronization, or main-thread acknowledgement.
+                if _eplb_async_worker.torch.equal(
+                    old_layer_indices,
+                    new_layer_indices,
+                ):
+                    layer_idx += 1
+                    continue
+
+                flag = _eplb_async_worker.torch.tensor(
+                    [int(model_state.rebalanced)],
+                    dtype=_eplb_async_worker.torch.int32,
+                    device="cpu",
+                )
+                _eplb_async_worker.torch.distributed.all_reduce(
+                    flag,
+                    group=eplb_cpu_group,
+                )
+                if int(flag.item()) != eplb_cpu_group.size():
+                    _eplb_async_worker.logger.warning(
+                        "async worker (rank=%d): layer %d coordinated stop (flag_sum=%d, group_size=%d)",
+                        ep_rank,
+                        layer_idx,
+                        int(flag.item()),
+                        eplb_cpu_group.size(),
+                    )
+                    model_state.rebalanced = False
+                    break
+
+                transfer_metadata = _eplb_async_worker.transfer_layer(
+                    old_layer_indices=old_layer_indices,
+                    new_layer_indices=new_layer_indices,
+                    expert_weights=model_state.model.expert_weights[layer_idx],
+                    expert_weights_buffer=model_state.expert_buffer,
+                    communicator=model_state.communicator,
+                    ep_group=eplb_group,
+                    is_profile=is_profile,
+                    cuda_stream=cuda_stream,
+                    layer_idx=layer_idx,
+                )
+
+                cuda_stream.synchronize()
+                consumed_event = _eplb_async_worker.CpuGpuEvent()
+                model_state.pending_result = _eplb_async_worker.AsyncEplbLayerResult(
+                    layer_idx=layer_idx,
+                    new_physical_to_logical_map=new_layer_indices,
+                    transfer_metadata=transfer_metadata,
+                    consumed_event=consumed_event,
+                )
+
+                consumed_event.wait(stream=cuda_stream)
+                assert model_state.pending_result is None
+                layer_idx += 1
+
+            # Upstream normally ends a cycle when the main thread consumes the
+            # final layer. If the final layer is skipped, there is no pending
+            # result to perform that transition, so the worker owns completion.
+            if layer_idx == num_layers:
+                model_state.rebalanced = False
+
+
+def _patch_async_transfer_worker() -> None:
+    original_worker = _eplb_async_worker.transfer_run_periodically
+    if getattr(original_worker, _PATCH_MARKER, False):
+        return
+    worker_signature = signature(original_worker)
+    required_parameters = {"state", "cuda_stream", "is_profile"}
+    if not required_parameters.issubset(worker_signature.parameters):
+        raise RuntimeError("Unsupported vLLM EPLB contract: async worker signature changed.")
+    setattr(_transfer_run_periodically, _PATCH_MARKER, True)
+    _eplb_async_worker.transfer_run_periodically = _transfer_run_periodically
+
+
 _patch_parallel_config()
 _patch_communicator_factory()
 _patch_async_move_to_workspace()
+_patch_async_transfer_worker()

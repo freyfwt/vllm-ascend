@@ -10,7 +10,9 @@ import torch
 from torch.distributed import all_reduce
 from vllm.distributed import get_ep_group
 from vllm.distributed.eplb import eplb_state as _eplb_state
+from vllm.logger import logger
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
 
 
@@ -89,6 +91,15 @@ class AscendEplbState(_eplb_state.EplbState):
         # accelerator device and create an NPU stream.
         if self.cuda_device_index is None:
             self.cuda_device_index = torch.accelerator.current_device_index()
+
+    def add_model(self, model, model_config) -> None:
+        super().add_model(model, model_config)
+        placement_policy = get_ascend_config().eplb_config.placement_policy
+        if placement_policy == "swift":
+            from vllm_ascend.distributed.eplb_policy import SwiftEplbPolicyAdapter
+
+            self.policy = SwiftEplbPolicyAdapter
+            logger.info("Selected Ascend EPLB placement policy: swift")
 
     def step(
         self,

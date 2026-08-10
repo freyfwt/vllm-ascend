@@ -99,6 +99,34 @@ class TestNPUPlatform(TestBase):
             "torch_nccl",
         )
 
+    def test_validate_eplb_config_allows_v2_swift_placement_policy(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.enable_elastic_ep = False
+        vllm_config.additional_config = {"eplb_config": {"placement_policy": "swift"}}
+
+        with patch.dict("os.environ", {}, clear=True):
+            _validate_eplb_config(vllm_config)
+
+    def test_validate_eplb_config_requires_eplb_for_placement_policy(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.additional_config = {"eplb_config": {"placement_policy": "swift"}}
+
+        with self.assertRaisesRegex(ValueError, "placement_policy requires --enable-eplb"):
+            _validate_eplb_config(vllm_config)
+
+    def test_validate_eplb_config_rejects_swift_with_elastic_ep(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.enable_elastic_ep = True
+        vllm_config.additional_config = {"eplb_config": {"placement_policy": "swift"}}
+
+        with self.assertRaisesRegex(ValueError, "Swift EPLB placement policy"):
+            _validate_eplb_config(vllm_config)
+
     def test_validate_eplb_config_replaces_upstream_gloo_default(self):
         vllm_config = self.mock_vllm_config()
         vllm_config.use_v2_model_runner = True
@@ -178,6 +206,13 @@ class TestNPUPlatform(TestBase):
         vllm_config = self.mock_vllm_config()
         vllm_config.use_v2_model_runner = False
         vllm_config.additional_config = {"eplb_config": {"load_collection_phase": "decode"}}
+
+        with self.assertRaisesRegex(ValueError, "only supported by Model Runner V2"):
+            _validate_eplb_config(vllm_config)
+
+    def test_validate_eplb_config_rejects_v1_placement_policy(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.additional_config = {"eplb_config": {"placement_policy": "swift"}}
 
         with self.assertRaisesRegex(ValueError, "only supported by Model Runner V2"):
             _validate_eplb_config(vllm_config)

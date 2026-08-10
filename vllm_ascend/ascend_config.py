@@ -823,6 +823,8 @@ class EplbConfig:
         # upstream EPLB expert-load window; any prefill request marks the batch
         # as prefill.
         "load_collection_phase": "all",
+        # Model Runner V2 only. When unset, keep the upstream EPLB policy.
+        "placement_policy": None,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -872,6 +874,8 @@ class EplbConfig:
             raise ValueError('eplb_heat_collection_stage must be one of ["all", "prefill", "decode"]')
         if self.load_collection_phase not in ["all", "prefill", "decode"]:
             raise ValueError('load_collection_phase must be one of ["all", "prefill", "decode"]')
+        if self.placement_policy not in [None, "swift"]:
+            raise ValueError('placement_policy must be null or "swift"')
 
         logger.info("Dynamic EPLB is %s", self.config["dynamic_eplb"])
         logger.info("The number of redundant experts is %s", self.config["num_redundant_experts"])

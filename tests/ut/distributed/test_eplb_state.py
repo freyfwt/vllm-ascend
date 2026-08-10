@@ -8,6 +8,7 @@ import torch
 from vllm.distributed.eplb import eplb_state as upstream_eplb_state
 
 from vllm_ascend.distributed import eplb_state
+from vllm_ascend.distributed.eplb_policy import SwiftEplbPolicyAdapter
 from vllm_ascend.distributed.eplb_state import (
     AscendEplbLayerState,
     AscendEplbState,
@@ -123,3 +124,70 @@ def test_init_sets_cuda_device_index_for_npu(monkeypatch):
     state = AscendEplbState(parallel_config, torch.device("cpu"))
 
     assert state.cuda_device_index == 5
+
+
+def test_add_model_keeps_upstream_policy_without_override(monkeypatch):
+    upstream_policy = object()
+
+    def upstream_add_model(self, model, model_config):
+        self.policy = upstream_policy
+
+    monkeypatch.setattr(upstream_eplb_state.EplbState, "add_model", upstream_add_model)
+    monkeypatch.setattr(
+        eplb_state,
+        "get_ascend_config",
+        lambda: SimpleNamespace(eplb_config=SimpleNamespace(placement_policy=None)),
+    )
+    state = AscendEplbState.__new__(AscendEplbState)
+
+    state.add_model(object(), object())
+
+    assert state.policy is upstream_policy
+
+
+def test_normal_add_model_selects_swift_policy(monkeypatch):
+    monkeypatch.setattr(upstream_eplb_state.EplbState, "add_model", lambda self, model, model_config: None)
+    monkeypatch.setattr(
+        eplb_state,
+        "get_ascend_config",
+        lambda: SimpleNamespace(eplb_config=SimpleNamespace(placement_policy="swift")),
+    )
+    state = AscendEplbState.__new__(AscendEplbState)
+
+    state.add_model(object(), object())
+
+    assert state.policy is SwiftEplbPolicyAdapter
+
+
+def test_from_mapping_selects_swift_policy_through_add_model(monkeypatch):
+    def upstream_add_model(self, model, model_config):
+        self.policy = object()
+
+    def upstream_from_mapping(cls, model, model_config, **kwargs):
+        state = cls.__new__(cls)
+        state.model_states = {}
+        state.add_model(model, model_config)
+        return state
+
+    monkeypatch.setattr(upstream_eplb_state.EplbState, "add_model", upstream_add_model)
+    monkeypatch.setattr(
+        upstream_eplb_state.EplbState,
+        "from_mapping",
+        classmethod(upstream_from_mapping),
+    )
+    monkeypatch.setattr(
+        eplb_state,
+        "get_ascend_config",
+        lambda: SimpleNamespace(eplb_config=SimpleNamespace(placement_policy="swift")),
+    )
+
+    state = AscendEplbState.from_mapping(
+        model=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+        parallel_config=object(),
+        expanded_physical_to_logical=torch.zeros(1),
+        num_valid_physical_experts=1,
+    )
+
+    assert state.policy is SwiftEplbPolicyAdapter

@@ -116,6 +116,12 @@ class TestAscendConfig(TestBase):
         with self.assertRaisesRegex(ValueError, "load_collection_phase must be one of"):
             EplbConfig({"load_collection_phase": "prompt"})
 
+    def test_eplb_placement_policy_validation(self):
+        self.assertIsNone(EplbConfig().placement_policy)
+        self.assertEqual(EplbConfig({"placement_policy": "swift"}).placement_policy, "swift")
+        with self.assertRaisesRegex(ValueError, "placement_policy must be null or"):
+            EplbConfig({"placement_policy": "unknown"})
+
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_without_additional_config(self, mock_fix_incompatible_config):

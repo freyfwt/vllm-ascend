@@ -861,10 +861,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
 
     use_v2_model_runner = bool(getattr(vllm_config, "use_v2_model_runner", False))
     if use_v2_model_runner:
-        legacy_eplb_fields = sorted(set(eplb_config) - {"load_collection_phase"})
+        legacy_eplb_fields = sorted(set(eplb_config) - {"load_collection_phase", "placement_policy"})
         if legacy_eplb_fields:
             raise ValueError(
-                "Model Runner V2 only accepts 'load_collection_phase' in "
+                "Model Runner V2 only accepts 'load_collection_phase' and "
+                "'placement_policy' in "
                 "additional_config.eplb_config; legacy fields are not supported: "
                 f"{', '.join(legacy_eplb_fields)}."
             )
@@ -878,6 +879,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
         load_collection_phase = eplb_config.get("load_collection_phase", "all")
         if load_collection_phase != "all" and not vllm_config.parallel_config.enable_eplb:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
+        placement_policy = eplb_config.get("placement_policy")
+        if placement_policy is not None and not vllm_config.parallel_config.enable_eplb:
+            raise ValueError("additional_config.eplb_config.placement_policy requires --enable-eplb.")
+        if placement_policy == "swift" and vllm_config.parallel_config.enable_elastic_ep:
+            raise ValueError("The Swift EPLB placement policy does not support elastic EP.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config
             if upstream_eplb_config.use_async:
@@ -906,10 +912,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                 # default before this platform hook runs. Ascend maps torch_nccl
                 # to torch.distributed over the HCCL device process group.
                 upstream_eplb_config.communicator = "torch_nccl"
-    elif "load_collection_phase" in eplb_config:
+    elif "load_collection_phase" in eplb_config or "placement_policy" in eplb_config:
         raise ValueError(
-            "additional_config.eplb_config.load_collection_phase is only supported by "
-            "Model Runner V2; use eplb_heat_collection_stage with Model Runner V1."
+            "additional_config.eplb_config.load_collection_phase and placement_policy "
+            "are only supported by Model Runner V2; use eplb_heat_collection_stage "
+            "and eplb_policy_type with Model Runner V1."
         )
     elif vllm_config.parallel_config.enable_eplb:
         raise ValueError("Upstream EPLB is only supported by Model Runner V2 on Ascend.")

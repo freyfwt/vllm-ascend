@@ -120,6 +120,7 @@ class TestAscendConfig(TestBase):
         self.assertIsNone(EplbConfig().placement_policy)
         self.assertEqual(EplbConfig({"placement_policy": "swift"}).placement_policy, "swift")
         self.assertEqual(EplbConfig({"placement_policy": "flashlb"}).placement_policy, "flashlb")
+        self.assertEqual(EplbConfig({"placement_policy": "stair"}).placement_policy, "stair")
         with self.assertRaisesRegex(ValueError, "placement_policy must be null"):
             EplbConfig({"placement_policy": "unknown"})
 

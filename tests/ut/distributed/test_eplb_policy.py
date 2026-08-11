@@ -5,11 +5,13 @@ import torch
 
 from vllm_ascend.distributed.eplb_policy import (
     FlashLBEplbPolicyAdapter,
+    StairEplbPolicyAdapter,
     SwiftEplbPolicyAdapter,
     _expand_logical_load_to_slots,
     _expand_logical_load_window_to_slots,
-    _reject_invalid_flashlb_layers,
+    _reject_invalid_placement_layers,
 )
+from vllm_ascend.eplb.core.policy.policy_stair import compute_balance_score
 from vllm_ascend.eplb.core.policy.policy_swift_balancer import SwiftBalanceEplb
 
 
@@ -77,7 +79,7 @@ def test_flashlb_adapter_preserves_v2_contract_and_only_applies_priority_layers(
     torch.testing.assert_close(result[1], placement[1])
 
 
-def test_reject_invalid_flashlb_layers_matches_v1_worker_constraints():
+def test_reject_invalid_placement_layers_matches_v1_worker_constraints():
     old_placement = torch.tensor(
         [[0, 1, 2, 3, 0, 1], [0, 1, 2, 3, 0, 1]],
         dtype=torch.long,
@@ -90,10 +92,11 @@ def test_reject_invalid_flashlb_layers_matches_v1_worker_constraints():
         dtype=torch.long,
     )
 
-    rejected = _reject_invalid_flashlb_layers(
+    rejected = _reject_invalid_placement_layers(
         old_placement,
         proposed_placement,
         num_ranks=2,
+        num_logical_experts=4,
     )
 
     assert rejected == [1]
@@ -218,3 +221,69 @@ def test_swift_adapter_rejects_missing_or_invalid_placement():
             assert error in str(exc)
         else:
             raise AssertionError("Expected invalid Swift placement to fail.")
+
+
+def test_stair_adapter_preserves_inputs_contract_and_improves_balance():
+    logical_load_window = torch.tensor(
+        [
+            [[1, 1, 100, 80]],
+            [[1, 1, 120, 60]],
+            [[1, 1, 80, 100]],
+            [[1, 1, 110, 70]],
+        ],
+        dtype=torch.int32,
+    )
+    placement = torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.long)
+    original_load = logical_load_window.clone()
+    original_placement = placement.clone()
+
+    result = StairEplbPolicyAdapter.rebalance_experts(
+        logical_load_window,
+        num_replicas=6,
+        num_groups=1,
+        num_nodes=1,
+        num_ranks=2,
+        old_global_expert_indices=placement,
+    )
+
+    assert StairEplbPolicyAdapter.uses_expert_load_time_series
+    assert result.shape == placement.shape
+    assert result.dtype == torch.long
+    assert result.device.type == "cpu"
+    assert result.is_contiguous()
+    torch.testing.assert_close(logical_load_window, original_load)
+    torch.testing.assert_close(placement, original_placement)
+    old_score = compute_balance_score(
+        logical_load_window[:, 0].numpy(),
+        placement.reshape(2, 3).numpy(),
+    )
+    new_score = compute_balance_score(
+        logical_load_window[:, 0].numpy(),
+        result.reshape(2, 3).numpy(),
+    )
+    assert new_score < old_score
+    for rank in result.reshape(2, 3):
+        assert torch.unique(rank).numel() == rank.numel()
+
+
+def test_stair_adapter_rejects_missing_or_invalid_placement():
+    logical_load_window = torch.ones((2, 1, 4), dtype=torch.int32)
+
+    for placement, error in [
+        (None, "requires the current"),
+        (torch.tensor([[0, 1, 2, 4]]), "invalid logical expert"),
+        (torch.tensor([[0, 0, 1, 2]]), "at least one physical replica"),
+    ]:
+        try:
+            StairEplbPolicyAdapter.rebalance_experts(
+                logical_load_window,
+                num_replicas=4,
+                num_groups=1,
+                num_nodes=1,
+                num_ranks=2,
+                old_global_expert_indices=placement,
+            )
+        except ValueError as exc:
+            assert error in str(exc)
+        else:
+            raise AssertionError("Expected invalid STAIR placement to fail.")

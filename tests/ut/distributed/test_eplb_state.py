@@ -10,6 +10,7 @@ from vllm.distributed.eplb import eplb_state as upstream_eplb_state
 from vllm_ascend.distributed import eplb_state
 from vllm_ascend.distributed.eplb_policy import (
     FlashLBEplbPolicyAdapter,
+    StairEplbPolicyAdapter,
     SwiftEplbPolicyAdapter,
 )
 from vllm_ascend.distributed.eplb_state import (
@@ -177,6 +178,20 @@ def test_normal_add_model_selects_flashlb_policy(monkeypatch):
 
     assert state.policy is FlashLBEplbPolicyAdapter
     warm_up.assert_called_once_with()
+
+
+def test_normal_add_model_selects_stair_policy(monkeypatch):
+    monkeypatch.setattr(upstream_eplb_state.EplbState, "add_model", lambda self, model, model_config: None)
+    monkeypatch.setattr(
+        eplb_state,
+        "get_ascend_config",
+        lambda: SimpleNamespace(eplb_config=SimpleNamespace(placement_policy="stair")),
+    )
+    state = AscendEplbState.__new__(AscendEplbState)
+
+    state.add_model(object(), object())
+
+    assert state.policy is StairEplbPolicyAdapter
 
 
 def test_from_mapping_selects_swift_policy_through_add_model(monkeypatch):

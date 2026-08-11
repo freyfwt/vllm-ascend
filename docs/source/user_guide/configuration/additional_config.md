@@ -128,11 +128,11 @@ The details of each configuration option are as follows:
 
 The accepted fields depend on the model runner:
 
-- **Model Runner V2** accepts only `load_collection_phase` here. Configure
-  upstream EPLB through `--enable-eplb` and `--eplb-config`, and set
-  `--eplb-config.use_async false` on Ascend.
+- **Model Runner V2** accepts `load_collection_phase` and `placement_policy`
+  here. Configure other EPLB options through `--enable-eplb` and
+  `--eplb-config`.
 - **Model Runner V1** accepts the legacy fields below except
-  `load_collection_phase`.
+  `load_collection_phase` and `placement_policy`.
   MRv1 does not accept upstream `--enable-eplb` on Ascend.
 
 Mixing the two schemas fails during startup instead of silently ignoring
@@ -149,6 +149,7 @@ configuration.
 | `eplb_policy_type`               | int | `2`    | MRv1 only. EPLB policy: `0`=Random, `1`=DefaultEplb, `2`=SwiftBalanceEplb, `3`=FlashLB. |
 | `eplb_heat_collection_stage`     | str | `"all"`| MRv1 only. Select `"all"`, `"prefill"`, or `"decode"` heat collection. |
 | `load_collection_phase`          | str | `"all"`| MRv2 only. Select `"all"`, `"prefill"`, or `"decode"` load submission. Any batch containing a prefill request is classified entirely as prefill. |
+| `placement_policy`               | str | `None`  | MRv2 only. Select the upstream default when unset, or choose the Ascend `"swift"`, `"flashlb"`, or `"stair"` placement policy. |
 
 **scheduler_config**
 

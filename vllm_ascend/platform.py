@@ -882,8 +882,12 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
         placement_policy = eplb_config.get("placement_policy")
         if placement_policy is not None and not vllm_config.parallel_config.enable_eplb:
             raise ValueError("additional_config.eplb_config.placement_policy requires --enable-eplb.")
-        if placement_policy in ("swift", "flashlb") and vllm_config.parallel_config.enable_elastic_ep:
-            policy_name = "Swift" if placement_policy == "swift" else "FlashLB"
+        if placement_policy in ("swift", "flashlb", "stair") and vllm_config.parallel_config.enable_elastic_ep:
+            policy_name = {
+                "swift": "Swift",
+                "flashlb": "FlashLB",
+                "stair": "STAIR",
+            }[placement_policy]
             raise ValueError(f"The {policy_name} EPLB placement policy does not support elastic EP.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config

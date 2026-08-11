@@ -106,6 +106,11 @@ class AscendEplbState(_eplb_state.EplbState):
             FlashLBEplbPolicyAdapter.warm_up()
             self.policy = FlashLBEplbPolicyAdapter
             logger.info("Selected Ascend EPLB placement policy: flashlb")
+        elif placement_policy == "stair":
+            from vllm_ascend.distributed.eplb_policy import StairEplbPolicyAdapter
+
+            self.policy = StairEplbPolicyAdapter
+            logger.info("Selected Ascend EPLB placement policy: stair")
 
     def step(
         self,

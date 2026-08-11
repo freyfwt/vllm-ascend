@@ -9,6 +9,7 @@ import torch
 from vllm.distributed.eplb.policy.abstract import AbstractEplbPolicy
 from vllm.logger import logger
 
+from vllm_ascend.eplb.core.policy.policy_stair import StairEplbPolicy
 from vllm_ascend.eplb.core.policy.policy_swift_balancer import SwiftBalanceEplb
 
 
@@ -99,10 +100,11 @@ def _expand_logical_load_window_to_slots(
     return logical_load_fp64.gather(2, placement_window) / slot_replica_counts
 
 
-def _reject_invalid_flashlb_layers(
+def _reject_invalid_placement_layers(
     old_placement: torch.Tensor,
     proposed_placement: torch.Tensor,
     num_ranks: int,
+    num_logical_experts: int,
 ) -> list[int]:
     """Apply the placement checks used by the Model Runner V1 EPLB worker."""
     slots_per_rank = old_placement.shape[1] // num_ranks
@@ -110,7 +112,11 @@ def _reject_invalid_flashlb_layers(
     for layer_idx in range(old_placement.shape[0]):
         old_layer = old_placement[layer_idx]
         new_layer = proposed_placement[layer_idx]
-        if torch.unique(new_layer).numel() < torch.unique(old_layer).numel():
+        if (
+            bool((new_layer < 0).any())
+            or bool((new_layer >= num_logical_experts).any())
+            or torch.unique(new_layer).numel() != num_logical_experts
+        ):
             rejected_layers.append(layer_idx)
             continue
 
@@ -260,10 +266,11 @@ class FlashLBEplbPolicyAdapter(AbstractEplbPolicy):
             weight.shape[1], num_replicas
         )
         result[priority_tensor] = new_placement_tensor[priority_tensor]
-        rejected_layers = _reject_invalid_flashlb_layers(
+        rejected_layers = _reject_invalid_placement_layers(
             old_placement,
             result,
             num_ranks,
+            weight.shape[2],
         )
         changed_layer_count = int(torch.any(result != old_placement, dim=1).sum().item())
         logger.info(
@@ -273,3 +280,66 @@ class FlashLBEplbPolicyAdapter(AbstractEplbPolicy):
             changed_layer_count,
         )
         return result.contiguous()
+
+
+class StairEplbPolicyAdapter(AbstractEplbPolicy):
+    """Expose the V2-native STAIR policy through the upstream contract."""
+
+    uses_expert_load_time_series = True
+
+    @classmethod
+    def rebalance_experts(
+        cls,
+        weight: torch.Tensor,
+        num_replicas: int,
+        num_groups: int,
+        num_nodes: int,
+        num_ranks: int,
+        old_global_expert_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if old_global_expert_indices is None:
+            raise ValueError("STAIR EPLB requires the current physical-to-logical map.")
+        if num_replicas <= 0 or num_groups <= 0 or num_nodes <= 0 or num_ranks <= 0:
+            raise ValueError("num_replicas, num_groups, num_nodes, and num_ranks must be positive.")
+        if num_replicas % num_ranks != 0:
+            raise ValueError(f"num_replicas ({num_replicas}) must be divisible by num_ranks ({num_ranks}).")
+        if num_ranks % num_nodes != 0:
+            raise ValueError(f"num_ranks ({num_ranks}) must be divisible by num_nodes ({num_nodes}).")
+        if weight.ndim != 3:
+            raise ValueError(f"STAIR EPLB requires [window, layers, experts] load, got {tuple(weight.shape)}.")
+        if weight.device.type != "cpu" or old_global_expert_indices.device.type != "cpu":
+            raise ValueError("STAIR EPLB policy inputs must be CPU tensors.")
+        if old_global_expert_indices.shape != (weight.shape[1], num_replicas):
+            raise ValueError(
+                "Current placement shape must be [layers, num_replicas], got "
+                f"{tuple(old_global_expert_indices.shape)} for weight shape {tuple(weight.shape)} "
+                f"and num_replicas={num_replicas}."
+            )
+
+        old_placement = old_global_expert_indices.detach().to(dtype=torch.long).clone()
+        if not bool(weight.any()):
+            return old_placement.contiguous()
+
+        start_time = time.perf_counter()
+        new_placement = StairEplbPolicy.rebalance_experts(
+            weight.detach().contiguous().numpy(),
+            old_placement.numpy(),
+            num_ranks,
+        )
+        compute_ms = (time.perf_counter() - start_time) * 1000
+        result = torch.from_numpy(new_placement).to(dtype=torch.long).contiguous()
+        rejected_layers = _reject_invalid_placement_layers(
+            old_placement,
+            result,
+            num_ranks,
+            weight.shape[2],
+        )
+        changed_layer_count = int(torch.any(result != old_placement, dim=1).sum().item())
+        logger.info(
+            "STAIR EPLB policy computation completed in %.3f ms; rejected %d invalid layers; "
+            "%d placement rows changed.",
+            compute_ms,
+            len(rejected_layers),
+            changed_layer_count,
+        )
+        return result

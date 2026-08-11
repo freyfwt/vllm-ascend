@@ -141,6 +141,32 @@ def _reject_invalid_placement_layers(
     return rejected_layers
 
 
+def _calculate_swift_placement(
+    logical_load: torch.Tensor,
+    old_placement: torch.Tensor,
+    num_nodes: int,
+    num_ranks: int,
+) -> torch.Tensor:
+    """Generate a complete placement with the Model Runner V1 Swift policy."""
+    slots_per_rank = old_placement.shape[1] // num_ranks
+    slot_load = _expand_logical_load_to_slots(logical_load, old_placement)
+    legacy_placement = old_placement.reshape(logical_load.shape[0], num_ranks, slots_per_rank)
+    legacy_slot_load = slot_load.reshape(logical_load.shape[0], num_ranks, slots_per_rank)
+
+    policy = SwiftBalanceEplb()
+    policy.num_die_per_host = num_ranks // num_nodes
+    _, _, new_placement = policy.rebalance_experts(
+        legacy_placement,
+        legacy_slot_load,
+        is_node_redundant=False,
+    )
+    return (
+        torch.as_tensor(new_placement, dtype=torch.long, device="cpu")
+        .reshape(logical_load.shape[0], old_placement.shape[1])
+        .contiguous()
+    )
+
+
 class SwiftEplbPolicyAdapter(AbstractEplbPolicy):
     """Adapt the existing Model Runner V1 Swift policy to the V2 contract."""
 
@@ -170,28 +196,18 @@ class SwiftEplbPolicyAdapter(AbstractEplbPolicy):
                 f"and num_replicas={num_replicas}."
             )
 
-        slots_per_rank = num_replicas // num_ranks
         old_placement = old_global_expert_indices.detach().to(dtype=torch.long).clone()
-        slot_load = _expand_logical_load_to_slots(weight, old_placement)
-        legacy_placement = old_placement.reshape(weight.shape[0], num_ranks, slots_per_rank)
-        legacy_slot_load = slot_load.reshape(weight.shape[0], num_ranks, slots_per_rank)
 
         start_time = time.perf_counter()
-        policy = SwiftBalanceEplb()
-        policy.num_die_per_host = num_ranks // num_nodes
-        _, _, new_placement = policy.rebalance_experts(
-            legacy_placement,
-            legacy_slot_load,
-            is_node_redundant=False,
+        result = _calculate_swift_placement(
+            weight,
+            old_placement,
+            num_nodes,
+            num_ranks,
         )
         compute_ms = (time.perf_counter() - start_time) * 1000
         logger.info("Swift EPLB policy computation completed in %.3f ms.", compute_ms)
-
-        return (
-            torch.as_tensor(new_placement, dtype=torch.long, device="cpu")
-            .reshape(weight.shape[0], num_replicas)
-            .contiguous()
-        )
+        return result
 
 
 class FlashLBEplbPolicyAdapter(AbstractEplbPolicy):
@@ -322,11 +338,25 @@ class StairEplbPolicyAdapter(AbstractEplbPolicy):
             return old_placement.contiguous()
 
         start_time = time.perf_counter()
+        swift_candidate = _calculate_swift_placement(
+            weight.sum(dim=0),
+            old_placement,
+            num_nodes,
+            num_ranks,
+        )
+        candidate_layer_count = int(torch.any(swift_candidate != old_placement, dim=1).sum().item())
+        candidate_rejected_layers = _reject_invalid_placement_layers(
+            old_placement,
+            swift_candidate,
+            num_ranks,
+            weight.shape[2],
+        )
         weight_array = weight.detach().contiguous().numpy()
         old_placement_array = old_placement.numpy()
         new_placement = cls._policy.rebalance_experts(
             weight_array,
             old_placement_array,
+            swift_candidate.numpy(),
             num_ranks,
         )
         compute_ms = (time.perf_counter() - start_time) * 1000
@@ -345,9 +375,11 @@ class StairEplbPolicyAdapter(AbstractEplbPolicy):
         )
         changed_layer_count = int(torch.any(result != old_placement, dim=1).sum().item())
         logger.info(
-            "STAIR EPLB policy computation completed in %.3f ms; rejected %d invalid layers; "
-            "%d placement rows changed.",
+            "STAIR EPLB policy computation completed in %.3f ms; Swift proposed %d layers; "
+            "rejected %d invalid Swift layers and %d invalid final layers; accepted %d layers.",
             compute_ms,
+            candidate_layer_count,
+            len(candidate_rejected_layers),
             len(rejected_layers),
             changed_layer_count,
         )

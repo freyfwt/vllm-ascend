@@ -3,6 +3,7 @@
 
 import torch
 
+import vllm_ascend.distributed.eplb_policy as eplb_policy
 from vllm_ascend.distributed.eplb_policy import (
     FlashLBEplbPolicyAdapter,
     StairEplbPolicyAdapter,
@@ -226,10 +227,10 @@ def test_swift_adapter_rejects_missing_or_invalid_placement():
 def test_stair_adapter_preserves_inputs_contract_and_improves_balance(monkeypatch):
     logical_load_window = torch.tensor(
         [
-            [[1, 1, 100, 80]],
-            [[1, 1, 120, 60]],
-            [[1, 1, 80, 100]],
-            [[1, 1, 110, 70]],
+            [[1, 1, 100, 1]],
+            [[1, 1, 120, 1]],
+            [[1, 1, 80, 1]],
+            [[1, 1, 110, 1]],
         ],
         dtype=torch.int32,
     )
@@ -265,6 +266,46 @@ def test_stair_adapter_preserves_inputs_contract_and_improves_balance(monkeypatc
     assert new_score < old_score
     for rank in result.reshape(2, 3):
         assert torch.unique(rank).numel() == rank.numel()
+
+
+def test_stair_adapter_filters_swift_candidates_with_the_full_time_series(monkeypatch):
+    logical_load_window = torch.tensor(
+        [
+            [[100, 90, 1, 1], [100, 1, 90, 1]],
+            [[90, 100, 1, 1], [90, 1, 100, 1]],
+        ],
+        dtype=torch.int32,
+    )
+    placement = torch.tensor(
+        [[0, 1, 2, 3], [0, 1, 2, 3]],
+        dtype=torch.long,
+    )
+    swift_candidate = torch.tensor(
+        [[0, 2, 1, 3], [0, 2, 1, 3]],
+        dtype=torch.long,
+    )
+    observed_logical_load = None
+
+    def fake_calculate_swift_placement(logical_load, old_placement, num_nodes, num_ranks):
+        nonlocal observed_logical_load
+        observed_logical_load = logical_load.clone()
+        return swift_candidate.clone()
+
+    monkeypatch.setattr(eplb_policy, "_calculate_swift_placement", fake_calculate_swift_placement)
+    monkeypatch.setattr(StairEplbPolicyAdapter, "_policy", StairEplbPolicy())
+
+    result = StairEplbPolicyAdapter.rebalance_experts(
+        logical_load_window,
+        num_replicas=4,
+        num_groups=1,
+        num_nodes=1,
+        num_ranks=2,
+        old_global_expert_indices=placement,
+    )
+
+    torch.testing.assert_close(observed_logical_load, logical_load_window.sum(dim=0))
+    torch.testing.assert_close(result[0], swift_candidate[0])
+    torch.testing.assert_close(result[1], placement[1])
 
 
 def test_stair_adapter_rejects_missing_or_invalid_placement(monkeypatch):

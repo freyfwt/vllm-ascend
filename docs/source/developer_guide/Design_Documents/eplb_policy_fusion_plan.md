@@ -2,403 +2,194 @@
 
 ## 状态
 
-本文档记录 Model Runner V2 STAIR EPLB placement policy 的已确认设计，作为实现、测试和性能实验的依据。当前分支已包含实验实现；是否保留该实现由后续 NPU 等价实验决定。
+本文档记录 STAIR 在真实负载回放校正后的实现设计。STAIR 是 **Statistical Temporal-Aware Incremental Rebalancing** 的缩写，配置值为 `stair`，核心类为 `StairEplbPolicy`，V2 adapter 为 `StairEplbPolicyAdapter`。
 
-STAIR 是 **Statistical Temporal-Aware Incremental Rebalancing** 的缩写。本方案融合 Swift 和 FlashLB 的有效部分，但不直接串联两套现有实现。其中，Statistical Temporal-Aware 对应 FlashLB 的时间序列统计和均衡评分，Incremental Rebalancing 对应 Swift 基于当前 placement 的增量构造；副本分配、合法性约束和局部优化由 STAIR 重新实现。
+STAIR 不建立搬运成本模型，不依赖离线 profiling，也不增加用户参数。它复用 Swift 生成完整、稳定、满足现有搬运约束的候选 placement，再使用 FlashLB 的时间序列评分和跨窗口 hysteresis 决定是否接受候选层。
 
-正式命名已经确认：配置值为 `stair`，算法核心类为 `StairEplbPolicy`，V2 adapter 类为 `StairEplbPolicyAdapter`，核心文件为 `policy_stair.py`。本文后续使用 “STAIR” 指代该实现。
+## 回放校正
 
-## 结论
+第一版 STAIR 自行使用当前 50-step 窗口的均值、方差和协方差重新分配冗余副本，并把 Swift 的 `num_max_com=1` 误实现为整层硬搬运上限。真实 V2 负载回放证明这两个设计会放大搬运量：
 
-新 policy 只优化负载均衡，不建立搬运成本模型。它不依赖离线 profiling，不进行在线成本校准，也不增加任何与硬件带宽、专家字节数或预期回本周期有关的用户配置。
+- 七个连续窗口中，第一版 STAIR 选择了 210 个 layer transfer，48 层全部发生过变化，多数层重复变化 5～7 次；
+- 336 个“层×窗口”替换候选中，213 个因硬通信上限只完成了部分目标；
+- 即使将每层目标在同一窗口补齐，仍会产生 188 个 layer transfer；
+- 相邻 50-step 窗口有 43～47 层的冗余专家目标变化，说明主要问题是统计目标追逐短窗口噪声；
+- 对相同负载执行“Swift 完整候选 + FlashLB 时间序列收益校验”，七个窗口只接受 19 个完整 layer transfer。
 
-整个决策过程仍以最小化采样窗口内各 rank 峰值负载相对平均负载的比值为主目标，但恢复 Swift 和 FlashLB 中适合增量决策的更新刹车。只有失衡恶化或单步收益足够显著时才允许更新；rank-pair 通信次数也作为硬约束。placement 变化量继续作为等价候选的次级排序条件。
-
-## 背景
-
-当前 Swift 和 FlashLB 各自解决了问题的一部分：
-
-- Swift 从当前 placement 出发重新分配冗余专家，并在构造过程中避免同一专家重复出现在同一 rank。它的增量构造和本地槽位保留更接近异步 EPLB 的真实 placement 约束，但只使用窗口汇总负载，没有跨时间样本的风险信息，当前副本负载递推和跨层平均负载计算也存在问题。
-- FlashLB 使用负载时间序列计算均值、方差和协方差，并在真实时间样本上评价候选 placement。它能够减少稳定窗口中的重复更新，但当前副本分配没有限制单专家副本数不超过 rank 数，placement 生成器在不存在合法目标 rank 时仍继续写入结果，且内部状态可能在 adapter 拒绝非法层之前被更新。
-
-在当前等价实验中，Swift 产生了 198 个 global layer transfer；FlashLB 产生了 32 个，并在完成前两轮调整后连续七轮保持零变化。该结果说明时间序列评分和更新门槛有价值，但 FlashLB 当前生成 placement 的方式不能直接作为生产实现。新 policy 因此采用新的单一流程，而不是在一个 policy 的输出上调用另一个 policy 做修补。
+因此，最终设计不再维护第二套副本分配和 placement planner。STAIR 的融合边界改为：Swift 负责候选生成，FlashLB 负责时序接受。该组合直接复用已验证的 Swift 搬运语义，同时阻止聚合窗口上的偶然改善转化为没有时序收益的真实搬运。
 
 ## 目标与非目标
 
 ### 目标
 
-1. 原生接收 Model Runner V2 的逻辑专家负载时间序列和当前 physical-to-logical map。
-2. 使用窗口时间序列评价当前 placement 和候选 placement 的真实均衡效果。
-3. 生成满足专家覆盖、rank 容量和同 rank 唯一性约束的 placement。
-4. 从当前 placement 增量构造候选，并在均衡效果等价时保留更多现有专家和槽位。
-5. 保留 FlashLB 的跨窗口均衡历史，但只在候选通过 adapter 最终校验后记录；下一窗口的当前 placement 与预期结果不一致时立即丢弃历史。
-6. 不修改 Model Runner V2 现有 load collection、异步 worker、传输、commit 和 routing table 刷新流程。
-7. 不增加 NPU 同步，不在 forward 热路径增加 Python 逻辑。
+1. 原生接收 Model Runner V2 的 `[T,L,E]` 逻辑专家负载时间序列和 `[L,P]` physical-to-logical map。
+2. 保留 Swift 的层级失衡门槛、局部交换收益门槛、通信约束和完整 placement 生成行为。
+3. 使用完整时间序列评价 Swift 候选，只提交真实改善均衡分数的层。
+4. 保留 FlashLB 的跨窗口 hysteresis，并只记录最终实际提交的 placement。
+5. 保持上游 Model Runner V2 的异步 load collection、policy worker、传输、commit 和 routing table 刷新流程不变。
+6. 不增加 NPU 同步，不在 forward 热路径增加 Python 逻辑。
 
 ### 非目标
 
 本方案不包含：
 
-- 搬运耗时预测或收益回本模型；
-- D2H、Gloo、H2D 或 ready-to-consume 成本参数；
+- 搬运耗时预测、收益回本模型或硬件成本参数；
 - 离线或启动时 profiling；
-- 在线传输成本拟合；
 - 用户可配置的 changed-layer 或 changed-expert 搬运预算；
-- 跨节点搬运 penalty；
 - 独立 policy 子进程；
-- Gloo/HCCL 传输机制修改；
-- Swift 或 FlashLB 现有实现的兼容性重构；
-- Model Runner V1 policy 行为修改。
+- Gloo/HCCL、D2H、H2D 或 ready-to-consume 生命周期修改；
+- Swift、FlashLB 或 Model Runner V1 的行为修改；
+- Swift 的整轮 5% 全局收益门槛。
 
-TTFT、TPOT、端到端耗时和搬运量仍作为实验指标记录，但不反馈到新 policy 的目标函数。
+TTFT、TPOT、端到端耗时和搬运量只作为实验指标，不反馈到 policy 的目标函数。
 
-## 输入、输出与负载模型
+## 输入、输出与均衡分数
 
-新 policy 通过 Model Runner V2 的 `AbstractEplbPolicy` 接口运行，并声明需要时间序列输入。主要输入为：
+STAIR 通过 Model Runner V2 的 `AbstractEplbPolicy` 接口运行，并声明 `uses_expert_load_time_series = True`：
 
 ```text
 expert_load:       [T, L, E]
 current_placement: [L, P]
+new_placement:     [L, P]
 ```
 
-其中：
+其中 `P = R * S`，`R` 为 EP rank 数，`S` 为每个 rank 的槽位数。输入和输出均位于 CPU；输出保持 `torch.long`、连续内存和原 shape，输入不得原地修改。
 
-- `T` 是采样窗口中的时间点数量；
-- `L` 是 MoE 层数；
-- `E` 是逻辑专家数；
-- `P` 是每层物理专家槽位总数；
-- `P = R * S`，`R` 是 EP rank 数，`S` 是每个 rank 的槽位数。
-
-输出为连续 CPU tensor：
+逻辑专家负载平均分摊给其物理副本。第 `t` 个样本中某层某 rank 的负载为：
 
 ```text
-new_placement: [L, P]
-```
-
-输出 dtype、device、shape 和 contiguity 与 Model Runner V2 当前 policy contract 保持一致。输入 `expert_load` 和 `current_placement` 不允许原地修改。
-
-与现有两套 policy 一致，新 policy 假设逻辑专家的路由负载平均分摊给它的所有物理副本。设第 `l` 层逻辑专家 `e` 的副本数为 `C[l,e]`，rank `r` 上的专家集合由 placement `P` 决定，则时间点 `t` 的 rank 负载为：
-
-```text
-rank_load[t,l,r]
-    = sum(expert_load[t,l,e] / C[l,e]
+rank_load[t,r]
+    = sum(expert_load[t,e] / replica_count[e]
           for e placed on rank r)
 ```
 
-该假设是当前 Model Runner V2 逻辑专家负载统计能够支持的最精确信息。新 policy 不把逻辑负载重新展开为 legacy physical-slot load，也不伪造不同副本之间的负载差异。
-
-## 纯均衡目标
-
-每层 placement 的不均衡分数定义为：
+每层均衡分数为：
 
 ```text
-instant_score[t,l]
-    = max(rank_load[t,l,:]) / mean(rank_load[t,l,:])
-
-balance_score[l]
-    = mean(instant_score[:,l])
+instant_score[t] = max(rank_load[t,:]) / mean(rank_load[t,:])
+balance_score    = mean(instant_score[:])
 ```
 
-分数越小越好，理论最优值为 `1.0`。当某个时间点该层总负载为零时，该时间点分数按 `1.0` 处理，不能因除零产生无穷大或 NaN。
+分数越小越好，理论最优为 `1.0`。总负载为零的样本按 `1.0` 处理。
 
-候选层先通过 Swift 的聚合负载失衡门槛和 FlashLB 的跨窗口更新门槛，再进入搜索。候选搜索完成后，还必须同时满足：
-
-```text
-current_score - candidate_score > BALANCE_EPSILON
-single_swap_peak_reduction >= aggregate_average_load * 0.01
-```
-
-`BALANCE_EPSILON` 是内部数值容差，初始使用 `1e-6`，不暴露为用户配置。两个候选分数之差不超过该容差时，依次选择：
-
-1. changed slots 更少的候选；
-2. 跨 rank 变化更少的候选；
-3. 专家 ID 和 rank ID 字典序更小的候选。
-
-后两项只保证等价结果稳定和可复现，不构成搬运成本目标。
-
-## 算法流程
+## 决策流程
 
 ### 1. 输入校验与快速返回
 
-policy 每个 rebalance window 执行一次，不在 request、forward 或单个 MoE 层的设备热路径执行。
+adapter 校验输入维数、CPU residency、layer 数、replica 数、rank/node 整除关系和当前 placement shape。窗口负载全零时直接返回当前 placement，不进入 Swift，也不更新 hysteresis。
 
-入口首先验证：
+最终候选逐层验证：
 
-- `expert_load` 为三维 CPU tensor；
-- `current_placement` 为二维 CPU tensor；
-- layer 维一致；
-- `P` 能被 `R` 整除；
-- placement 中专家 ID 位于 `[0, E)`；
-- 每个逻辑专家在每层至少出现一次；
-- 每个 rank 的当前 placement 不包含重复逻辑专家。
+- 专家 ID 位于 `[0,E)`；
+- 每个逻辑专家至少有一个副本；
+- 同一逻辑专家的副本数不超过 rank 数；
+- 同一 rank 不含重复专家；
+- 继续保留在同一 rank 的专家不发生无意义的槽位换位。
 
-以下情况直接返回当前 placement：
+非法候选层回退到当前 placement，并记录 rejected layer 数。
 
-- 窗口负载全部为零；
-- 当前层已经达到数值意义上的完全均衡；
-- 候选生成失败或候选没有超过 `BALANCE_EPSILON` 的均衡收益。
+### 2. Swift 生成完整候选
 
-即使 `P == E`、没有冗余槽位，也不能直接跳过整层。此时目标副本数固定为每个专家一个，但跨 rank 交换仍可能改善均衡，因此仍应进入局部均衡优化。
+adapter 将时间序列沿窗口维求和，得到 `[L,E]` 聚合逻辑负载。该操作只发生在 CPU policy worker 中，不触发设备同步。
 
-输入契约错误必须抛出明确异常。某一层在合法输入上无法构造更好的合法候选时只回退该层，不影响其它层。编程错误和内部数组越界不能被静默吞掉。
+为兼容现有 Swift 输入，逻辑专家负载按当前副本数均分到每个物理槽位，再调用现有 `SwiftBalanceEplb`。STAIR 不复制或重写 Swift planner，因此继承其完整语义：
 
-### 2. 时间序列统计
+- 层级 aggregate peak/average 失衡门槛为 `1.01`；
+- 单步 swap 至少降低 aggregate average load 的 `1%`；
+- `num_max_com=1` 约束优选冗余分配和后续 swap；
+- 当优选阶段受通信额度限制时，Swift 的 fallback 会在当前窗口补齐剩余冗余槽位；
+- 继续存在于本 rank 的专家保留原槽位；
+- 只有 aggregate placement 改善的层才写入候选。
 
-每层从 `[T,E]` 逻辑专家负载计算：
+`num_max_com=1` 不是“整层最多搬一个专家”的硬预算。把它解释成硬预算会把一个完整层更新拆到多个 EPLB 窗口，而运行时传输开销按层支付，最终造成同一层反复搬运。
 
-```text
-mean[e]
-variance[e]
-covariance[e1,e2]
-risk[e] = mean[e] + Z_SCORE * sqrt(variance[e])
-```
+Swift 返回的整轮 `change` 标志包含 5% 全局收益判断。STAIR 与现有 V2 Swift adapter 一致，忽略该全局标志，只使用逐层候选。这样不会因其它层收益不足而否决少数确有价值的层。
 
-`Z_SCORE` 沿用 FlashLB 当前默认值 `0.674`，作为候选生成启发式的内部常量，不作为用户配置。最终更新决定仍由完整时间序列的 `balance_score` 作出，因此统计近似不能单独决定是否采用 placement。
+### 3. FlashLB 时间序列接受
 
-均值、方差和协方差只为当前 rebalance window 创建。policy 仅跨窗口保存每层最近一次已采纳 placement 的 `average_to_peak_ratio`，用于 FlashLB hysteresis：首次运行强制尝试；后续仅当当前 ratio 低于历史 ratio 的 95%，或绝对 ratio 低于 0.9 时重新搜索。rank 数不小于 32 时沿用 FlashLB 默认的 90% 和 0.85。adapter validator 回退的层不更新历史；下一窗口 placement 与预期结果不一致时清空历史，防止预测状态领先于真实表。
-
-### 3. 目标副本数量分配
-
-每个逻辑专家从一个副本开始，剩余 `P - E` 个冗余槽位逐个分配。每一步选择当前单位风险最高且仍可增加副本的专家：
+对 Swift 实际改变的每一层，STAIR 使用完整 `[T,E]` 时间序列分别计算当前 placement 和 Swift 候选的 `balance_score`。只有满足以下条件才接受：
 
 ```text
-unit_risk[e] = risk[e] / replica_count[e]
+current_score - candidate_score > 1e-6
 ```
 
-副本分配必须始终满足：
+这一步是减少短窗口抖动的关键。Swift 的聚合负载可能认为候选改善，但完整时间序列会揭示不同时间点上的峰值被抵消、反转或仅是采样偶然。未获得时序收益的候选层保持当前 placement。
+
+STAIR 同时保留 FlashLB hysteresis。首次观察某层时允许评估；提交后记录该候选的 average-to-peak ratio。后续仅在以下任一条件满足时重新接受搜索结果：
 
 ```text
-1 <= replica_count[e] <= R
-sum(replica_count) == P
+current_ratio < past_ratio * relative_threshold
+current_ratio < absolute_threshold
 ```
 
-当多个专家的 `unit_risk` 相同时，优先专家 ID 更小者，保证所有 rank 对相同输入生成相同结果。
+当 `R < 32` 时，阈值为 `0.95` 和 `0.9`；否则为 `0.9` 和 `0.85`。该门槛限制稳定层重复更新，但不替代候选的正时序收益校验。
 
-如果约束下无法分配完所有物理槽位，说明输入拓扑本身不可行，policy 必须报错，不能像当前 FlashLB 一样让 placement 阶段处理一个不可能满足的副本目标。
+### 4. Commit 一致性
 
-该步骤替换 Swift 的副本负载递推公式和 FlashLB 当前无 rank 上限的 `min_max_replica()`。第一版不使用 FlashTree 的分组树搜索；目标副本数由单一、可解释且确定性的 min-max 风险分配产生。
+adapter 完成最终 validator 后才调用 `commit()`。STAIR 只为实际变化层记录新的 ratio，并保存预期 placement。若下一窗口观察到的当前 placement 与预期结果不一致，说明异步 commit、validator 或外部状态没有按预测推进，policy 会清空历史，避免内部状态领先于真实 routing table。
 
-### 4. 增量 placement 构造
+## 数据和线程行为
 
-目标副本数确定后，placement planner 从当前 placement 开始，而不是生成一张与当前 rank 排列无关的新表。
+STAIR 只处理上游已经交给 policy worker 的 CPU tensor：
 
-#### 4.1 替换多余副本
+- `weight.sum(dim=0)`、slot-load 展开、Swift 计算和时间序列评分均在 CPU 执行；
+- 不读取 NPU tensor，不调用 `torch.npu.synchronize()`，也不使用设备 tensor `.item()`；
+- 不向日志添加 NPU event 或同步计时；
+- 只跨窗口保存每层一个 ratio 和一份预期 placement；
+- 不保存负载窗口，不维护搬运成本状态。
 
-planner 不先批量删除全部多余副本，因为独立删除可能使剩余空槽位无法满足同 rank 唯一性。它把一次“删除多余副本并填入缺失副本”作为原子替换：每次只从当前副本数高于目标值的专家选择一个槽位，并立即填入当前副本数低于目标值的专家。
+因此该实现不会把异步调度重新同步化。policy CPU 耗时仍需在真实实验中记录，但可与前台 NPU forward 并行。
 
-每个候选替换后，planner 通过确定性的容量流检查验证剩余缺失副本仍能映射到剩余多余槽位。流图同时约束每个缺失专家的需求量、每个物理槽位最多使用一次、每个多余专家允许删除的副本数，以及目标 rank 不得已有待填入专家。无法完成全部剩余替换的候选不得进入评分。
-
-#### 4.2 选择替换位置
-
-按 `unit_risk` 从高到低处理副本不足的专家。对每一个待增加副本，只考虑满足以下条件的多余副本槽位：
-
-- 目标 rank 尚未包含该专家；
-- 被替换专家的当前副本数高于其目标副本数；
-- 放置后所有专家覆盖和 rank 容量约束仍可完成。
-
-在合法候选 rank 中，选择加入该专家后设备风险最小的 rank。设备风险使用专家均值、方差和同 rank 专家间协方差计算。风险等价时，优先保留更多当前 placement 的方案，再按 rank ID 和槽位 ID 决定。
-
-如果某个缺失副本没有合法目标 rank，该层候选判定为不可行并回退到当前 placement，不能使用 `-1` rank 继续写入。
-
-### 5. 有界局部均衡优化
-
-初始候选构造完成后，执行最多 `MAX_REFINEMENT_STEPS` 次跨 rank 专家交换，初始值沿用 Swift 的 `100`。同时恢复 `num_max_com=1`：每层、每个有向 rank pair 最多提交一次冗余副本搬入；双向交换要求两个方向都仍有额度，并各消耗一次额度。
-
-当目标副本分布需要同一 rank pair 在一轮内搬入多次时，planner 保留本轮通信额度内已经完成的部分 placement，并按实际副本数继续评分和校验；不能因为完整目标尚未一次达到而回滚已有改善。剩余副本调整由后续窗口继续完成。这是 `Incremental Rebalancing` 的必要语义，也避免 `num_max_com=1` 与精确目标副本数互相锁死。
-
-每轮优先检查当前窗口中贡献最高的 rank，对合法专家对执行交换模拟。交换必须保持：
-
-- 每个 rank 槽位数不变；
-- 同一专家不在同一 rank 重复；
-- 每个逻辑专家的目标副本数不变；
-- placement 中不存在空槽位或非法专家 ID。
-
-只有完整窗口 `balance_score` 严格改善超过 `BALANCE_EPSILON`，且聚合窗口上的最热 rank 峰值至少下降平均 rank 负载的 1% 时才接受交换。若一轮不存在可接受交换，立即停止。候选选择遵循统一 tie-break 规则，不能依赖 Python `set` 的遍历顺序。
-
-STAIR 不恢复 Swift 的整轮 5% 全局收益门槛。该门槛会把各层独立收益绑定为一次全局一票否决，可能丢弃少数高价值层；层级 1.01 门槛、单步 1% 门槛、FlashLB hysteresis 和 rank-pair 额度已经分别限制触发频率、微小收益交换和单层搬运量。
-
-### 6. 槽位对齐和最终校验
-
-局部优化后，在不改变每个 rank 专家集合的前提下对槽位重新排列。当前 rank 上继续存在的专家必须保持原槽位，新增专家只填入被删除专家留下的槽位。
-
-返回前逐层验证：
-
-1. shape、dtype、device 和 contiguity 满足 V2 contract；
-2. 所有专家 ID 合法；
-3. 每个逻辑专家至少一个副本；
-4. 每个逻辑专家副本数与目标副本数一致；
-5. 单专家副本数不超过 rank 数；
-6. 同 rank 不存在重复专家；
-7. 每个 rank 槽位数不变；
-8. 保留在同一 rank 的专家没有发生无意义的槽位换位；
-9. 被采用层的 `candidate_score` 优于 `current_score`。
-
-第一版保留 adapter 侧的独立 validator 作为防御性检查。planner 内部校验和 adapter validator 应使用同一组不变量；adapter 出现 rejected layer 视为实现缺陷，而不是正常控制流。被拒绝层回退当前 placement，并记录层号和失败规则，但日志不得引入设备同步。
-
-## 数据和内存行为
-
-新 policy 只处理 CPU 侧统计数据。它不读取 NPU tensor，不调用 `.item()` 访问设备数据，也不增加 `torch.npu.synchronize()` 或 NPU event。
-
-实现应直接消费 V2 已收集的逻辑负载时间序列：
-
-- contiguous CPU tensor 转 NumPy 时优先使用共享内存 view；
-- 非 contiguous 输入只允许在 policy 入口创建一次 contiguous 副本；
-- 不创建 `[T,L,R,S]` physical-slot load；
-- current placement 保持只读；
-- 输出从 current placement 的 CPU clone 开始，只覆盖确认采用的层；
-- 均值、方差、协方差和 rank load 是单次 rebalance 的临时数组；
-- 不创建跨窗口负载 buffer；只保留 policy singleton 中每层一个均衡 ratio 和一份预期 placement，用于 hysteresis 与提交一致性检查。
-
-协方差矩阵是算法中最大的临时结构，形状为 `[E,E]`。实现按层计算并复用 scratch storage，避免同时保留 `[L,E,E]`。这使额外内存从 `O(L*E^2)` 降为 `O(E^2)`。
-
-## 组件边界和集成方式
-
-新实现保持上游 Model Runner V2 EPLB 生命周期不变：
+## 组件边界
 
 ```text
-V2 logical load window
-    -> Ascend policy adapter
-    -> pure-balance planner
-    -> validated [L,P] placement
-    -> existing upstream diff/transfer pipeline
-    -> existing async commit and routing refresh
+V2 logical load time series
+    -> Ascend STAIR adapter
+    -> aggregate load + existing Swift candidate generator
+    -> STAIR temporal score and FlashLB hysteresis
+    -> final placement validator
+    -> existing upstream async diff/transfer/commit pipeline
 ```
 
-Ascend 侧新增一个 V2-native policy core 和薄 adapter。core 负责统计、副本规划、placement 构造、局部优化、评分和内部合法性检查；adapter 只负责 V2 contract 校验、tensor/NumPy 边界、最终防御性校验和日志。
+实现只修改 vLLM Ascend：
 
-现有 Swift、FlashLB 和 upstream default policy 保持不变，继续作为对照组。新 policy 不修改 upstream `EPLB_POLICIES` 全局注册表，而是沿用 `AscendEplbState` 当前的 Ascend-specific policy 选择路径。
+| 位置 | 责任 |
+| --- | --- |
+| `vllm_ascend/eplb/core/policy/policy_stair.py` | 时间序列评分、hysteresis 和 commit 状态 |
+| `vllm_ascend/distributed/eplb_policy.py` | V2 contract、Swift 候选生成、最终 validator 和日志 |
+| `vllm_ascend/distributed/eplb_state.py` | 根据 Ascend 配置选择 STAIR adapter |
+| `vllm_ascend/ascend_config.py` | 接受 `placement_policy: stair` |
 
-预期修改边界如下，具体新名称必须在编码前确认：
+不修改 `/Users/freyfwt/Projects/vllm` 上游接口，也不改变 `SwiftBalanceEplb` 本身。
 
-| 位置 | 动作 | 责任 |
-| --- | --- | --- |
-| `vllm_ascend/eplb/core/policy/policy_stair.py` | 新增 | V2-native STAIR 纯均衡算法核心 |
-| `vllm_ascend/distributed/eplb_policy.py` | 扩展 | 新 policy 的 V2 adapter 和最终 validator |
-| `vllm_ascend/distributed/eplb_state.py` | 扩展 | 根据 Ascend 配置选择新 adapter |
-| `vllm_ascend/ascend_config.py` | 扩展 | 接受确认后的单一 policy 配置值 |
-| `vllm_ascend/platform.py` | 扩展 | 保持现有 V2 EPLB/elastic EP 配置校验 |
-| `tests/ut/eplb/core/policy/` | 扩展 | 核心算法性质和边界验证 |
-| `tests/ut/distributed/test_eplb_policy.py` | 扩展 | V2 contract、adapter 和 validator 验证 |
-| `tests/ut/distributed/test_eplb_state.py` | 扩展 | policy 选择验证 |
-| `tests/ut/test_ascend_config.py`、`tests/ut/test_platform.py` | 扩展 | 配置接受与错误组合验证 |
+## 配置
 
-第一版不修改 `/Users/freyfwt/Projects/vllm` 上游仓库。V2 时间序列输入和当前 placement 已经能够通过现有接口提供。
-
-## 配置与命名
-
-用户只需要通过现有 `additional_config.eplb_config.placement_policy` 选择 STAIR：
+用户仅通过现有 Ascend 配置选择 STAIR：
 
 ```text
-placement_policy: stair
+additional_config.eplb_config.placement_policy: stair
 ```
 
-除该 policy 名称外不新增任何用户可见配置。
+不增加其它用户可见配置。
 
-正式名称如下：
+## 测试与性能验收
 
-| 类型 | 名称 | 状态 |
-| --- | --- | --- |
-| 算法全称 | Statistical Temporal-Aware Incremental Rebalancing | 已确认 |
-| 算法简称 | STAIR | 已确认 |
-| 配置值 | `stair` | 已确认 |
-| 算法核心类 | `StairEplbPolicy` | 已确认 |
-| V2 adapter 类 | `StairEplbPolicyAdapter` | 已确认 |
-| 核心文件 | `policy_stair.py` | 已确认 |
-| 纯均衡评分函数 | `compute_balance_score` | 建议保留，职责明确 |
-| 副本分配函数 | `allocate_replicas` | 建议保留，职责明确 |
-| placement 构造函数 | `build_placement` | 建议保留，职责明确 |
-| 局部优化函数 | `refine_placement` | 建议保留，职责明确 |
+CPU 单元测试至少证明：
 
-`hybrid`、`flash_swift`、`swift` 和 `flashlb` 不作为 STAIR 的别名，避免用户误认为它与某个现有 policy 完全兼容。
+- Swift adapter 仍与直接调用 legacy Swift 的结果一致；
+- STAIR 使用完整窗口聚合负载生成 Swift 候选；
+- 只接受时间序列分数严格改善的候选层；
+- FlashLB 相对和绝对 hysteresis 阈值生效；
+- history 只对最终提交层更新，observed placement 不一致时清空；
+- 输入不被修改，输出满足 shape、dtype、CPU 和 contiguity contract；
+- 非法 placement 被明确拒绝或逐层回退。
 
-## 正确性与测试策略
+真实 NPU 实验沿用此前 V1/V2 等价 case：TP2、EP、异步调度、`FULL_AND_PIECEWISE`、4 个冗余专家、`window_size=50`、等价 interval、并发 8、输出 256。记录：
 
-### CPU 单元测试
+- TTFT、TPOT、端到端耗时和吞吐；
+- policy cycle 数和 CPU policy 耗时；
+- 每轮 Swift proposed layer、STAIR accepted layer 和 rejected layer；
+- 实际 global layer transfer 总数；
+- 与 V1 Swift 开启 EPLB 的同 case 差异。
 
-核心算法必须证明以下性质：
-
-- 副本总数守恒，所有逻辑专家至少一个副本；
-- 单专家副本数不超过 rank 数；
-- 同一 rank 不出现重复专家；
-- 每个 rank 槽位数不变；
-- 输入 tensor 不被修改；
-- 相同输入产生完全一致的输出；
-- 不同层总负载独立计算，不复用第 0 层平均值；
-- 单副本、最大副本、全零负载和均匀负载行为正确；
-- 不可行目标被明确识别，不产生 `-1` rank 或非法 placement；
-- 每个实际变化层的窗口均衡分数严格改善；
-- 分数等价时选择变化更少的 placement；
-- 超过局部优化步数上限时仍返回合法候选。
-- Swift 的 1.01 层级失衡、1% 单步收益和 `num_max_com=1` 均有独立回归测试；
-- FlashLB 的相对 hysteresis、绝对失衡门槛、首次强制尝试和仅对已采纳层更新历史均有独立回归测试。
-
-adapter 和配置测试必须证明：
-
-- `uses_expert_load_time_series` 已启用；
-- 输入输出满足 V2 shape、dtype、CPU residency 和 contiguity contract；
-- 不再展开 legacy slot load；
-- planner 非法输出会被 validator 拒绝并逐层回退；
-- 未选择新 policy 时默认路径不变；
-- 新配置值只在启用 EPLB 的 Model Runner V2 下生效；
-- 不支持的 elastic EP 组合在初始化阶段失败。
-
-### 记录负载回放
-
-使用 Swift 和 FlashLB 实验中保存的相同 `[T,L,E]` 负载窗口和初始 placement 离线回放，对比：
-
-- 当前 placement、Swift、FlashLB 和新 policy 的 `balance_score`；
-- 变化层数和 changed slots；
-- 是否出现非法或 validator rejected layer；
-- policy CPU 计算时间；
-- 连续相同窗口是否稳定返回相同 placement。
-
-回放首先验证算法，不以某次端到端耗时替代均衡正确性。
-
-### NPU 端到端实验
-
-沿用此前 V1/V2 等价实验的模型、DP/TP/EP、图模式、异步调度、荣誉专家数、采样窗口、policy interval、请求并发和输出长度。至少比较：
-
-1. EPLB 关闭；
-2. V2 Swift；
-3. V2 FlashLB；
-4. 新 policy。
-
-记录：
-
-- 更新前后 `balance_score`；
-- policy 计算耗时；
-- policy cycle 数；
-- 实际变化层数；
-- changed experts 和 global layer transfer 数；
-- validator rejected layer 数；
-- 平均 TTFT；
-- 平均 TPOT；
-- 请求端到端耗时；
-- benchmark wall time 和吞吐。
-
-所有观测日志必须使用 CPU 时间或现有异步生命周期事件，不能为了测量增加设备同步。
-
-## 验收标准
-
-新 policy 进入后续优化前必须同时满足：
-
-1. 所有 CPU 正确性和确定性测试通过；
-2. 记录负载回放中没有非法 placement；
-3. NPU 实验中 validator rejected layer 为零；
-4. 每个变化层的新 `balance_score` 严格优于旧 placement；
-5. 稳定或重复窗口不产生由非确定性排序导致的 placement 抖动；
-6. EPLB 关闭、upstream default、Swift 和 FlashLB 路径行为不受影响；
-7. policy 不增加 NPU 同步或 forward 热路径工作。
-
-端到端性能必须记录并与三个对照组比较。STAIR 不引入传输耗时模型、用户配置的搬运预算或整轮 5% 一票否决，但保留层级/单步更新门槛、跨窗口 hysteresis 和通信额度，以避免首次实验中每轮 48 层全变的无刹车行为。
-
-## 实施顺序
-
-1. 编写独立的 STAIR CPU 纯算法核心和性质测试，不接入运行时。
-2. 使用记录负载回放比较 Swift、FlashLB 和 STAIR，先解决所有非法 placement 和非确定性问题。
-3. 增加 V2 adapter、配置选择和防御性 validator，不修改异步传输链路。
-4. 运行 CPU 测试和格式检查。
-5. 在指定 NPU 服务器运行等价端到端实验，记录均衡、搬运和性能结果。
-6. 根据结果决定是否保留实验 policy、继续优化候选搜索，或回退实现。
-
-命名确认和第一版运行时代码已经完成；最终状态以本文档记录的验收实验为准。
+验收重点不是某一轮恰好零变化，而是完整测量窗口内将搬运量压回 V1 同一数量级，同时保持 validator rejection 为零，并使 TPOT、端到端耗时和吞吐显著接近 V1。

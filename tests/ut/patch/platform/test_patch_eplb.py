@@ -159,6 +159,33 @@ def test_async_workspace_wrapper_refreshes_committed_layer(monkeypatch):
     refresh.assert_called_once_with(model_state, 3)
 
 
+def test_async_workspace_wrapper_acknowledges_no_transfer_cycle(monkeypatch):
+    consumed_event = MagicMock()
+    pending_result = SimpleNamespace(
+        layer_idx=1,
+        transfer_metadata=patch_eplb._NO_TRANSFER_CYCLE_COMPLETE,
+        consumed_event=consumed_event,
+    )
+    model_state = SimpleNamespace(
+        pending_result=pending_result,
+        rebalanced=True,
+        model=SimpleNamespace(num_moe_layers=2),
+    )
+    original_move = MagicMock()
+    refresh = MagicMock()
+    monkeypatch.setattr(patch_eplb, "refresh_model_routing_tables", refresh)
+
+    wrapped_move = patch_eplb._wrap_move_to_workspace(original_move)
+    result = wrapped_move(model_state, 0)
+
+    assert result is None
+    assert model_state.rebalanced is False
+    assert model_state.pending_result is None
+    consumed_event.record.assert_called_once_with()
+    original_move.assert_not_called()
+    refresh.assert_not_called()
+
+
 class _CycleComplete(Exception):
     pass
 
@@ -175,13 +202,19 @@ class _OneCycleEvent:
 
 def _run_one_async_cycle(monkeypatch, old_map, new_map):
     pending_layers = []
+    completed_cycles = []
     transfer_metadata = object()
     transfer_layer = MagicMock(return_value=transfer_metadata)
     all_reduce = MagicMock()
 
     class _ConsumedEvent:
         def wait(self, stream):
-            pending_layers.append(model_state.pending_result.layer_idx)
+            result = model_state.pending_result
+            if result.transfer_metadata is patch_eplb._NO_TRANSFER_CYCLE_COMPLETE:
+                completed_cycles.append(result.layer_idx)
+                model_state.rebalanced = False
+            else:
+                pending_layers.append(result.layer_idx)
             model_state.pending_result = None
 
     stream = MagicMock()
@@ -222,14 +255,14 @@ def _run_one_async_cycle(monkeypatch, old_map, new_map):
     with pytest.raises(_CycleComplete):
         patch_eplb._transfer_run_periodically(state, stream)
 
-    return model_state, stream, communicator, transfer_layer, all_reduce, pending_layers
+    return model_state, stream, communicator, transfer_layer, all_reduce, pending_layers, completed_cycles
 
 
 def test_async_worker_skips_fully_unchanged_cycle(monkeypatch):
     placement = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
 
-    model_state, stream, communicator, transfer_layer, all_reduce, pending_layers = _run_one_async_cycle(
-        monkeypatch, placement, placement.clone()
+    model_state, stream, communicator, transfer_layer, all_reduce, pending_layers, completed_cycles = (
+        _run_one_async_cycle(monkeypatch, placement, placement.clone())
     )
 
     communicator.set_stream.assert_called_once_with(stream)
@@ -237,6 +270,7 @@ def test_async_worker_skips_fully_unchanged_cycle(monkeypatch):
     stream.synchronize.assert_not_called()
     all_reduce.assert_not_called()
     assert pending_layers == []
+    assert completed_cycles == [1]
     assert model_state.pending_result is None
     assert model_state.rebalanced is False
 
@@ -245,7 +279,7 @@ def test_async_worker_transfers_only_changed_layers_and_completes_cycle(monkeypa
     old_map = torch.tensor([[0, 1], [0, 1], [1, 0]], dtype=torch.int32)
     new_map = torch.tensor([[0, 1], [1, 0], [1, 0]], dtype=torch.int32)
 
-    model_state, stream, _, transfer_layer, all_reduce, pending_layers = _run_one_async_cycle(
+    model_state, stream, _, transfer_layer, all_reduce, pending_layers, completed_cycles = _run_one_async_cycle(
         monkeypatch,
         old_map,
         new_map,
@@ -264,5 +298,6 @@ def test_async_worker_transfers_only_changed_layers_and_completes_cycle(monkeypa
     stream.synchronize.assert_called_once_with()
     all_reduce.assert_called_once()
     assert pending_layers == [1]
+    assert completed_cycles == [2]
     assert model_state.pending_result is None
     assert model_state.rebalanced is False

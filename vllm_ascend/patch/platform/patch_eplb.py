@@ -18,6 +18,7 @@ from vllm_ascend.distributed.eplb_communicator import (
 from vllm_ascend.distributed.eplb_state import refresh_model_routing_tables
 
 _PATCH_MARKER = "_vllm_ascend_eplb_patch"
+_NO_TRANSFER_CYCLE_COMPLETE = object()
 
 
 class _CudaAlikeEplbPlatformProxy:
@@ -104,6 +105,15 @@ def _wrap_move_to_workspace(original_move):
         model_state = bound.arguments["model_state"]
         pending_result = model_state.pending_result
         layer_idx = pending_result.layer_idx if pending_result is not None else None
+        if (
+            pending_result is not None
+            and getattr(pending_result, "transfer_metadata", None) is _NO_TRANSFER_CYCLE_COMPLETE
+        ):
+            assert layer_idx == model_state.model.num_moe_layers - 1
+            model_state.rebalanced = False
+            model_state.pending_result = None
+            pending_result.consumed_event.record()
+            return None
         result = original_move(*bound.args, **bound.kwargs)
         if layer_idx is not None:
             refresh_model_routing_tables(model_state, layer_idx)
@@ -209,10 +219,20 @@ def _transfer_run_periodically(
                 layer_idx += 1
 
             # Upstream normally ends a cycle when the main thread consumes the
-            # final layer. If the final layer is skipped, there is no pending
-            # result to perform that transition, so the worker owns completion.
-            if layer_idx == num_layers:
-                model_state.rebalanced = False
+            # final layer. If that layer is skipped, publish a no-transfer
+            # completion result so all main threads finish through the existing
+            # all-ranks-ready protocol. Setting rebalanced=False directly here
+            # races with the main-thread collective and can deadlock ranks.
+            if layer_idx == num_layers and model_state.rebalanced:
+                consumed_event = _eplb_async_worker.CpuGpuEvent()
+                model_state.pending_result = _eplb_async_worker.AsyncEplbLayerResult(
+                    layer_idx=num_layers - 1,
+                    new_physical_to_logical_map=new_physical_to_logical_map[-1],
+                    transfer_metadata=_NO_TRANSFER_CYCLE_COMPLETE,
+                    consumed_event=consumed_event,
+                )
+                consumed_event.wait(stream=cuda_stream)
+                assert model_state.pending_result is None
 
 
 def _patch_async_transfer_worker() -> None:

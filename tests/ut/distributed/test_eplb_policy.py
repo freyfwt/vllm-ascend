@@ -11,7 +11,7 @@ from vllm_ascend.distributed.eplb_policy import (
     _expand_logical_load_window_to_slots,
     _reject_invalid_placement_layers,
 )
-from vllm_ascend.eplb.core.policy.policy_stair import compute_balance_score
+from vllm_ascend.eplb.core.policy.policy_stair import StairEplbPolicy, compute_balance_score
 from vllm_ascend.eplb.core.policy.policy_swift_balancer import SwiftBalanceEplb
 
 
@@ -223,7 +223,7 @@ def test_swift_adapter_rejects_missing_or_invalid_placement():
             raise AssertionError("Expected invalid Swift placement to fail.")
 
 
-def test_stair_adapter_preserves_inputs_contract_and_improves_balance():
+def test_stair_adapter_preserves_inputs_contract_and_improves_balance(monkeypatch):
     logical_load_window = torch.tensor(
         [
             [[1, 1, 100, 80]],
@@ -236,6 +236,7 @@ def test_stair_adapter_preserves_inputs_contract_and_improves_balance():
     placement = torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.long)
     original_load = logical_load_window.clone()
     original_placement = placement.clone()
+    monkeypatch.setattr(StairEplbPolicyAdapter, "_policy", StairEplbPolicy())
 
     result = StairEplbPolicyAdapter.rebalance_experts(
         logical_load_window,
@@ -266,8 +267,9 @@ def test_stair_adapter_preserves_inputs_contract_and_improves_balance():
         assert torch.unique(rank).numel() == rank.numel()
 
 
-def test_stair_adapter_rejects_missing_or_invalid_placement():
+def test_stair_adapter_rejects_missing_or_invalid_placement(monkeypatch):
     logical_load_window = torch.ones((2, 1, 4), dtype=torch.int32)
+    monkeypatch.setattr(StairEplbPolicyAdapter, "_policy", StairEplbPolicy())
 
     for placement, error in [
         (None, "requires the current"),

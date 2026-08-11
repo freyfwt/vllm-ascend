@@ -12,7 +12,7 @@ STAIR 是 **Statistical Temporal-Aware Incremental Rebalancing** 的缩写。本
 
 新 policy 只优化负载均衡，不建立搬运成本模型。它不依赖离线 profiling，不进行在线成本校准，也不增加任何与硬件带宽、专家字节数或预期回本周期有关的用户配置。
 
-整个决策过程只有一个主目标：最小化采样窗口内各 rank 峰值负载相对平均负载的比值。placement 变化量只在两个候选的均衡效果等价时作为次级排序条件，不能阻止一个均衡效果更好的合法候选被采用。
+整个决策过程仍以最小化采样窗口内各 rank 峰值负载相对平均负载的比值为主目标，但恢复 Swift 和 FlashLB 已验证过的更新刹车。只有失衡恶化或收益足够显著时才允许更新；rank-pair 通信次数也作为硬约束。placement 变化量继续作为等价候选的次级排序条件。
 
 ## 背景
 
@@ -31,7 +31,7 @@ STAIR 是 **Statistical Temporal-Aware Incremental Rebalancing** 的缩写。本
 2. 使用窗口时间序列评价当前 placement 和候选 placement 的真实均衡效果。
 3. 生成满足专家覆盖、rank 容量和同 rank 唯一性约束的 placement。
 4. 从当前 placement 增量构造候选，并在均衡效果等价时保留更多现有专家和槽位。
-5. 保持算法无跨窗口可变状态，使当前 committed placement 始终是唯一权威输入。
+5. 保留 FlashLB 的跨窗口均衡历史，但只在候选通过 adapter 最终校验后记录；下一窗口的当前 placement 与预期结果不一致时立即丢弃历史。
 6. 不修改 Model Runner V2 现有 load collection、异步 worker、传输、commit 和 routing table 刷新流程。
 7. 不增加 NPU 同步，不在 forward 热路径增加 Python 逻辑。
 
@@ -43,7 +43,7 @@ STAIR 是 **Statistical Temporal-Aware Incremental Rebalancing** 的缩写。本
 - D2H、Gloo、H2D 或 ready-to-consume 成本参数；
 - 离线或启动时 profiling；
 - 在线传输成本拟合；
-- changed-layer 或 changed-expert 搬运预算；
+- 用户可配置的 changed-layer 或 changed-expert 搬运预算；
 - 跨节点搬运 penalty；
 - 独立 policy 子进程；
 - Gloo/HCCL 传输机制修改；
@@ -101,10 +101,12 @@ balance_score[l]
 
 分数越小越好，理论最优值为 `1.0`。当某个时间点该层总负载为零时，该时间点分数按 `1.0` 处理，不能因除零产生无穷大或 NaN。
 
-候选层只在以下条件成立时更新：
+候选层先通过 Swift 的聚合负载失衡门槛和 FlashLB 的跨窗口更新门槛，再进入搜索。候选搜索完成后，还必须同时满足：
 
 ```text
 current_score - candidate_score > BALANCE_EPSILON
+single_swap_peak_reduction >= aggregate_average_load * 0.01
+sum(candidate_layer_peak) < sum(current_layer_peak) * 0.95
 ```
 
 `BALANCE_EPSILON` 是内部数值容差，初始使用 `1e-6`，不暴露为用户配置。两个候选分数之差不超过该容差时，依次选择：
@@ -154,7 +156,7 @@ risk[e] = mean[e] + Z_SCORE * sqrt(variance[e])
 
 `Z_SCORE` 沿用 FlashLB 当前默认值 `0.674`，作为候选生成启发式的内部常量，不作为用户配置。最终更新决定仍由完整时间序列的 `balance_score` 作出，因此统计近似不能单独决定是否采用 placement。
 
-统计只为当前 rebalance window 创建，不保存跨窗口 ring buffer、EWMA 或历史最优分数。这样不需要 policy singleton、pending placement 或两阶段状态提交，也不会出现预测状态领先于真实 committed placement 的问题。
+均值、方差和协方差只为当前 rebalance window 创建。policy 仅跨窗口保存每层最近一次已采纳 placement 的 `average_to_peak_ratio`，用于 FlashLB hysteresis：首次运行强制尝试；后续仅当当前 ratio 低于历史 ratio 的 95%，或绝对 ratio 低于 0.9 时重新搜索。rank 数不小于 32 时沿用 FlashLB 默认的 90% 和 0.85。adapter validator 回退的层不更新历史；下一窗口 placement 与预期结果不一致时清空历史，防止预测状态领先于真实表。
 
 ### 3. 目标副本数量分配
 
@@ -201,7 +203,7 @@ planner 不先批量删除全部多余副本，因为独立删除可能使剩余
 
 ### 5. 有界局部均衡优化
 
-初始候选构造完成后，执行最多 `MAX_REFINEMENT_STEPS` 次跨 rank 专家交换。初始值沿用 Swift 的 `100` 次上限，但它只是 policy CPU 计算量的安全边界，不是通信或搬运限制。
+初始候选构造完成后，执行最多 `MAX_REFINEMENT_STEPS` 次跨 rank 专家交换，初始值沿用 Swift 的 `100`。同时恢复 `num_max_com=1`：每层、每个有向 rank pair 最多提交一次冗余副本搬入；双向交换要求两个方向都仍有额度，并各消耗一次额度。
 
 每轮优先检查当前窗口中贡献最高的 rank，对合法专家对执行交换模拟。交换必须保持：
 
@@ -210,9 +212,9 @@ planner 不先批量删除全部多余副本，因为独立删除可能使剩余
 - 每个逻辑专家的目标副本数不变；
 - placement 中不存在空槽位或非法专家 ID。
 
-只有完整窗口 `balance_score` 严格改善超过 `BALANCE_EPSILON` 时才接受交换。若一轮不存在可接受交换，立即停止。候选选择遵循统一 tie-break 规则，不能依赖 Python `set` 的遍历顺序。
+只有完整窗口 `balance_score` 严格改善超过 `BALANCE_EPSILON`，且聚合窗口上的最热 rank 峰值至少下降平均 rank 负载的 1% 时才接受交换。若一轮不存在可接受交换，立即停止。候选选择遵循统一 tie-break 规则，不能依赖 Python `set` 的遍历顺序。
 
-该阶段借鉴 Swift 的 bounded swap，但删除 `num_max_com`、跨节点成本和发送方向限制，因为这些约束可能阻止纯均衡目标选择更优 placement。
+所有层完成候选搜索后，再执行 Swift 的全局收益门槛：候选各层聚合峰值之和必须严格低于原值的 95%，否则整轮返回当前 placement。该门槛与 rank-pair 额度可能阻止理论均衡分数更好的候选，目的是抑制小收益的大范围搬运。
 
 ### 6. 槽位对齐和最终校验
 
@@ -244,7 +246,7 @@ planner 不先批量删除全部多余副本，因为独立删除可能使剩余
 - current placement 保持只读；
 - 输出从 current placement 的 CPU clone 开始，只覆盖确认采用的层；
 - 均值、方差、协方差和 rank load 是单次 rebalance 的临时数组；
-- 不创建跨窗口 buffer 或全局可变 policy 实例。
+- 不创建跨窗口负载 buffer；只保留 policy singleton 中每层一个均衡 ratio 和一份预期 placement，用于 hysteresis 与提交一致性检查。
 
 协方差矩阵是算法中最大的临时结构，形状为 `[E,E]`。实现按层计算并复用 scratch storage，避免同时保留 `[L,E,E]`。这使额外内存从 `O(L*E^2)` 降为 `O(E^2)`。
 
@@ -326,6 +328,8 @@ placement_policy: stair
 - 每个实际变化层的窗口均衡分数严格改善；
 - 分数等价时选择变化更少的 placement；
 - 超过局部优化步数上限时仍返回合法候选。
+- Swift 的 1.01 层级失衡、1% 单步收益、`num_max_com=1` 和全局 5% 收益门槛均有独立回归测试；
+- FlashLB 的相对 hysteresis、绝对失衡门槛、首次强制尝试和仅对已采纳层更新历史均有独立回归测试。
 
 adapter 和配置测试必须证明：
 
@@ -385,7 +389,7 @@ adapter 和配置测试必须证明：
 6. EPLB 关闭、upstream default、Swift 和 FlashLB 路径行为不受影响；
 7. policy 不增加 NPU 同步或 forward 热路径工作。
 
-端到端性能必须记录并与三个对照组比较，但本方案不承诺搬运量小于等于 FlashLB 的 32 次。纯均衡目标允许一个明显更均衡的 placement 产生更多变化；changed slots 只在均衡效果等价时参与选择。如果实验表明纯均衡收益无法覆盖真实搬运开销，应重新讨论目标函数，而不能在本实现中偷偷加入未确认的成本参数或搬运预算。
+端到端性能必须记录并与三个对照组比较。STAIR 不引入传输耗时模型或用户配置的搬运预算，但恢复两套原算法的固定更新门槛和通信额度，以避免首次实验中每轮 48 层全变的无刹车行为。
 
 ## 实施顺序
 

@@ -286,6 +286,7 @@ class StairEplbPolicyAdapter(AbstractEplbPolicy):
     """Expose the V2-native STAIR policy through the upstream contract."""
 
     uses_expert_load_time_series = True
+    _policy = StairEplbPolicy()
 
     @classmethod
     def rebalance_experts(
@@ -321,9 +322,11 @@ class StairEplbPolicyAdapter(AbstractEplbPolicy):
             return old_placement.contiguous()
 
         start_time = time.perf_counter()
-        new_placement = StairEplbPolicy.rebalance_experts(
-            weight.detach().contiguous().numpy(),
-            old_placement.numpy(),
+        weight_array = weight.detach().contiguous().numpy()
+        old_placement_array = old_placement.numpy()
+        new_placement = cls._policy.rebalance_experts(
+            weight_array,
+            old_placement_array,
             num_ranks,
         )
         compute_ms = (time.perf_counter() - start_time) * 1000
@@ -333,6 +336,12 @@ class StairEplbPolicyAdapter(AbstractEplbPolicy):
             result,
             num_ranks,
             weight.shape[2],
+        )
+        cls._policy.commit(
+            weight_array,
+            old_placement_array,
+            result.numpy(),
+            num_ranks,
         )
         changed_layer_count = int(torch.any(result != old_placement, dim=1).sum().item())
         logger.info(

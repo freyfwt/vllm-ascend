@@ -10,6 +10,15 @@ import numpy as np
 BALANCE_EPSILON = 1e-6
 MAX_REFINEMENT_STEPS = 100
 Z_SCORE = 0.674
+SWIFT_IMBALANCE_THRESHOLD = 1.01
+SWIFT_MIN_SWAP_IMPROVEMENT_RATIO = 0.01
+SWIFT_MAX_COMMUNICATIONS_PER_RANK_PAIR = 1
+SWIFT_GLOBAL_IMPROVEMENT_RATIO = 0.05
+FLASH_UPDATE_THRESHOLD_RATIO = 0.9
+FLASH_UPDATE_THRESHOLD_VALUE = 0.85
+FLASH_SMALL_WORLD_SIZE = 32
+FLASH_SMALL_WORLD_UPDATE_THRESHOLD_RATIO = 0.95
+FLASH_SMALL_WORLD_UPDATE_THRESHOLD_VALUE = 0.9
 
 
 def _replica_counts(placement: np.ndarray, num_experts: int) -> np.ndarray:
@@ -56,6 +65,17 @@ def compute_balance_score(expert_load: np.ndarray, placement: np.ndarray) -> flo
     if np.any(placement < 0) or np.any(placement >= expert_load.shape[1]):
         raise ValueError("placement contains an invalid logical expert index.")
     return _score_rank_loads(_rank_loads(expert_load, placement, expert_load.shape[1]))
+
+
+def _aggregate_peak_and_average(
+    expert_load: np.ndarray,
+    placement: np.ndarray,
+) -> tuple[float, float]:
+    rank_loads = np.sum(
+        _rank_loads(expert_load, placement, expert_load.shape[1]),
+        axis=0,
+    )
+    return float(np.max(rank_loads)), float(np.mean(rank_loads))
 
 
 def _compute_statistics(expert_load: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -230,10 +250,12 @@ def _replace_surplus_replicas(
     mean: np.ndarray,
     variance: np.ndarray,
     covariance: np.ndarray,
-) -> np.ndarray | None:
+) -> tuple[np.ndarray, np.ndarray] | None:
     proposal = placement.copy()
     num_experts = target_replicas.shape[0]
     risk = mean + Z_SCORE * np.sqrt(np.maximum(variance, 0.0))
+    num_ranks = placement.shape[0]
+    num_com_between_rank = np.zeros((num_ranks, num_ranks), dtype=np.int64)
 
     if not _can_reach_target(proposal, target_replicas):
         return None
@@ -242,7 +264,7 @@ def _replace_surplus_replicas(
         replica_counts = _replica_counts(proposal, num_experts)
         deficits = target_replicas - replica_counts
         if not np.any(deficits > 0):
-            return proposal
+            return proposal, num_com_between_rank
 
         unit_risk = np.full(num_experts, -np.inf, dtype=np.float64)
         missing = deficits > 0
@@ -253,9 +275,15 @@ def _replace_surplus_replicas(
         best_score = np.inf
         best_risk = np.inf
         best_position: tuple[int, int] | None = None
+        best_send_rank: int | None = None
         for rank_id, rank in enumerate(proposal):
             if expert_id in rank:
                 continue
+            send_ranks = np.flatnonzero(np.any(proposal == expert_id, axis=1))
+            send_ranks = send_ranks[num_com_between_rank[send_ranks, rank_id] < SWIFT_MAX_COMMUNICATIONS_PER_RANK_PAIR]
+            if send_ranks.size == 0:
+                continue
+            send_rank = int(send_ranks[0])
             for slot_id, surplus_expert in enumerate(rank):
                 if replica_counts[surplus_expert] <= target_replicas[surplus_expert]:
                     continue
@@ -282,9 +310,11 @@ def _replace_surplus_replicas(
                     best_score = score
                     best_risk = candidate_risk
                     best_position = position
+                    best_send_rank = send_rank
 
-        if best_candidate is None:
+        if best_candidate is None or best_position is None or best_send_rank is None:
             return None
+        num_com_between_rank[best_send_rank, best_position[0]] += 1
         proposal = best_candidate
 
 
@@ -297,6 +327,7 @@ def _refine_placement(
     placement: np.ndarray,
     original_placement: np.ndarray,
     target_replicas: np.ndarray,
+    num_com_between_rank: np.ndarray,
 ) -> np.ndarray:
     proposal = placement.copy()
     unit_load = expert_load / target_replicas
@@ -310,8 +341,10 @@ def _refine_placement(
     average_load[nonzero] = total_load[nonzero] / proposal.shape[0]
 
     for _ in range(MAX_REFINEMENT_STEPS):
-        excess = np.mean(np.maximum(rank_loads - average_load[:, None], 0.0), axis=0)
-        hottest_rank = int(np.argmax(excess))
+        aggregate_rank_loads = np.sum(rank_loads, axis=0)
+        hottest_rank = int(np.argmax(aggregate_rank_loads))
+        aggregate_peak = float(aggregate_rank_loads[hottest_rank])
+        swap_threshold = float(np.mean(aggregate_rank_loads)) * SWIFT_MIN_SWAP_IMPROVEMENT_RATIO
         best_swap: tuple[int, int, int, int] | None = None
         best_score = current_score
         best_changed_slots = np.iinfo(np.int64).max
@@ -321,6 +354,11 @@ def _refine_placement(
 
         for target_rank in range(proposal.shape[0]):
             if target_rank == hottest_rank:
+                continue
+            if (
+                num_com_between_rank[target_rank, hottest_rank] >= SWIFT_MAX_COMMUNICATIONS_PER_RANK_PAIR
+                or num_com_between_rank[hottest_rank, target_rank] >= SWIFT_MAX_COMMUNICATIONS_PER_RANK_PAIR
+            ):
                 continue
             target_experts = proposal[target_rank]
             target_units = unit_load[:, target_experts]
@@ -362,7 +400,23 @@ def _refine_placement(
                 candidate_ratios = np.ones_like(candidate_peak)
                 candidate_ratios[nonzero] = candidate_peak[nonzero] / average_load[nonzero, None, None]
                 candidate_scores = np.mean(candidate_ratios, axis=0)
+            aggregate_delta = np.sum(delta, axis=0)
+            source_aggregate_loads = aggregate_rank_loads[hottest_rank] + aggregate_delta
+            target_aggregate_loads = aggregate_rank_loads[target_rank] - aggregate_delta
+            other_ranks = [
+                rank_id for rank_id in range(proposal.shape[0]) if rank_id not in (hottest_rank, target_rank)
+            ]
+            if other_ranks:
+                other_aggregate_peak = float(np.max(aggregate_rank_loads[other_ranks]))
+                candidate_aggregate_peaks = np.maximum(
+                    np.maximum(source_aggregate_loads, target_aggregate_loads),
+                    other_aggregate_peak,
+                )
+            else:
+                candidate_aggregate_peaks = np.maximum(source_aggregate_loads, target_aggregate_loads)
+            meets_swap_threshold = aggregate_peak - candidate_aggregate_peaks >= swap_threshold
             candidate_scores[~valid_swaps] = np.inf
+            candidate_scores[~meets_swap_threshold] = np.inf
             score = float(np.min(candidate_scores))
             if score >= current_score - BALANCE_EPSILON:
                 continue
@@ -403,6 +457,8 @@ def _refine_placement(
         rank_loads[:, target_rank] -= delta
         proposal[source_rank, source_slot] = target_expert
         proposal[target_rank, target_slot] = source_expert
+        num_com_between_rank[source_rank, target_rank] += 1
+        num_com_between_rank[target_rank, source_rank] += 1
         current_score = best_score
     return proposal
 
@@ -424,9 +480,54 @@ def _align_local_slots(original_placement: np.ndarray, placement: np.ndarray) ->
 class StairEplbPolicy:
     """Pure CPU implementation of STAIR expert placement."""
 
-    @classmethod
+    def __init__(self) -> None:
+        self.average_to_peak_history: dict[int, float] = {}
+        self._topology: tuple[int, int, int, int] | None = None
+        self._expected_placement: np.ndarray | None = None
+
+    def _prepare_history(
+        self,
+        expert_load: np.ndarray,
+        current_placement: np.ndarray,
+        num_ranks: int,
+    ) -> None:
+        topology = (
+            expert_load.shape[1],
+            expert_load.shape[2],
+            current_placement.shape[1],
+            num_ranks,
+        )
+        if self._topology != topology:
+            self.average_to_peak_history.clear()
+            self._topology = topology
+            self._expected_placement = None
+        elif self._expected_placement is not None and not np.array_equal(
+            current_placement,
+            self._expected_placement,
+        ):
+            self.average_to_peak_history.clear()
+            self._expected_placement = None
+
+    def _needs_flash_update(
+        self,
+        layer_id: int,
+        current_score: float,
+        num_ranks: int,
+    ) -> bool:
+        past_ratio = self.average_to_peak_history.get(layer_id)
+        if past_ratio is None:
+            return True
+        if num_ranks < FLASH_SMALL_WORLD_SIZE:
+            threshold_ratio = FLASH_SMALL_WORLD_UPDATE_THRESHOLD_RATIO
+            threshold_value = FLASH_SMALL_WORLD_UPDATE_THRESHOLD_VALUE
+        else:
+            threshold_ratio = FLASH_UPDATE_THRESHOLD_RATIO
+            threshold_value = FLASH_UPDATE_THRESHOLD_VALUE
+        current_ratio = 1.0 / current_score
+        return current_ratio < past_ratio * threshold_ratio or current_ratio < threshold_value
+
     def rebalance_experts(
-        cls,
+        self,
         expert_load: np.ndarray,
         current_placement: np.ndarray,
         num_ranks: int,
@@ -451,16 +552,27 @@ class StairEplbPolicy:
         current_by_rank = current_placement.reshape(current_placement.shape[0], num_ranks, slots_per_rank)
         for layer_placement in current_by_rank:
             _validate_layer_placement(layer_placement, num_experts, num_ranks)
+        self._prepare_history(expert_load, current_placement, num_ranks)
 
         result = current_by_rank.copy()
         if not np.any(expert_load):
             return result.reshape(current_placement.shape).copy()
 
+        current_global_peak = 0.0
+        candidate_global_peak = 0.0
         for layer_id in range(expert_load.shape[1]):
             layer_load = expert_load[:, layer_id, :]
             original_placement = current_by_rank[layer_id]
             current_score = compute_balance_score(layer_load, original_placement)
-            if current_score <= 1.0 + BALANCE_EPSILON:
+            current_peak, current_average = _aggregate_peak_and_average(layer_load, original_placement)
+            current_global_peak += current_peak
+            candidate_global_peak += current_peak
+            aggregate_imbalance = current_peak / current_average if current_average > 0 else 1.0
+            if aggregate_imbalance < SWIFT_IMBALANCE_THRESHOLD or not self._needs_flash_update(
+                layer_id,
+                current_score,
+                num_ranks,
+            ):
                 continue
 
             mean, variance, covariance = _compute_statistics(layer_load)
@@ -470,7 +582,7 @@ class StairEplbPolicy:
                 current_placement.shape[1],
                 num_ranks,
             )
-            proposal = _replace_surplus_replicas(
+            replacement = _replace_surplus_replicas(
                 layer_load,
                 original_placement,
                 target_replicas,
@@ -478,13 +590,15 @@ class StairEplbPolicy:
                 variance,
                 covariance,
             )
-            if proposal is None:
+            if replacement is None:
                 continue
+            proposal, num_com_between_rank = replacement
             proposal = _refine_placement(
                 layer_load,
                 proposal,
                 original_placement,
                 target_replicas,
+                num_com_between_rank,
             )
             proposal = _align_local_slots(original_placement, proposal)
             _validate_layer_placement(
@@ -496,5 +610,32 @@ class StairEplbPolicy:
             candidate_score = compute_balance_score(layer_load, proposal)
             if current_score - candidate_score > BALANCE_EPSILON:
                 result[layer_id] = proposal
+                candidate_peak, _ = _aggregate_peak_and_average(layer_load, proposal)
+                candidate_global_peak += candidate_peak - current_peak
+
+        minimum_global_improvement = current_global_peak * SWIFT_GLOBAL_IMPROVEMENT_RATIO
+        if current_global_peak - candidate_global_peak <= minimum_global_improvement:
+            result = current_by_rank.copy()
 
         return result.reshape(current_placement.shape).copy()
+
+    def commit(
+        self,
+        expert_load: np.ndarray,
+        current_placement: np.ndarray,
+        committed_placement: np.ndarray,
+        num_ranks: int,
+    ) -> None:
+        """Record FlashLB hysteresis state only for placements actually committed."""
+        expert_load = np.asarray(expert_load, dtype=np.float64)
+        current_placement = np.asarray(current_placement, dtype=np.int64)
+        committed_placement = np.asarray(committed_placement, dtype=np.int64)
+        if current_placement.shape != committed_placement.shape:
+            raise ValueError("Current and committed placements must have the same shape.")
+        self._prepare_history(expert_load, current_placement, num_ranks)
+        slots_per_rank = current_placement.shape[1] // num_ranks
+        for layer_id in np.flatnonzero(np.any(committed_placement != current_placement, axis=1)):
+            placement = committed_placement[layer_id].reshape(num_ranks, slots_per_rank)
+            score = compute_balance_score(expert_load[:, layer_id, :], placement)
+            self.average_to_peak_history[int(layer_id)] = 1.0 / score
+        self._expected_placement = committed_placement.copy()

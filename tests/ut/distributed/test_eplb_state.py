@@ -130,6 +130,115 @@ def test_init_sets_cuda_device_index_for_npu(monkeypatch):
     assert state.cuda_device_index == 5
 
 
+def test_temporal_policy_rebuilds_window_when_upstream_aggregates_load(monkeypatch):
+    physical_load_window = torch.tensor(
+        [
+            [[1, 2, 3], [4, 5, 6]],
+            [[7, 8, 9], [10, 11, 12]],
+        ],
+        dtype=torch.int32,
+    )
+    model_state = SimpleNamespace(
+        expert_load_window=physical_load_window,
+        physical_to_logical_map=torch.tensor(
+            [[0, 1, 0], [1, 0, 1]],
+            dtype=torch.int32,
+        ),
+        model=SimpleNamespace(num_moe_layers=2, num_logical_experts=2),
+    )
+    state = AscendEplbState.__new__(AscendEplbState)
+    state.model_states = {"model": model_state}
+    state.num_valid_physical_experts = 3
+    state._preserve_expert_load_time_series = True
+    reduced_inputs = []
+
+    def upstream_allreduce(self, tensors):
+        reduced_inputs.extend(tensor.clone() for tensor in tensors)
+        return tensors
+
+    monkeypatch.setattr(
+        upstream_eplb_state.EplbState,
+        "_allreduce_list",
+        upstream_allreduce,
+    )
+
+    result = state._allreduce_list([torch.full((2, 2), -1, dtype=torch.int32)])
+
+    expected = torch.tensor(
+        [
+            [[4, 2], [5, 10]],
+            [[16, 8], [11, 22]],
+        ],
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(reduced_inputs[0], expected.reshape(-1, 2))
+    torch.testing.assert_close(result[0], expected)
+
+
+def test_temporal_policy_accepts_native_upstream_time_series(monkeypatch):
+    state = AscendEplbState.__new__(AscendEplbState)
+    state._preserve_expert_load_time_series = True
+    first = torch.arange(12, dtype=torch.int32).reshape(2, 2, 3)
+    second = torch.arange(18, dtype=torch.int32).reshape(2, 3, 3)
+    reduced_inputs = []
+
+    def upstream_allreduce(self, tensors):
+        reduced_inputs.extend(tensor.clone() for tensor in tensors)
+        return tensors
+
+    monkeypatch.setattr(
+        upstream_eplb_state.EplbState,
+        "_allreduce_list",
+        upstream_allreduce,
+    )
+
+    result = state._allreduce_list([first, second])
+
+    torch.testing.assert_close(reduced_inputs[0], first.reshape(-1, 3))
+    torch.testing.assert_close(reduced_inputs[1], second.reshape(-1, 3))
+    torch.testing.assert_close(result[0], first)
+    torch.testing.assert_close(result[1], second)
+
+
+def test_default_policy_keeps_upstream_allreduce_contract(monkeypatch):
+    state = AscendEplbState.__new__(AscendEplbState)
+    state._preserve_expert_load_time_series = False
+    aggregated_load = torch.arange(6, dtype=torch.int32).reshape(2, 3)
+    upstream_allreduce = MagicMock(return_value=[aggregated_load])
+    monkeypatch.setattr(
+        upstream_eplb_state.EplbState,
+        "_allreduce_list",
+        upstream_allreduce,
+    )
+
+    result = state._allreduce_list([aggregated_load])
+
+    assert result[0] is aggregated_load
+    upstream_allreduce.assert_called_once_with([aggregated_load])
+
+
+def test_rearrange_scopes_temporal_allreduce_to_policy_cycle(monkeypatch):
+    observed_flags = []
+
+    def upstream_rearrange(self, is_profile=False, rank_mapping=None):
+        observed_flags.append(self._preserve_expert_load_time_series)
+
+    monkeypatch.setattr(
+        upstream_eplb_state.EplbState,
+        "rearrange",
+        upstream_rearrange,
+    )
+    state = AscendEplbState.__new__(AscendEplbState)
+    state.policy = SimpleNamespace(uses_expert_load_time_series=True)
+    state.is_async = True
+    state.model_states = {}
+
+    state.rearrange(is_profile=True)
+
+    assert observed_flags == [True]
+    assert not state._preserve_expert_load_time_series
+
+
 def test_add_model_keeps_upstream_policy_without_override(monkeypatch):
     upstream_policy = object()
 

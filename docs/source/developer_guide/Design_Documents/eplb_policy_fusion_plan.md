@@ -130,7 +130,8 @@ adapter 完成最终 validator 后才调用 `commit()`。STAIR 只为实际变�
 
 ## 数据和线程行为
 
-STAIR 只处理上游已经交给 policy worker 的 CPU tensor：
+Ascend EPLB state 在 policy 显式声明需要时间序列时保留 load window 维度，
+再把 CPU tensor 交给 policy worker：
 
 - `weight.sum(dim=0)`、slot-load 展开、Swift 计算和时间序列评分均在 CPU 执行；
 - 不读取 NPU tensor，不调用 `torch.npu.synchronize()`，也不使用设备 tensor `.item()`；
@@ -157,10 +158,11 @@ V2 logical load time series
 | --- | --- |
 | `vllm_ascend/eplb/core/policy/policy_stair.py` | 时间序列评分、hysteresis 和 commit 状态 |
 | `vllm_ascend/distributed/eplb_policy.py` | V2 contract、Swift 候选生成、最终 validator 和日志 |
-| `vllm_ascend/distributed/eplb_state.py` | 根据 Ascend 配置选择 STAIR adapter |
+| `vllm_ascend/distributed/eplb_state.py` | 根据 Ascend 配置选择 STAIR adapter，并为 opt-in policy 本地保留完整 load time series |
 | `vllm_ascend/ascend_config.py` | 接受 `placement_policy: stair` |
 
-不修改 `/Users/freyfwt/Projects/vllm` 上游接口，也不改变 `SwiftBalanceEplb` 本身。
+不依赖 vLLM 上游接口改动，也不改变 `SwiftBalanceEplb` 本身。若上游已经原生
+保留时间序列，本地兼容层会直接复用，不会重复映射。
 
 ## 配置
 

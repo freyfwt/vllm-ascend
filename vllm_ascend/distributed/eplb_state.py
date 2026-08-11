@@ -86,6 +86,7 @@ class AscendEplbState(_eplb_state.EplbState):
     def __init__(self, parallel_config, device: torch.device) -> None:
         super().__init__(parallel_config, device)
         self._has_fresh_recorded_load = False
+        self._preserve_expert_load_time_series = False
         # The upstream EplbState only sets cuda_device_index for CUDA devices.
         # The async worker thread needs a valid device index to set the
         # accelerator device and create an NPU stream.
@@ -148,6 +149,50 @@ class AscendEplbState(_eplb_state.EplbState):
         all_reduce(flag, group=device_group)
         return bool(flag.item())
 
+    def _build_logical_expert_load_time_series(self) -> list[torch.Tensor]:
+        """Map recorded physical loads without collapsing the window axis."""
+        logical_load_windows: list[torch.Tensor] = []
+        for model_state in self.model_states.values():
+            physical_load_window = model_state.expert_load_window[:, :, : self.num_valid_physical_experts]
+            logical_load_window = torch.zeros(
+                physical_load_window.shape[0],
+                model_state.model.num_moe_layers,
+                model_state.model.num_logical_experts,
+                dtype=physical_load_window.dtype,
+                device=physical_load_window.device,
+            )
+            logical_load_window.scatter_add_(
+                dim=-1,
+                index=model_state.physical_to_logical_map[:, : self.num_valid_physical_experts]
+                .unsqueeze(0)
+                .expand_as(physical_load_window)
+                .long(),
+                src=physical_load_window,
+            )
+            logical_load_windows.append(logical_load_window)
+        return logical_load_windows
+
+    def _allreduce_list(self, tensor_list: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Preserve the window axis for opt-in Ascend placement policies."""
+        if not self._preserve_expert_load_time_series:
+            return super()._allreduce_list(tensor_list)
+
+        # Older vLLM releases collapse the window before this extension point.
+        # Rebuild it locally in that case. Newer releases may already pass the
+        # time series, so keep their result instead of mapping the loads twice.
+        if all(tensor.dim() == 3 for tensor in tensor_list):
+            temporal_load_windows = tensor_list
+        else:
+            temporal_load_windows = self._build_logical_expert_load_time_series()
+
+        # The upstream helper batches multiple models as 2D tensors. Flatten
+        # only the leading window/layer axes for the collective, then restore
+        # the policy-facing [window, layer, expert] contract.
+        shapes = [tensor.shape for tensor in temporal_load_windows]
+        flattened = [tensor.reshape(-1, tensor.shape[-1]) for tensor in temporal_load_windows]
+        reduced = super()._allreduce_list(flattened)
+        return [tensor.reshape(shape) for tensor, shape in zip(reduced, shapes)]
+
     def rearrange(
         self,
         is_profile: bool = False,
@@ -167,7 +212,26 @@ class AscendEplbState(_eplb_state.EplbState):
         if should_gate and not self._has_global_fresh_recorded_load():
             return None
 
-        result = super().rearrange(is_profile=is_profile, rank_mapping=rank_mapping)
+        preserve_time_series = bool(
+            getattr(
+                getattr(self, "policy", None),
+                "uses_expert_load_time_series",
+                False,
+            )
+        )
+        previous_preserve_time_series = getattr(
+            self,
+            "_preserve_expert_load_time_series",
+            False,
+        )
+        self._preserve_expert_load_time_series = preserve_time_series
+        try:
+            result = super().rearrange(
+                is_profile=is_profile,
+                rank_mapping=rank_mapping,
+            )
+        finally:
+            self._preserve_expert_load_time_series = previous_preserve_time_series
         if not is_profile and not self.is_async:
             for model_state in self.model_states.values():
                 refresh_model_routing_tables(model_state)

@@ -249,7 +249,7 @@ def _replace_surplus_replicas(
     mean: np.ndarray,
     variance: np.ndarray,
     covariance: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     proposal = placement.copy()
     num_experts = target_replicas.shape[0]
     risk = mean + Z_SCORE * np.sqrt(np.maximum(variance, 0.0))
@@ -263,7 +263,7 @@ def _replace_surplus_replicas(
         replica_counts = _replica_counts(proposal, num_experts)
         deficits = target_replicas - replica_counts
         if not np.any(deficits > 0):
-            return proposal, num_com_between_rank
+            return proposal, target_replicas, num_com_between_rank
 
         unit_risk = np.full(num_experts, -np.inf, dtype=np.float64)
         missing = deficits > 0
@@ -312,6 +312,8 @@ def _replace_surplus_replicas(
                     best_send_rank = send_rank
 
         if best_candidate is None or best_position is None or best_send_rank is None:
+            if np.any(proposal != placement):
+                return proposal, replica_counts, num_com_between_rank
             return None
         num_com_between_rank[best_send_rank, best_position[0]] += 1
         proposal = best_candidate
@@ -587,12 +589,12 @@ class StairEplbPolicy:
             )
             if replacement is None:
                 continue
-            proposal, num_com_between_rank = replacement
+            proposal, effective_target_replicas, num_com_between_rank = replacement
             proposal = _refine_placement(
                 layer_load,
                 proposal,
                 original_placement,
-                target_replicas,
+                effective_target_replicas,
                 num_com_between_rank,
             )
             proposal = _align_local_slots(original_placement, proposal)
@@ -600,7 +602,7 @@ class StairEplbPolicy:
                 proposal,
                 num_experts,
                 num_ranks,
-                target_replicas,
+                effective_target_replicas,
             )
             candidate_score = compute_balance_score(layer_load, proposal)
             if current_score - candidate_score > BALANCE_EPSILON:

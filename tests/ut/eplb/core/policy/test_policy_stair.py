@@ -214,7 +214,15 @@ def test_stair_restores_swift_rank_pair_replacement_limit(monkeypatch):
         covariance,
     )
 
-    assert limited is None
+    assert limited is not None
+    limited_placement, limited_replicas, limited_communications = limited
+    assert np.count_nonzero(limited_placement != placement) == 1
+    assert np.max(limited_communications) == 1
+    np.testing.assert_array_equal(
+        np.bincount(limited_placement.reshape(-1), minlength=6),
+        limited_replicas,
+    )
+    assert not np.array_equal(limited_replicas, target_replicas)
     assert unlimited is not None
     np.testing.assert_array_equal(
         np.bincount(unlimited[0].reshape(-1), minlength=6),

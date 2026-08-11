@@ -13,7 +13,6 @@ Z_SCORE = 0.674
 SWIFT_IMBALANCE_THRESHOLD = 1.01
 SWIFT_MIN_SWAP_IMPROVEMENT_RATIO = 0.01
 SWIFT_MAX_COMMUNICATIONS_PER_RANK_PAIR = 1
-SWIFT_GLOBAL_IMPROVEMENT_RATIO = 0.05
 FLASH_UPDATE_THRESHOLD_RATIO = 0.9
 FLASH_UPDATE_THRESHOLD_VALUE = 0.85
 FLASH_SMALL_WORLD_SIZE = 32
@@ -558,15 +557,11 @@ class StairEplbPolicy:
         if not np.any(expert_load):
             return result.reshape(current_placement.shape).copy()
 
-        current_global_peak = 0.0
-        candidate_global_peak = 0.0
         for layer_id in range(expert_load.shape[1]):
             layer_load = expert_load[:, layer_id, :]
             original_placement = current_by_rank[layer_id]
             current_score = compute_balance_score(layer_load, original_placement)
             current_peak, current_average = _aggregate_peak_and_average(layer_load, original_placement)
-            current_global_peak += current_peak
-            candidate_global_peak += current_peak
             aggregate_imbalance = current_peak / current_average if current_average > 0 else 1.0
             if aggregate_imbalance < SWIFT_IMBALANCE_THRESHOLD or not self._needs_flash_update(
                 layer_id,
@@ -610,12 +605,6 @@ class StairEplbPolicy:
             candidate_score = compute_balance_score(layer_load, proposal)
             if current_score - candidate_score > BALANCE_EPSILON:
                 result[layer_id] = proposal
-                candidate_peak, _ = _aggregate_peak_and_average(layer_load, proposal)
-                candidate_global_peak += candidate_peak - current_peak
-
-        minimum_global_improvement = current_global_peak * SWIFT_GLOBAL_IMPROVEMENT_RATIO
-        if current_global_peak - candidate_global_peak <= minimum_global_improvement:
-            result = current_by_rank.copy()
 
         return result.reshape(current_placement.shape).copy()
 

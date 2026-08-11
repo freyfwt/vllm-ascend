@@ -142,7 +142,6 @@ def test_stair_commits_flashlb_history_only_for_changed_layers():
 def test_stair_restores_swift_layer_imbalance_gate(monkeypatch):
     placement = np.array([[0, 1, 2, 3]], dtype=np.int64)
     expert_load = np.array([[[80.0, 20.9, 79.0, 20.0]]])
-    monkeypatch.setattr(policy_stair, "SWIFT_GLOBAL_IMPROVEMENT_RATIO", 0.0)
     monkeypatch.setattr(policy_stair, "SWIFT_MIN_SWAP_IMPROVEMENT_RATIO", 0.0)
 
     gated = StairEplbPolicy().rebalance_experts(expert_load, placement, num_ranks=2)
@@ -156,7 +155,6 @@ def test_stair_restores_swift_layer_imbalance_gate(monkeypatch):
 def test_stair_restores_swift_minimum_swap_improvement(monkeypatch):
     placement = np.array([[0, 1, 2, 3]], dtype=np.int64)
     expert_load = np.array([[[80.0, 21.5, 79.5, 19.0]]])
-    monkeypatch.setattr(policy_stair, "SWIFT_GLOBAL_IMPROVEMENT_RATIO", 0.0)
 
     gated = StairEplbPolicy().rebalance_experts(expert_load, placement, num_ranks=2)
     monkeypatch.setattr(policy_stair, "SWIFT_MIN_SWAP_IMPROVEMENT_RATIO", 0.0)
@@ -222,18 +220,6 @@ def test_stair_restores_swift_rank_pair_replacement_limit(monkeypatch):
         np.bincount(unlimited[0].reshape(-1), minlength=6),
         target_replicas,
     )
-
-
-def test_stair_restores_swift_global_five_percent_gate(monkeypatch):
-    placement = np.array([[0, 1, 2, 3]], dtype=np.int64)
-    expert_load = np.array([[[80.0, 25.0, 75.0, 20.0]]])
-
-    gated = StairEplbPolicy().rebalance_experts(expert_load, placement, num_ranks=2)
-    monkeypatch.setattr(policy_stair, "SWIFT_GLOBAL_IMPROVEMENT_RATIO", 0.0)
-    ungated = StairEplbPolicy().rebalance_experts(expert_load, placement, num_ranks=2)
-
-    np.testing.assert_array_equal(gated, placement)
-    assert np.any(ungated != placement)
 
 
 @pytest.mark.parametrize("seed", range(10))

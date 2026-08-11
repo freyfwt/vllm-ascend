@@ -12,7 +12,7 @@ STAIR 是 **Statistical Temporal-Aware Incremental Rebalancing** 的缩写。本
 
 新 policy 只优化负载均衡，不建立搬运成本模型。它不依赖离线 profiling，不进行在线成本校准，也不增加任何与硬件带宽、专家字节数或预期回本周期有关的用户配置。
 
-整个决策过程仍以最小化采样窗口内各 rank 峰值负载相对平均负载的比值为主目标，但恢复 Swift 和 FlashLB 已验证过的更新刹车。只有失衡恶化或收益足够显著时才允许更新；rank-pair 通信次数也作为硬约束。placement 变化量继续作为等价候选的次级排序条件。
+整个决策过程仍以最小化采样窗口内各 rank 峰值负载相对平均负载的比值为主目标，但恢复 Swift 和 FlashLB 中适合增量决策的更新刹车。只有失衡恶化或单步收益足够显著时才允许更新；rank-pair 通信次数也作为硬约束。placement 变化量继续作为等价候选的次级排序条件。
 
 ## 背景
 
@@ -106,7 +106,6 @@ balance_score[l]
 ```text
 current_score - candidate_score > BALANCE_EPSILON
 single_swap_peak_reduction >= aggregate_average_load * 0.01
-sum(candidate_layer_peak) < sum(current_layer_peak) * 0.95
 ```
 
 `BALANCE_EPSILON` 是内部数值容差，初始使用 `1e-6`，不暴露为用户配置。两个候选分数之差不超过该容差时，依次选择：
@@ -214,7 +213,7 @@ planner 不先批量删除全部多余副本，因为独立删除可能使剩余
 
 只有完整窗口 `balance_score` 严格改善超过 `BALANCE_EPSILON`，且聚合窗口上的最热 rank 峰值至少下降平均 rank 负载的 1% 时才接受交换。若一轮不存在可接受交换，立即停止。候选选择遵循统一 tie-break 规则，不能依赖 Python `set` 的遍历顺序。
 
-所有层完成候选搜索后，再执行 Swift 的全局收益门槛：候选各层聚合峰值之和必须严格低于原值的 95%，否则整轮返回当前 placement。该门槛与 rank-pair 额度可能阻止理论均衡分数更好的候选，目的是抑制小收益的大范围搬运。
+STAIR 不恢复 Swift 的整轮 5% 全局收益门槛。该门槛会把各层独立收益绑定为一次全局一票否决，可能丢弃少数高价值层；层级 1.01 门槛、单步 1% 门槛、FlashLB hysteresis 和 rank-pair 额度已经分别限制触发频率、微小收益交换和单层搬运量。
 
 ### 6. 槽位对齐和最终校验
 
@@ -328,7 +327,7 @@ placement_policy: stair
 - 每个实际变化层的窗口均衡分数严格改善；
 - 分数等价时选择变化更少的 placement；
 - 超过局部优化步数上限时仍返回合法候选。
-- Swift 的 1.01 层级失衡、1% 单步收益、`num_max_com=1` 和全局 5% 收益门槛均有独立回归测试；
+- Swift 的 1.01 层级失衡、1% 单步收益和 `num_max_com=1` 均有独立回归测试；
 - FlashLB 的相对 hysteresis、绝对失衡门槛、首次强制尝试和仅对已采纳层更新历史均有独立回归测试。
 
 adapter 和配置测试必须证明：
@@ -389,7 +388,7 @@ adapter 和配置测试必须证明：
 6. EPLB 关闭、upstream default、Swift 和 FlashLB 路径行为不受影响；
 7. policy 不增加 NPU 同步或 forward 热路径工作。
 
-端到端性能必须记录并与三个对照组比较。STAIR 不引入传输耗时模型或用户配置的搬运预算，但恢复两套原算法的固定更新门槛和通信额度，以避免首次实验中每轮 48 层全变的无刹车行为。
+端到端性能必须记录并与三个对照组比较。STAIR 不引入传输耗时模型、用户配置的搬运预算或整轮 5% 一票否决，但保留层级/单步更新门槛、跨窗口 hysteresis 和通信额度，以避免首次实验中每轮 48 层全变的无刹车行为。
 
 ## 实施顺序
 

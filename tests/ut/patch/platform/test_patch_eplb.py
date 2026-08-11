@@ -171,7 +171,12 @@ def test_async_workspace_wrapper_acknowledges_no_transfer_cycle(monkeypatch):
         rebalanced=True,
         model=SimpleNamespace(num_moe_layers=2),
     )
-    original_move = MagicMock()
+    original_move_called = False
+
+    def original_move(model_state, ep_rank):
+        nonlocal original_move_called
+        original_move_called = True
+
     refresh = MagicMock()
     monkeypatch.setattr(patch_eplb, "refresh_model_routing_tables", refresh)
 
@@ -182,7 +187,7 @@ def test_async_workspace_wrapper_acknowledges_no_transfer_cycle(monkeypatch):
     assert model_state.rebalanced is False
     assert model_state.pending_result is None
     consumed_event.record.assert_called_once_with()
-    original_move.assert_not_called()
+    assert original_move_called is False
     refresh.assert_not_called()
 
 

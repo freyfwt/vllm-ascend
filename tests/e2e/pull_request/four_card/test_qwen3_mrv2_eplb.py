@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
+import hashlib
 import os
 from typing import Any
 from unittest.mock import patch
@@ -23,20 +24,42 @@ PROMPTS = [
 ]
 
 
-def _run_dp2_tp2(*, enable_eplb: bool, use_async: bool = False):
+def _get_eplb_snapshot(worker) -> dict[str, Any]:
+    state = worker.model_runner.eplb.state
+    assert state is not None
+    assert len(state.model_states) == 1
+    model_state = next(iter(state.model_states.values()))
+    mapping = model_state.physical_to_logical_map.detach().cpu().contiguous()
+    policy = state.policy
+    policy_impl = getattr(policy, "_policy", None)
+    history = getattr(policy_impl, "average_to_peak_history", {})
+    return {
+        "policy": policy.__name__,
+        "history_size": len(history),
+        "is_async": state.is_async,
+        "layer_fingerprints": [hashlib.sha256(layer.numpy().tobytes()).hexdigest() for layer in mapping],
+    }
+
+
+def _flatten_snapshots(snapshots: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [snapshot for dp_snapshots in snapshots for snapshot in dp_snapshots]
+
+
+def _run_dp2_tp2(*, enable_eplb: bool):
     runner_kwargs: dict[str, Any] = {
         "data_parallel_size": 2,
         "tensor_parallel_size": 2,
         "enable_expert_parallel": True,
-        "max_model_len": 1024,
-        "max_num_seqs": 4,
-        "max_num_batched_tokens": 1024,
-        "enforce_eager": True,
+        "max_model_len": 2048,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 2048,
+        "compilation_config": {"cudagraph_mode": "FULL_AND_PIECEWISE"},
         "quantization": "ascend",
         "distributed_executor_backend": "mp",
-        "async_scheduling": False,
+        "async_scheduling": True,
         "gpu_memory_utilization": 0.7,
         "block_size": 128,
+        "enable_prefix_caching": False,
         "dp_start_timeout": 1800,
         "dp_request_timeout": 1800,
     }
@@ -47,17 +70,27 @@ def _run_dp2_tp2(*, enable_eplb: bool, use_async: bool = False):
                 "eplb_config": {
                     "window_size": 2,
                     "step_interval": 2,
-                    "num_redundant_experts": 16,
-                    "log_balancedness": True,
-                    "log_balancedness_interval": 1,
-                    "use_async": use_async,
+                    "num_redundant_experts": 4,
+                    "log_balancedness": False,
+                    "use_async": True,
                 },
-                "additional_config": {"eplb_config": {"load_collection_phase": "prefill"}},
+                "additional_config": {
+                    "eplb_config": {
+                        "load_collection_phase": "prefill",
+                        "placement_policy": "stair",
+                    }
+                },
             }
         )
 
     with DPVllmRunner(MODEL, **runner_kwargs) as runner:
-        return runner.generate_greedy(PROMPTS, max_tokens=16)
+        if not enable_eplb:
+            return runner.generate_greedy(PROMPTS, max_tokens=16), None, None
+
+        before = _flatten_snapshots(runner.collective_rpc(_get_eplb_snapshot))
+        outputs = runner.generate_greedy(PROMPTS, max_tokens=16)
+        after = _flatten_snapshots(runner.collective_rpc(_get_eplb_snapshot))
+        return outputs, before, after
 
 
 @pytest.mark.e2e_model(MODEL)
@@ -68,7 +101,7 @@ def _run_dp2_tp2(*, enable_eplb: bool, use_async: bool = False):
     deploy="pd_mix",
     hardware="A3",
     quantization="W8A8",
-    graph_mode="eager",
+    graph_mode="full_and_piecewise",
 )
 @patch.dict(
     os.environ,
@@ -80,45 +113,30 @@ def _run_dp2_tp2(*, enable_eplb: bool, use_async: bool = False):
     },
 )
 @wait_until_npu_memory_free(target_free_percentage=0.7, max_wait_seconds=180)
-def test_qwen3_moe_w8a8_dp2_tp2_sync_eplb_accuracy():
-    baseline_outputs = _run_dp2_tp2(enable_eplb=False)
-    eplb_outputs = _run_dp2_tp2(enable_eplb=True)
+def test_qwen3_moe_w8a8_dp2_tp2_async_stair_eplb_accuracy():
+    baseline_outputs, _, _ = _run_dp2_tp2(enable_eplb=False)
+    eplb_outputs, before, after = _run_dp2_tp2(enable_eplb=True)
 
-    check_outputs_equal(
-        outputs_0_lst=eplb_outputs,
-        outputs_1_lst=baseline_outputs,
-        name_0="MRV2 synchronous EPLB",
-        name_1="MRV2 baseline",
+    assert before is not None and after is not None
+    assert len(before) == len(after) == 4
+    assert all(snapshot["policy"] == "StairEplbPolicyAdapter" for snapshot in before)
+    assert all(snapshot["is_async"] for snapshot in before)
+    assert all(snapshot["history_size"] > 0 for snapshot in after), "STAIR did not commit a policy decision"
+
+    changed_layer_counts = [
+        sum(before_fp != after_fp for before_fp, after_fp in zip(old["layer_fingerprints"], new["layer_fingerprints"]))
+        for old, new in zip(before, after)
+    ]
+    assert all(changed_layer_count > 0 for changed_layer_count in changed_layer_counts), (
+        "No async EPLB transfer was committed on every EP rank"
+    )
+    assert len({tuple(snapshot["layer_fingerprints"]) for snapshot in after}) == 1, (
+        "Committed EPLB mappings diverged across EP ranks"
     )
 
-
-@pytest.mark.e2e_model(MODEL)
-@pytest.mark.e2e_coverage(
-    arch="moe",
-    feature="eplb",
-    parallel="DP,TP,EP",
-    deploy="pd_mix",
-    hardware="A3",
-    quantization="W8A8",
-    graph_mode="eager",
-)
-@patch.dict(
-    os.environ,
-    {
-        "VLLM_USE_V2_MODEL_RUNNER": "1",
-        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-        "HCCL_BUFFSIZE": "1024",
-        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-    },
-)
-@wait_until_npu_memory_free(target_free_percentage=0.7, max_wait_seconds=180)
-def test_qwen3_moe_w8a8_dp2_tp2_async_eplb_accuracy():
-    baseline_outputs = _run_dp2_tp2(enable_eplb=False)
-    eplb_outputs = _run_dp2_tp2(enable_eplb=True, use_async=True)
-
     check_outputs_equal(
         outputs_0_lst=eplb_outputs,
         outputs_1_lst=baseline_outputs,
-        name_0="MRV2 asynchronous EPLB",
+        name_0="MRV2 asynchronous STAIR EPLB",
         name_1="MRV2 baseline",
     )

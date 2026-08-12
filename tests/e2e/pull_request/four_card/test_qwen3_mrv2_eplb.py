@@ -34,10 +34,16 @@ class EplbSnapshotWorkerExtension:
         policy = state.policy
         policy_impl = getattr(policy, "_policy", None)
         history = getattr(policy_impl, "average_to_peak_history", {})
+        load_windows = [
+            model_state.expert_load_window.detach().cpu()
+            for model_state in state.model_states.values()
+        ]
         return {
             "policy": policy.__name__,
             "history_size": len(history),
             "is_async": state.is_async,
+            "load_window_min": min(int(window.min().item()) for window in load_windows),
+            "negative_load_count": sum(int((window < 0).sum().item()) for window in load_windows),
             "layer_fingerprints": [hashlib.sha256(layer.numpy().tobytes()).hexdigest() for layer in mapping],
         }
 
@@ -123,7 +129,9 @@ def test_qwen3_moe_w8a8_dp2_tp2_async_stair_eplb_accuracy():
     assert len(before) == len(after) == 4
     assert all(snapshot["policy"] == "StairEplbPolicyAdapter" for snapshot in before)
     assert all(snapshot["is_async"] for snapshot in before)
-    assert all(snapshot["history_size"] > 0 for snapshot in after), "STAIR did not commit a policy decision"
+    assert all(snapshot["history_size"] > 0 for snapshot in after), (
+        f"STAIR did not commit a policy decision; final EPLB snapshots: {after}"
+    )
 
     changed_layer_counts = [
         sum(before_fp != after_fp for before_fp, after_fp in zip(old["layer_fingerprints"], new["layer_fingerprints"]))

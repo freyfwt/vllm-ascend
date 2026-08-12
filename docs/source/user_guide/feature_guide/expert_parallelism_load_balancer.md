@@ -6,10 +6,9 @@ Expert balancing for MoE (Mixture of Experts) models in LLM (Large Language) ser
 
 vLLM Ascend provides two EPLB integration paths:
 
-- **Model Runner V2 (MRv2)** uses the upstream vLLM EPLB controller,
-  configuration, default policy, load window, asynchronous worker, and
-  rearrangement lifecycle. Ascend adds Gloo CPU staging and the
-  `load_collection_phase` extension.
+- **Model Runner V2 (MRv2)** uses the upstream vLLM EPLB controller, load
+  window, and commit lifecycle. Ascend fixes the policy to STAIR and adds
+  asynchronous Gloo-staged movement and the `load_collection_phase` extension.
 - **Model Runner V1 (MRv1)** retains the legacy vLLM Ascend dynamic, recording,
   and static EPLB modes.
 
@@ -31,8 +30,8 @@ also depends on the selected model runner and hardware generation.
 
 Legacy MRv1 performance has primarily been verified on DeepSeek-V3.1/R1. The
 initial MRv2 model-level validation uses Qwen3-30B-A3B W8A8 with asynchronous
-EPLB. Validate accuracy and performance with the target model, topology, and
-traffic before production deployment.
+EPLB and graph mode. Validate accuracy and performance with the target model,
+topology, and traffic before production deployment.
 
 > [!IMPORTANT]
 > Ascend 950 Products does not support using EPLB with quant type "W4A8MXFP4", "W4A16", "W4A16MXFP4".
@@ -76,12 +75,11 @@ EPLB is not recommended in the following scenarios because the load-balancing be
 
 ## How to Use EPLB
 
-### Model Runner V2: Asynchronous EPLB
+### Model Runner V2: Asynchronous STAIR EPLB
 
 Select MRv2 explicitly when the model or environment does not select it by
-default. Enable expert parallelism and upstream EPLB. Ascend uses the upstream
-default policy, selects the Gloo communicator automatically, and supports
-asynchronous movement only.
+default. Enable expert parallelism and EPLB. Asynchronous mode is required and
+STAIR is selected automatically; no Ascend policy option is exposed.
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=1
@@ -108,11 +106,11 @@ MRv2 uses the upstream `EPLBConfig` fields:
 | `window_size` | `1000` | Number of recent steps used for expert-load recording. |
 | `step_interval` | `3000` | Interval between expert rearrangements. |
 | `num_redundant_experts` | `0` | Number of redundant physical experts. |
-| `use_async` | `true` | Ascend MRv2 always runs asynchronously. `false` is normalized to `true` with a warning. |
-| `policy` | `default` | Upstream EPLB placement policy. |
+| `use_async` | `true` | Must remain `true`. Expert movement uses Gloo CPU staging on a background worker. |
+| `policy` | `default` | Leave at the upstream default. Ascend internally fixes MRv2 placement to STAIR. |
 | `log_balancedness` | `false` | Log expert balancedness metrics. |
 | `log_balancedness_interval` | `1` | Interval between balancedness log entries. |
-| `communicator` | `None` | Leave unset for automatic Gloo selection, or set `torch_gloo`. |
+| `communicator` | `None` | Leave unset for automatic `torch_gloo` selection, or explicitly set `torch_gloo`. |
 
 These fields may also be passed together as JSON through `--eplb-config`.
 They must not be placed in `--additional-config` for MRv2.
@@ -132,10 +130,10 @@ non-matching batches.
 
 Classification is performed once per batch. A batch containing any prefill
 request is classified entirely as prefill; otherwise it is decode. A batch
-that does not match `load_collection_phase` contributes zero load whenever the
-current step is recorded; it does not suppress the shared EPLB window advance.
-This keeps load-window slots, scheduling, and communication aligned across
-data-parallel ranks.
+that does not match `load_collection_phase` does not contribute load and does
+not advance the EPLB load window. It still participates in the global EPLB
+scheduling and communication sequence so that data-parallel ranks remain
+synchronized.
 
 For example, to collect only prefill load:
 
@@ -148,11 +146,12 @@ vllm serve Qwen/Qwen3-30B-A3B \
 ```
 
 > [!IMPORTANT]
-> MRv2 supports asynchronous EPLB only and normalizes `use_async=false` to
-> asynchronous Gloo movement. It rejects legacy `dynamic_eplb`,
-> recording/static-map fields, `DYNAMIC_EPLB`, and `EXPERT_MAP_RECORD`, as
-> well as communicators other than Gloo. Validate the target model, topology,
-> graph mode, and traffic independently before production use.
+> MRv2 EPLB on Ascend supports the asynchronous Gloo path only. It rejects
+> synchronous movement, elastic EP, legacy `dynamic_eplb`, recording/static-map
+> fields, `DYNAMIC_EPLB`, and `EXPERT_MAP_RECORD`. The validated regression
+> scope includes `FULL_AND_PIECEWISE` graph mode, DP2 × TP2, and EP world size
+> four. Validate other topologies, multi-node deployment, and speculative
+> decoding independently before use.
 
 ### Model Runner V1: Legacy EPLB
 

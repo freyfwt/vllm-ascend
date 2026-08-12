@@ -1,6 +1,4 @@
-# Model Runner V1 EPLB Architecture
-
-This page describes the legacy Model Runner V1 (MRv1) EPLB implementation, including Swift and the MRv1 policy factory. Model Runner V2 uses a different controller, policy, and asynchronous movement lifecycle; see [Model Runner V2 EPLB Architecture](model_runner_v2_eplb.md). User-facing configuration for both runners is documented in the [EPLB user guide](../../user_guide/feature_guide/expert_parallelism_load_balancer.md).
+# Expert Parallelism Load Balancer (EPLB)
 
 ## Why We Need EPLB?
 

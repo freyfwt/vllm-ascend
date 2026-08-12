@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 from vllm.config import EPLBConfig, ParallelConfig, VllmConfig
 from vllm.config import parallel as parallel_module
 from vllm.platforms import current_platform
@@ -48,26 +47,7 @@ def test_parallel_and_vllm_config_keep_upstream_validation():
         vllm_config = VllmConfig(parallel_config=parallel_config)
 
     assert vllm_config.parallel_config.enable_eplb
-    assert vllm_config.parallel_config.eplb_config.communicator == "torch_gloo"
-
-
-def test_parallel_config_keeps_upstream_nixl_auto_selection():
-    with (
-        _npu_parallel_config_platform(),
-        patch(
-            "vllm.distributed.nixl_utils.is_nixl_available",
-            return_value=True,
-        ) as is_nixl_available,
-    ):
-        parallel_config = ParallelConfig(
-            tensor_parallel_size=2,
-            enable_expert_parallel=True,
-            enable_eplb=True,
-            eplb_config=EPLBConfig(use_async=True),
-        )
-
-    assert parallel_config.eplb_config.communicator == "nixl"
-    is_nixl_available.assert_called_once_with()
+    assert not getattr(ParallelConfig.__post_init__, patch_eplb._PATCH_MARKER, False)
 
 
 def test_parallel_config_platform_patch_is_idempotent():
@@ -78,27 +58,27 @@ def test_parallel_config_platform_patch_is_idempotent():
     assert parallel_module.current_platform is proxy
 
 
-def test_communicator_factory_creates_ascend_gloo_communicator(monkeypatch):
+def test_communicator_factory_maps_gloo_to_staged_on_npu(monkeypatch):
     communicator = object()
     gloo_cls = MagicMock(return_value=communicator)
     monkeypatch.setattr(patch_eplb, "AscendGlooEplbCommunicator", gloo_cls)
     coordinator = MagicMock()
 
-    result = patch_eplb._eplb_communicator.create_eplb_communicator(
-        coordinator,
-        "torch_gloo",
-        [[object()]],
-        [object()],
-    )
+    with _npu_parallel_config_platform():
+        result = patch_eplb._eplb_communicator.create_eplb_communicator(
+            coordinator,
+            "torch_gloo",
+            [[object()]],
+            [object()],
+        )
 
     assert result is communicator
     gloo_cls.assert_called_once_with(cpu_group=coordinator.cpu_group)
 
 
-def test_communicator_factory_accepts_additive_parameters(monkeypatch):
-    communicator = object()
-    gloo_cls = MagicMock(return_value=communicator)
-    monkeypatch.setattr(patch_eplb, "AscendGlooEplbCommunicator", gloo_cls)
+def test_communicator_factory_forwards_other_backends_and_additive_parameters():
+    sentinel = object()
+    calls = []
 
     def original_factory(
         group_coordinator,
@@ -108,66 +88,99 @@ def test_communicator_factory_accepts_additive_parameters(monkeypatch):
         *,
         transport_options=None,
     ):
-        raise AssertionError("The upstream factory should not be called on Ascend.")
+        calls.append(
+            (
+                group_coordinator,
+                backend,
+                expert_weights,
+                expert_buffer,
+                transport_options,
+            )
+        )
+        return sentinel
 
     wrapped_factory = patch_eplb._wrap_communicator_factory(original_factory)
-    coordinator = MagicMock()
-    result = wrapped_factory(
-        group_coordinator=coordinator,
-        backend="torch_gloo",
-        expert_weights=[[object()]],
-        expert_buffer=[object()],
-        transport_options={"mode": "future"},
-    )
+    coordinator = object()
+    expert_weights = object()
+    expert_buffer = object()
 
-    assert result is communicator
-    gloo_cls.assert_called_once_with(cpu_group=coordinator.cpu_group)
+    with _npu_parallel_config_platform():
+        result = wrapped_factory(
+            coordinator,
+            "nixl",
+            expert_weights,
+            expert_buffer,
+            transport_options={"mode": "future"},
+        )
 
-
-def test_communicator_factory_requires_group_coordinator_parameter():
-    def original_factory(backend, expert_weights, expert_buffer):
-        raise AssertionError("The upstream factory should not be called on Ascend.")
-
-    with pytest.raises(RuntimeError, match="group_coordinator"):
-        patch_eplb._wrap_communicator_factory(original_factory)
+    assert result is sentinel
+    assert calls == [
+        (
+            coordinator,
+            "nixl",
+            expert_weights,
+            expert_buffer,
+            {"mode": "future"},
+        )
+    ]
 
 
 def test_async_workspace_wrapper_refreshes_committed_layer(monkeypatch):
-    call_order: list[str] = []
-    consumed_event = MagicMock()
-    consumed_event.record.side_effect = lambda _stream=None: call_order.append("ack")
-    pending_result = SimpleNamespace(
-        layer_idx=3,
-        transfer_metadata=object(),
-        consumed_event=consumed_event,
-    )
+    pending_result = SimpleNamespace(layer_idx=3, transfer_metadata=object())
+    state = SimpleNamespace(commit_policy_layer=MagicMock(), complete_async_cycle=MagicMock())
     model_state = SimpleNamespace(
         pending_result=pending_result,
         rebalanced=True,
-        model=SimpleNamespace(num_moe_layers=4),
-        model_name="model",
+        _ascend_eplb_state=state,
     )
-    refresh = MagicMock(side_effect=lambda *_args: call_order.append("refresh"))
+    refresh = MagicMock()
     monkeypatch.setattr(patch_eplb, "refresh_model_routing_tables", refresh)
-    log_info = MagicMock()
-    monkeypatch.setattr(patch_eplb.logger, "info", log_info)
 
     def original_move(model_state, ep_rank, *, future_option=None):
-        assert ep_rank == 0
+        assert ep_rank == 2
         assert future_option == "future"
-        call_order.append("move")
-        model_state.pending_result.consumed_event.record()
         model_state.pending_result = None
         return "moved"
 
     wrapped_move = patch_eplb._wrap_move_to_workspace(original_move)
-    result = wrapped_move(model_state, 0, future_option="future")
+    result = wrapped_move(model_state, 2, future_option="future")
 
     assert result == "moved"
     refresh.assert_called_once_with(model_state, 3)
-    log_info.assert_called_once_with(
-        "%s: model=%s",
-        patch_eplb.ASYNC_EPLB_CYCLE_COMMITTED_LOG,
-        "model",
+    state.commit_policy_layer.assert_called_once_with(model_state, 3)
+    state.complete_async_cycle.assert_not_called()
+
+
+def test_async_workspace_wrapper_acknowledges_no_transfer_cycle(monkeypatch):
+    consumed_event = MagicMock()
+    pending_result = SimpleNamespace(
+        layer_idx=1,
+        transfer_metadata=patch_eplb.NO_TRANSFER_CYCLE_COMPLETE,
+        consumed_event=consumed_event,
     )
-    assert call_order == ["move", "refresh", "ack"]
+    state = SimpleNamespace(complete_async_cycle=MagicMock())
+    model_state = SimpleNamespace(
+        pending_result=pending_result,
+        rebalanced=True,
+        model=SimpleNamespace(num_moe_layers=2),
+        _ascend_eplb_state=state,
+    )
+    original_move_called = False
+
+    def original_move(model_state, ep_rank):
+        nonlocal original_move_called
+        original_move_called = True
+
+    refresh = MagicMock()
+    monkeypatch.setattr(patch_eplb, "refresh_model_routing_tables", refresh)
+
+    wrapped_move = patch_eplb._wrap_move_to_workspace(original_move)
+    result = wrapped_move(model_state, 0)
+
+    assert result is None
+    assert model_state.rebalanced is False
+    assert model_state.pending_result is None
+    consumed_event.record.assert_called_once_with()
+    assert original_move_called is False
+    refresh.assert_not_called()
+    state.complete_async_cycle.assert_called_once_with()

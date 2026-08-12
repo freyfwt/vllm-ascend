@@ -9,35 +9,12 @@ from inspect import signature
 from vllm.config import parallel as _parallel_config
 from vllm.distributed.eplb import eplb_communicator as _eplb_communicator
 from vllm.distributed.eplb import eplb_state as _eplb_state
-from vllm.logger import logger
 
-from vllm_ascend.distributed.eplb.communicator import AscendGlooEplbCommunicator
-from vllm_ascend.distributed.eplb.state import (
-    ASYNC_EPLB_CYCLE_COMMITTED_LOG,
-    refresh_model_routing_tables,
-)
+from vllm_ascend.distributed.eplb_async_worker import NO_TRANSFER_CYCLE_COMPLETE
+from vllm_ascend.distributed.eplb_communicator import AscendGlooEplbCommunicator
+from vllm_ascend.distributed.eplb_state import refresh_model_routing_tables
 
 _PATCH_MARKER = "_vllm_ascend_eplb_patch"
-
-
-class _DeferredConsumedEvent:
-    """Delay the worker acknowledgement until Ascend commit hooks finish."""
-
-    def __init__(self, consumed_event) -> None:
-        self._consumed_event = consumed_event
-        self._recorded = False
-        self._stream = None
-
-    def record(self, stream=None) -> None:
-        if self._recorded:
-            raise RuntimeError("EPLB result consumption was acknowledged more than once.")
-        self._recorded = True
-        self._stream = stream
-
-    def flush(self) -> None:
-        if not self._recorded:
-            raise RuntimeError("Upstream EPLB workspace move did not acknowledge the pending result.")
-        self._consumed_event.record(self._stream)
 
 
 class _CudaAlikeEplbPlatformProxy:
@@ -65,15 +42,17 @@ def _patch_parallel_config() -> None:
 
 def _wrap_communicator_factory(original_factory):
     factory_signature = signature(original_factory)
-    if "group_coordinator" not in factory_signature.parameters:
-        raise RuntimeError("Unsupported vLLM EPLB contract: communicator factory has no group_coordinator parameter.")
+    required_parameters = {"group_coordinator", "backend", "expert_weights", "expert_buffer"}
+    if not required_parameters.issubset(factory_signature.parameters):
+        raise RuntimeError("Unsupported vLLM EPLB contract: communicator factory signature changed.")
 
     @wraps(original_factory)
     def _create_eplb_communicator(*args, **kwargs):
         bound = factory_signature.bind(*args, **kwargs)
-        return AscendGlooEplbCommunicator(
-            cpu_group=bound.arguments["group_coordinator"].cpu_group,
-        )
+        bound.apply_defaults()
+        if _is_npu_platform(_parallel_config.current_platform) and bound.arguments["backend"] == "torch_gloo":
+            return AscendGlooEplbCommunicator(cpu_group=bound.arguments["group_coordinator"].cpu_group)
+        return original_factory(*args, **kwargs)
 
     setattr(_create_eplb_communicator, _PATCH_MARKER, True)
     return _create_eplb_communicator
@@ -99,28 +78,23 @@ def _wrap_move_to_workspace(original_move):
         model_state = bound.arguments["model_state"]
         pending_result = model_state.pending_result
         layer_idx = pending_result.layer_idx if pending_result is not None else None
+        if pending_result is not None and pending_result.transfer_metadata is NO_TRANSFER_CYCLE_COMPLETE:
+            model_state.rebalanced = False
+            model_state.pending_result = None
+            pending_result.consumed_event.record()
+            state = getattr(model_state, "_ascend_eplb_state", None)
+            if state is not None:
+                state.complete_async_cycle()
+            return None
 
-        deferred_event = None
-        consumed_event = None
-        if pending_result is not None:
-            consumed_event = pending_result.consumed_event
-            deferred_event = _DeferredConsumedEvent(consumed_event)
-            pending_result.consumed_event = deferred_event
-        try:
-            result = original_move(*bound.args, **bound.kwargs)
-            if layer_idx is not None:
-                refresh_model_routing_tables(model_state, layer_idx)
-                if bound.arguments["ep_rank"] == 0 and layer_idx == model_state.model.num_moe_layers - 1:
-                    logger.info(
-                        "%s: model=%s",
-                        ASYNC_EPLB_CYCLE_COMMITTED_LOG,
-                        model_state.model_name,
-                    )
-        finally:
-            if pending_result is not None and consumed_event is not None:
-                pending_result.consumed_event = consumed_event
-        if deferred_event is not None:
-            deferred_event.flush()
+        result = original_move(*bound.args, **bound.kwargs)
+        if layer_idx is not None:
+            refresh_model_routing_tables(model_state, layer_idx)
+            state = getattr(model_state, "_ascend_eplb_state", None)
+            if state is not None:
+                state.commit_policy_layer(model_state, layer_idx)
+                if not model_state.rebalanced:
+                    state.complete_async_cycle()
         return result
 
     setattr(_move_to_workspace, _PATCH_MARKER, True)

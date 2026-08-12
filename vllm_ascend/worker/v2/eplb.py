@@ -11,7 +11,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.v1.worker.gpu.eplb_utils import EPLBController
 
-from vllm_ascend.distributed.eplb.state import AscendEplbState
+from vllm_ascend.distributed.eplb_state import AscendEplbState
 
 
 def is_eplb_load_collection_phase_matched(
@@ -67,31 +67,42 @@ class AscendEPLBController(EPLBController):
             return
         state.prepare_forward(model_config, num_unpadded_tokens, ubatch_slices)
         if state.should_record_tensor is not None:
-            should_record = (
+            state.should_record_tensor.fill_(
                 state._should_record_current_step(log_stats=self.parallel_config.eplb_config.log_balancedness)
                 and self._load_collection_phase_matched
             )
-            state.should_record_tensor.fill_(should_record)
-            if should_record:
-                state._has_fresh_recorded_load = True
+
+    def step(
+        self,
+        is_dummy: bool = False,
+        is_profile: bool = False,
+    ) -> None:
+        state = self.state
+        if not self.parallel_config.enable_eplb or self.suppressed or state is None or not self._has_registered_models:
+            return
+
+        discard_current_load = not is_profile and not self._load_collection_phase_matched
+        # Phase selection may change the load submitted by each rank, but all
+        # ranks must advance the EPLB state machine and enter collectives in
+        # the same order. Treat a non-matching batch as an EPLB dummy step and
+        # let the upstream controller preserve the global logging schedule.
+        super().step(is_dummy=is_dummy or discard_current_load, is_profile=is_profile)
 
     def setup_from_mapping(
         self,
         model: nn.Module,
         model_config: Any,
         expanded_physical_to_logical: torch.Tensor,
-        old_num_physical_experts: int | None = None,
+        old_num_physical_experts: int,
     ) -> None:
         model = _unwrap_moe(model)
         assert is_mixture_of_experts(model)
-        from_mapping_kwargs: dict[str, Any] = dict(
+        self.state = AscendEplbState.from_mapping(
             model=model,
             model_config=model_config,
             device=self.device,
             parallel_config=self.parallel_config,
             expanded_physical_to_logical=expanded_physical_to_logical,
+            num_valid_physical_experts=old_num_physical_experts,
         )
-        if old_num_physical_experts is not None:
-            from_mapping_kwargs["num_valid_physical_experts"] = old_num_physical_experts
-        self.state = AscendEplbState.from_mapping(**from_mapping_kwargs)
         self._has_registered_models = True

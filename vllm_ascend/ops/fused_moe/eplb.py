@@ -119,6 +119,13 @@ def map_to_physical_and_record(
     return physical_ids
 
 
+def _map_to_physical_fake(
+    topk_ids: torch.Tensor,
+    expert_replica_routing_table: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(topk_ids)
+
+
 def _map_to_physical_and_record_fake(
     topk_ids: torch.Tensor,
     expert_replica_routing_table: torch.Tensor,
@@ -128,6 +135,13 @@ def _map_to_physical_and_record_fake(
 ) -> torch.Tensor:
     return torch.empty_like(topk_ids)
 
+
+direct_register_custom_op(
+    op_name="ascend_eplb_map_to_physical",
+    op_func=map_to_physical,
+    fake_impl=_map_to_physical_fake,
+    dispatch_key="PrivateUse1",
+)
 
 direct_register_custom_op(
     op_name="ascend_eplb_map_to_physical_and_record",

@@ -35,7 +35,6 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.lora.fused_moe import sync_lora_context
-from vllm_ascend.ops.fused_moe.eplb import record_local_expert_load
 from vllm_ascend.ops.fused_moe.experts_selector import zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
@@ -245,17 +244,6 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         self.enable_npugraph_ex_static_kernel = ascend_config.ascend_compilation_config.enable_static_kernel
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         self._use_v2_model_runner = bool(vllm_config.use_v2_model_runner)
-        self._defer_v2_eplb_recording = self._use_v2_model_runner and not getattr(
-            getattr(vllm_config, "parallel_config", None),
-            "enable_dbo",
-            False,
-        )
-        self._v2_eplb_token_split_size = getattr(
-            getattr(vllm_config, "parallel_config", None),
-            "tensor_parallel_size",
-            1,
-        )
-        self._v2_eplb_load_buffers: dict[int, tuple[torch.Tensor, int]] = {}
         self.dynamic_eplb = False
         self.multi_stage = False
         self.load_counter = None
@@ -312,39 +300,6 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             except RuntimeError as exc:
                 raise ValueError("Every Ascend EPLB expert row must be flattenable without a copy.") from exc
         return flattened_weights
-
-    def record_deferred_eplb_load(self, num_tokens: int) -> None:
-        """Record a captured load buffer after graph replay during sampling windows."""
-        if not self._defer_v2_eplb_recording:
-            return
-        load_buffer = self._v2_eplb_load_buffers.get(num_tokens)
-        if load_buffer is None:
-            # Ascend's TP+EP prepare path splits the token dimension across
-            # TP ranks before routing. Dynamic PIECEWISE graphs therefore
-            # publish their local routed-token count, while the model runner
-            # observes the global padded count. Keep the exact lookup first
-            # for paths that do not split tokens (for example shared-expert
-            # DP), then fall back to the local TP shard size.
-            split_size = self._v2_eplb_token_split_size
-            split_rank = self.moe_config.ep_rank % split_size
-            quotient, remainder = divmod(num_tokens, split_size)
-            local_num_tokens = quotient + int(split_rank < remainder)
-            load_buffer = self._v2_eplb_load_buffers.get(local_num_tokens)
-        if load_buffer is None:
-            raise RuntimeError(
-                f"No captured EPLB load buffer for {num_tokens} tokens; "
-                f"available keys: {list(self._v2_eplb_load_buffers)}."
-            )
-        expert_tokens, group_list_type = load_buffer
-        eplb_state = self.router.eplb_state
-        assert eplb_state is not None and eplb_state.expert_load_view is not None
-        record_local_expert_load(
-            expert_tokens=expert_tokens,
-            group_list_type=group_list_type,
-            expert_load_view=eplb_state.expert_load_view,
-            ep_rank=self.moe_config.ep_rank,
-            ep_size=self.moe_config.ep_size,
-        )
 
     def init_eplb(self, n_shared_experts):
         ascend_config = get_ascend_config()
@@ -617,31 +572,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         if zero_expert_result is not None:
             fused_experts_results.routed_out += zero_expert_result
 
-        if self._use_v2_model_runner and self.router.eplb_state is not None:
-            expert_tokens = fused_experts_results.expert_tokens
-            group_list_type = fused_experts_results.group_list_type
-            assert expert_tokens is not None and group_list_type is not None, (
-                "expert_tokens and group_list_type must be returned when Model Runner V2 EPLB is enabled."
-            )
-            if self._defer_v2_eplb_recording:
-                # Graph replay updates the same captured output buffer. Key it
-                # by padded token count so every captured graph size retains
-                # its own stable expert-token tensor.
-                self._v2_eplb_load_buffers[topk_ids.shape[0]] = (
-                    expert_tokens,
-                    group_list_type,
-                )
-            else:
-                eplb_state = self.router.eplb_state
-                assert eplb_state.expert_load_view is not None
-                record_local_expert_load(
-                    expert_tokens=expert_tokens,
-                    group_list_type=group_list_type,
-                    expert_load_view=eplb_state.expert_load_view,
-                    ep_rank=self.moe_config.ep_rank,
-                    ep_size=self.moe_config.ep_size,
-                )
-        elif self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
+        if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
             expert_tokens = fused_experts_results.expert_tokens
             group_list_type = fused_experts_results.group_list_type
             assert expert_tokens is not None and group_list_type is not None, (

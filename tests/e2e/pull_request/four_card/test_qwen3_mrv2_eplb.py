@@ -34,16 +34,19 @@ class EplbSnapshotWorkerExtension:
         policy = state.policy
         policy_impl = getattr(policy, "_policy", None)
         history = getattr(policy_impl, "average_to_peak_history", {})
-        load_windows = [
-            model_state.expert_load_window.detach().cpu()
-            for model_state in state.model_states.values()
-        ]
+        load_windows = [model_state.expert_load_window.detach().cpu() for model_state in state.model_states.values()]
+        global_load = None
+        if model_state.eplb_stats is not None:
+            global_load = model_state.eplb_stats.global_expert_load_window.detach().cpu()
         return {
             "policy": policy.__name__,
             "history_size": len(history),
             "is_async": state.is_async,
             "load_window_min": min(int(window.min().item()) for window in load_windows),
             "negative_load_count": sum(int((window < 0).sum().item()) for window in load_windows),
+            "global_load_min": None if global_load is None else int(global_load.min().item()),
+            "global_load_max": None if global_load is None else int(global_load.max().item()),
+            "global_negative_load_count": None if global_load is None else int((global_load < 0).sum().item()),
             "layer_fingerprints": [hashlib.sha256(layer.numpy().tobytes()).hexdigest() for layer in mapping],
         }
 

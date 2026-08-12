@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -374,6 +375,13 @@ class NPUModelRunner(GPUModelRunner):
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
         batch_has_prefill = bool(np.any(is_prefilling_np))
         self.eplb.set_batch_phase(batch_has_prefill, num_tokens_after_padding)
+        tp_size = self.parallel_config.tensor_parallel_size
+        tp_rank = get_tensor_model_parallel_rank()
+        quotient, remainder = divmod(num_tokens, tp_size)
+        self.eplb.prepare_forward(
+            self.model_config,
+            quotient + int(tp_rank < remainder),
+        )
 
         # Get prefill tokens if any.
         if batch_has_prefill:

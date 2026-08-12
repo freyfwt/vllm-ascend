@@ -33,7 +33,6 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -1590,7 +1589,7 @@ class DPVllmRunner(VllmRunner):
 
     def collective_rpc(
         self,
-        method: str | Callable[..., Any],
+        method: str,
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,

@@ -24,21 +24,22 @@ PROMPTS = [
 ]
 
 
-def _get_eplb_snapshot(worker) -> dict[str, Any]:
-    state = worker.model_runner.eplb.state
-    assert state is not None
-    assert len(state.model_states) == 1
-    model_state = next(iter(state.model_states.values()))
-    mapping = model_state.physical_to_logical_map.detach().cpu().contiguous()
-    policy = state.policy
-    policy_impl = getattr(policy, "_policy", None)
-    history = getattr(policy_impl, "average_to_peak_history", {})
-    return {
-        "policy": policy.__name__,
-        "history_size": len(history),
-        "is_async": state.is_async,
-        "layer_fingerprints": [hashlib.sha256(layer.numpy().tobytes()).hexdigest() for layer in mapping],
-    }
+class EplbSnapshotWorkerExtension:
+    def get_eplb_snapshot(self) -> dict[str, Any]:
+        state = self.model_runner.eplb.state
+        assert state is not None
+        assert len(state.model_states) == 1
+        model_state = next(iter(state.model_states.values()))
+        mapping = model_state.physical_to_logical_map.detach().cpu().contiguous()
+        policy = state.policy
+        policy_impl = getattr(policy, "_policy", None)
+        history = getattr(policy_impl, "average_to_peak_history", {})
+        return {
+            "policy": policy.__name__,
+            "history_size": len(history),
+            "is_async": state.is_async,
+            "layer_fingerprints": [hashlib.sha256(layer.numpy().tobytes()).hexdigest() for layer in mapping],
+        }
 
 
 def _flatten_snapshots(snapshots: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -60,6 +61,7 @@ def _run_dp2_tp2(*, enable_eplb: bool):
         "gpu_memory_utilization": 0.7,
         "block_size": 128,
         "enable_prefix_caching": False,
+        "worker_extension_cls": ("tests.e2e.pull_request.four_card.test_qwen3_mrv2_eplb.EplbSnapshotWorkerExtension"),
         "dp_start_timeout": 1800,
         "dp_request_timeout": 1800,
     }
@@ -87,9 +89,9 @@ def _run_dp2_tp2(*, enable_eplb: bool):
         if not enable_eplb:
             return runner.generate_greedy(PROMPTS, max_tokens=16), None, None
 
-        before = _flatten_snapshots(runner.collective_rpc(_get_eplb_snapshot))
+        before = _flatten_snapshots(runner.collective_rpc("get_eplb_snapshot"))
         outputs = runner.generate_greedy(PROMPTS, max_tokens=16)
-        after = _flatten_snapshots(runner.collective_rpc(_get_eplb_snapshot))
+        after = _flatten_snapshots(runner.collective_rpc("get_eplb_snapshot"))
         return outputs, before, after
 
 

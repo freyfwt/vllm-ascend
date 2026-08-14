@@ -47,7 +47,24 @@ def test_parallel_and_vllm_config_keep_upstream_validation():
         vllm_config = VllmConfig(parallel_config=parallel_config)
 
     assert vllm_config.parallel_config.enable_eplb
-    assert not getattr(ParallelConfig.__post_init__, patch_eplb._PATCH_MARKER, False)
+    assert vllm_config.parallel_config.eplb_config.communicator == "torch_gloo"
+    assert getattr(ParallelConfig.__post_init__, patch_eplb._PATCH_MARKER, False)
+
+
+def test_parallel_config_selects_gloo_before_upstream_nixl_probe():
+    with (
+        _npu_parallel_config_platform(),
+        patch("vllm.distributed.nixl_utils.is_nixl_available") as is_nixl_available,
+    ):
+        parallel_config = ParallelConfig(
+            tensor_parallel_size=2,
+            enable_expert_parallel=True,
+            enable_eplb=True,
+            eplb_config=EPLBConfig(use_async=True),
+        )
+
+    assert parallel_config.eplb_config.communicator == "torch_gloo"
+    is_nixl_available.assert_not_called()
 
 
 def test_parallel_config_platform_patch_is_idempotent():
@@ -132,6 +149,7 @@ def test_async_workspace_wrapper_refreshes_committed_layer(monkeypatch):
         pending_result=pending_result,
         rebalanced=True,
         _ascend_eplb_state=state,
+        _ascend_eplb_committed_layers=0,
     )
     refresh = MagicMock()
     monkeypatch.setattr(patch_eplb, "refresh_model_routing_tables", refresh)
@@ -148,6 +166,7 @@ def test_async_workspace_wrapper_refreshes_committed_layer(monkeypatch):
     assert result == "moved"
     refresh.assert_called_once_with(model_state, 3)
     state.commit_policy_layer.assert_called_once_with(model_state, 3)
+    assert model_state._ascend_eplb_committed_layers == 1
 
 
 def test_async_workspace_wrapper_acknowledges_no_transfer_cycle(monkeypatch):

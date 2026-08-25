@@ -25,7 +25,7 @@ PROMPTS = [
 EXPECTED_ANSWER_PREFIXES = [
     ("Paris",),
     ("Jupiter",),
-    ("32 degrees Fahrenheit", "0 degrees Celsius"),
+    ("32 degrees Fahrenheit", "32°F", "0 degrees Celsius", "0°C", "0 °C"),
     ("Jane Austen",),
     ("Au",),
     ("12",),

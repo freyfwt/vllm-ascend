@@ -149,23 +149,28 @@ class AscendEplbState(_eplb_state.EplbState):
     def _build_logical_expert_load_time_series(self) -> list[torch.Tensor]:
         logical_load_windows = []
         for model_state in self.model_states.values():
-            physical_load_window = model_state.expert_load_window[:, :, : self.num_valid_physical_experts]
+            physical_load_window = model_state.expert_load_window
+            physical_to_logical_map = model_state.physical_to_logical_map
+            invalid_idx = model_state.model.num_logical_experts
             logical_load_window = torch.zeros(
                 physical_load_window.shape[0],
                 model_state.model.num_moe_layers,
-                model_state.model.num_logical_experts,
+                invalid_idx + 1,
                 dtype=physical_load_window.dtype,
                 device=physical_load_window.device,
             )
             logical_load_window.scatter_add_(
                 dim=-1,
-                index=model_state.physical_to_logical_map[:, : self.num_valid_physical_experts]
+                index=physical_to_logical_map.masked_fill(
+                    physical_to_logical_map < 0,
+                    invalid_idx,
+                )
                 .unsqueeze(0)
                 .expand_as(physical_load_window)
                 .long(),
                 src=physical_load_window,
             )
-            logical_load_windows.append(logical_load_window)
+            logical_load_windows.append(logical_load_window[..., :-1])
         return logical_load_windows
 
     def _allreduce_list(self, tensor_list: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -225,7 +230,6 @@ class AscendEplbState(_eplb_state.EplbState):
         device: torch.device,
         parallel_config,
         expanded_physical_to_logical: torch.Tensor,
-        num_valid_physical_experts: int,
     ) -> "AscendEplbState":
         state = super().from_mapping(
             model=model,
@@ -233,7 +237,6 @@ class AscendEplbState(_eplb_state.EplbState):
             device=device,
             parallel_config=parallel_config,
             expanded_physical_to_logical=expanded_physical_to_logical,
-            num_valid_physical_experts=num_valid_physical_experts,
         )
         for model_state in state.model_states.values():
             refresh_model_routing_tables(model_state)

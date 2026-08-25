@@ -17,6 +17,26 @@ from vllm_ascend.distributed.eplb.state import refresh_model_routing_tables
 _PATCH_MARKER = "_vllm_ascend_eplb_patch"
 
 
+class _DeferredConsumedEvent:
+    """Delay the worker acknowledgement until Ascend commit hooks finish."""
+
+    def __init__(self, consumed_event) -> None:
+        self._consumed_event = consumed_event
+        self._recorded = False
+        self._stream = None
+
+    def record(self, stream=None) -> None:
+        if self._recorded:
+            raise RuntimeError("EPLB result consumption was acknowledged more than once.")
+        self._recorded = True
+        self._stream = stream
+
+    def flush(self) -> None:
+        if not self._recorded:
+            raise RuntimeError("Upstream EPLB workspace move did not acknowledge the pending result.")
+        self._consumed_event.record(self._stream)
+
+
 class _CudaAlikeEplbPlatformProxy:
     """Delegate platform operations while exposing EPLB validation capability."""
 
@@ -102,14 +122,26 @@ def _wrap_move_to_workspace(original_move):
             pending_result.consumed_event.record()
             return None
 
-        result = original_move(*bound.args, **bound.kwargs)
-        if layer_idx is not None:
-            refresh_model_routing_tables(model_state, layer_idx)
-            state = getattr(model_state, "_ascend_eplb_state", None)
-            if state is not None:
-                state.commit_policy_layer(model_state, layer_idx)
-            committed_layers = getattr(model_state, "_ascend_eplb_committed_layers", 0)
-            model_state._ascend_eplb_committed_layers = committed_layers + 1
+        deferred_event = None
+        consumed_event = None
+        if pending_result is not None:
+            consumed_event = pending_result.consumed_event
+            deferred_event = _DeferredConsumedEvent(consumed_event)
+            pending_result.consumed_event = deferred_event
+        try:
+            result = original_move(*bound.args, **bound.kwargs)
+            if layer_idx is not None:
+                refresh_model_routing_tables(model_state, layer_idx)
+                state = getattr(model_state, "_ascend_eplb_state", None)
+                if state is not None:
+                    state.commit_policy_layer(model_state, layer_idx)
+                committed_layers = getattr(model_state, "_ascend_eplb_committed_layers", 0)
+                model_state._ascend_eplb_committed_layers = committed_layers + 1
+        finally:
+            if pending_result is not None and consumed_event is not None:
+                pending_result.consumed_event = consumed_event
+        if deferred_event is not None:
+            deferred_event.flush()
         return result
 
     setattr(_move_to_workspace, _PATCH_MARKER, True)

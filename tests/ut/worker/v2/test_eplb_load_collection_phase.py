@@ -62,6 +62,29 @@ class TestEplbLoadCollectionPhase(unittest.TestCase):
 
         self.assertIsInstance(controller.state, AscendEplbState)
 
+    def test_setup_from_mapping_uses_current_upstream_contract(self):
+        controller = self._make_controller()
+        model = MagicMock()
+        model_config = object()
+        mapping = torch.zeros((1, 1), dtype=torch.int32)
+        state = MagicMock()
+
+        with (
+            patch("vllm_ascend.worker.v2.eplb.is_mixture_of_experts", return_value=True),
+            patch.object(AscendEplbState, "from_mapping", return_value=state) as from_mapping,
+        ):
+            controller.setup_from_mapping(model, model_config, mapping)
+
+        from_mapping.assert_called_once_with(
+            model=model,
+            model_config=model_config,
+            device=controller.device,
+            parallel_config=controller.parallel_config,
+            expanded_physical_to_logical=mapping,
+        )
+        self.assertIs(controller.state, state)
+        self.assertTrue(controller._has_registered_models)
+
     def test_rank_local_phase_filter_keeps_load_window_steps_aligned(self):
         for batch_has_prefill in (True, False):
             with self.subTest(batch_has_prefill=batch_has_prefill):

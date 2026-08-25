@@ -78,6 +78,8 @@ def _run_one_cycle(monkeypatch, old_map, new_map, *, commit_results=True):
                 pending_layers.append(result.layer_idx)
                 if commit_results:
                     model_state._ascend_eplb_committed_layers += 1
+                    if result.layer_idx == model_state.model.num_moe_layers - 1:
+                        model_state.rebalanced = False
             model_state.pending_result = None
 
     stream = MagicMock()
@@ -169,3 +171,25 @@ def test_async_worker_does_not_log_acknowledged_but_uncommitted_cycle(monkeypatc
     )
 
     cycle_log.assert_not_called()
+
+
+def test_async_worker_logs_cycle_when_final_layer_changes(monkeypatch):
+    old_map = torch.tensor([[0, 1], [0, 1], [0, 1]], dtype=torch.int32)
+    new_map = torch.tensor([[0, 1], [0, 1], [1, 0]], dtype=torch.int32)
+    model_state, _, transfer_layer, _, pending_layers, completed_cycles, cycle_log = _run_one_cycle(
+        monkeypatch,
+        old_map,
+        new_map,
+    )
+
+    transfer_layer.assert_called_once()
+    assert transfer_layer.call_args.kwargs["layer_idx"] == 2
+    assert pending_layers == [2]
+    assert completed_cycles == []
+    assert model_state.rebalanced is False
+    cycle_log.assert_called_once_with(
+        "%s: model=%s, changed_layers=%d",
+        eplb_async_worker.ASYNC_EPLB_CYCLE_COMMITTED_LOG,
+        "model",
+        1,
+    )

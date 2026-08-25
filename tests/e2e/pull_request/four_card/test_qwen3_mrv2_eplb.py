@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+import regex as re
 
 from tests.e2e.conftest import DPVllmRunner, wait_until_npu_memory_free
 from vllm_ascend.distributed.eplb.async_worker import ASYNC_EPLB_CYCLE_COMMITTED_LOG
@@ -124,4 +125,9 @@ def test_qwen3_moe_w8a8_dp2_tp2_async_stair_eplb_accuracy(capfd: pytest.CaptureF
     eplb_outputs = _run_dp2_tp2()
     _assert_expected_answers(eplb_outputs, "MRV2 asynchronous STAIR EPLB")
     captured = capfd.readouterr()
-    assert ASYNC_EPLB_CYCLE_COMMITTED_LOG in captured.out + captured.err
+    output = captured.out + captured.err
+    committed_cycle = re.search(
+        rf"{re.escape(ASYNC_EPLB_CYCLE_COMMITTED_LOG)}: model=.+, changed_layers=([1-9][0-9]*)",
+        output,
+    )
+    assert committed_cycle is not None, "No asynchronous EPLB cycle committed a real layer transfer."

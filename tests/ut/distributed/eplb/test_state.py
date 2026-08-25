@@ -84,7 +84,6 @@ def test_from_mapping_refreshes_final_mapping(monkeypatch):
         device=torch.device("cpu"),
         parallel_config=object(),
         expanded_physical_to_logical=torch.zeros(1),
-        num_valid_physical_experts=1,
     )
 
     assert isinstance(state, AscendEplbState)
@@ -107,22 +106,21 @@ def test_init_sets_cuda_device_index_for_npu(monkeypatch):
 def test_temporal_policy_rebuilds_window_when_upstream_aggregates_load(monkeypatch):
     physical_load_window = torch.tensor(
         [
-            [[1, 2, 3], [4, 5, 6]],
-            [[7, 8, 9], [10, 11, 12]],
+            [[1, 2, 3, 99], [4, 5, 6, 99]],
+            [[7, 8, 9, 99], [10, 11, 12, 99]],
         ],
         dtype=torch.int32,
     )
     model_state = SimpleNamespace(
         expert_load_window=physical_load_window,
         physical_to_logical_map=torch.tensor(
-            [[0, 1, 0], [1, 0, 1]],
+            [[0, 1, 0, -1], [1, 0, 1, -1]],
             dtype=torch.int32,
         ),
         model=SimpleNamespace(num_moe_layers=2, num_logical_experts=2),
     )
     state = AscendEplbState.__new__(AscendEplbState)
     state.model_states = {"model": model_state}
-    state.num_valid_physical_experts = 3
     state._preserve_expert_load_time_series = True
     reduced_inputs: list[torch.Tensor] = []
 

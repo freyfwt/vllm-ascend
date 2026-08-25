@@ -107,7 +107,7 @@ MRv2 uses the upstream `EPLBConfig` fields:
 | `window_size` | `1000` | Number of recent steps used for expert-load recording. |
 | `step_interval` | `3000` | Interval between expert rearrangements. |
 | `num_redundant_experts` | `0` | Number of redundant physical experts. |
-| `use_async` | `true` | Ascend MRv2 always runs asynchronously. |
+| `use_async` | `true` | Ascend MRv2 always runs asynchronously. `false` is normalized to `true` with a warning. |
 | `policy` | `default` | Leave at the default; Ascend selects STAIR internally. |
 | `log_balancedness` | `false` | Log expert balancedness metrics. |
 | `log_balancedness_interval` | `1` | Interval between balancedness log entries. |
@@ -150,7 +150,8 @@ vllm serve Qwen/Qwen3-30B-A3B \
 ```
 
 > [!IMPORTANT]
-> MRv2 supports asynchronous EPLB only. It rejects legacy `dynamic_eplb`,
+> MRv2 supports asynchronous EPLB only and normalizes `use_async=false` to
+> asynchronous Gloo movement. It rejects legacy `dynamic_eplb`,
 > recording/static-map fields, `DYNAMIC_EPLB`, and `EXPERT_MAP_RECORD`, as
 > well as communicators other than Gloo. Validate the target model, topology,
 > graph mode, and traffic independently before production use.

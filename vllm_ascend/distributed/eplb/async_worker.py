@@ -120,6 +120,7 @@ def transfer_run_periodically(
             changed_layers: list[int] = (
                 torch.any(new_mapping != old_mapping, dim=1).nonzero(as_tuple=False).flatten().tolist()
             )
+            cycle_completed = True
 
             for layer_idx in changed_layers:
                 flag = torch.tensor([int(model_state.rebalanced)], dtype=torch.int32, device="cpu")
@@ -134,6 +135,7 @@ def transfer_run_periodically(
                         eplb_cpu_group.size(),
                     )
                     model_state.rebalanced = False
+                    cycle_completed = False
                     break
 
                 transfer_metadata = transfer_layer(
@@ -156,7 +158,7 @@ def transfer_run_periodically(
                     cuda_stream,
                 )
 
-            if model_state.rebalanced:
+            if cycle_completed and model_state.rebalanced:
                 _publish_result(
                     model_state,
                     model_state.model.num_moe_layers - 1,
@@ -164,6 +166,7 @@ def transfer_run_periodically(
                     NO_TRANSFER_CYCLE_COMPLETE,
                     cuda_stream,
                 )
+            if cycle_completed:
                 committed_layers = getattr(model_state, "_ascend_eplb_committed_layers", 0)
                 if ep_rank == 0 and committed_layers > 0:
                     logger.info(

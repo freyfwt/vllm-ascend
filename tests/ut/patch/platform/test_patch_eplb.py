@@ -143,20 +143,30 @@ def test_communicator_factory_forwards_other_backends_and_additive_parameters():
 
 
 def test_async_workspace_wrapper_refreshes_committed_layer(monkeypatch):
-    pending_result = SimpleNamespace(layer_idx=3, transfer_metadata=object())
-    state = SimpleNamespace(commit_policy_layer=MagicMock())
+    call_order: list[str] = []
+    consumed_event = MagicMock()
+    consumed_event.record.side_effect = lambda _stream=None: call_order.append("ack")
+    pending_result = SimpleNamespace(
+        layer_idx=3,
+        transfer_metadata=object(),
+        consumed_event=consumed_event,
+    )
+    commit_policy_layer = MagicMock(side_effect=lambda *_args: call_order.append("policy"))
+    state = SimpleNamespace(commit_policy_layer=commit_policy_layer)
     model_state = SimpleNamespace(
         pending_result=pending_result,
         rebalanced=True,
         _ascend_eplb_state=state,
         _ascend_eplb_committed_layers=0,
     )
-    refresh = MagicMock()
+    refresh = MagicMock(side_effect=lambda *_args: call_order.append("refresh"))
     monkeypatch.setattr(patch_eplb, "refresh_model_routing_tables", refresh)
 
     def original_move(model_state, ep_rank, *, future_option=None):
         assert ep_rank == 2
         assert future_option == "future"
+        call_order.append("move")
+        model_state.pending_result.consumed_event.record()
         model_state.pending_result = None
         return "moved"
 
@@ -167,6 +177,7 @@ def test_async_workspace_wrapper_refreshes_committed_layer(monkeypatch):
     refresh.assert_called_once_with(model_state, 3)
     state.commit_policy_layer.assert_called_once_with(model_state, 3)
     assert model_state._ascend_eplb_committed_layers == 1
+    assert call_order == ["move", "refresh", "policy", "ack"]
 
 
 def test_async_workspace_wrapper_acknowledges_no_transfer_cycle(monkeypatch):

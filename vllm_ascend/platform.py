@@ -845,6 +845,12 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
         if vllm_config.parallel_config.enable_eplb:
             upstream_eplb_config = vllm_config.parallel_config.eplb_config
+            if upstream_eplb_config.communicator not in (None, "torch_gloo"):
+                raise ValueError(
+                    "Async EPLB on Ascend requires the torch_gloo communicator "
+                    "(CPU staging). Leave eplb_config.communicator unset for "
+                    "automatic selection or set it to 'torch_gloo'."
+                )
             if not upstream_eplb_config.use_async:
                 logger.warning(
                     "Synchronous EPLB is not supported on Ascend; "
@@ -864,12 +870,6 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                 upstream_eplb_config.policy = "default"
             if vllm_config.parallel_config.enable_elastic_ep:
                 raise ValueError("Async EPLB is not supported with elastic EP on Ascend.")
-            if upstream_eplb_config.communicator not in (None, "torch_gloo"):
-                raise ValueError(
-                    "Async EPLB on Ascend requires the torch_gloo communicator "
-                    "(CPU staging). Leave eplb_config.communicator unset for "
-                    "automatic selection or set it to 'torch_gloo'."
-                )
     elif "load_collection_phase" in eplb_config:
         raise ValueError(
             "additional_config.eplb_config.load_collection_phase is only supported by "

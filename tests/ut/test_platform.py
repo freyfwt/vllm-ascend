@@ -161,7 +161,7 @@ class TestNPUPlatform(TestBase):
         vllm_config.parallel_config.enable_eplb = True
         vllm_config.parallel_config.eplb_config = MagicMock(
             use_async=False,
-            communicator="torch_nccl",
+            communicator=None,
             policy="random",
         )
 
@@ -172,6 +172,22 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(vllm_config.parallel_config.eplb_config.communicator, "torch_gloo")
         self.assertEqual(vllm_config.parallel_config.eplb_config.policy, "default")
         self.assertEqual(warning.call_count, 2)
+
+    def test_validate_eplb_config_rejects_nccl_before_sync_normalization(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.eplb_config = MagicMock(
+            use_async=False,
+            communicator="torch_nccl",
+            policy="default",
+        )
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            self.assertRaisesRegex(ValueError, "torch_gloo"),
+        ):
+            _validate_eplb_config(vllm_config)
 
     def test_validate_eplb_config_async_keeps_gloo_auto_select(self):
         vllm_config = self.mock_vllm_config()

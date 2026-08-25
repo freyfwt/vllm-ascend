@@ -125,6 +125,7 @@ def test_temporal_policy_rebuilds_window_when_upstream_aggregates_load(monkeypat
     reduced_inputs: list[torch.Tensor] = []
 
     def upstream_allreduce(self, tensors):
+        assert all(tensor.is_contiguous() for tensor in tensors)
         reduced_inputs.extend(tensor.clone() for tensor in tensors)
         return tensors
 

@@ -183,7 +183,7 @@ class AscendEplbState(_eplb_state.EplbState):
             else self._build_logical_expert_load_time_series()
         )
         shapes = [tensor.shape for tensor in temporal_load_windows]
-        flattened = [tensor.reshape(-1, tensor.shape[-1]) for tensor in temporal_load_windows]
+        flattened = [tensor.reshape(-1, tensor.shape[-1]).contiguous() for tensor in temporal_load_windows]
         reduced = super()._allreduce_list(flattened)
         return [tensor.reshape(shape) for tensor, shape in zip(reduced, shapes)]
 

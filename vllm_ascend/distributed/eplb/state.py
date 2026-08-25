@@ -3,6 +3,7 @@
 
 """Ascend EPLB state for Statistical Temporal-Aware Incremental Rebalancing (STAIR)."""
 
+import inspect
 from dataclasses import fields
 from typing import Any
 
@@ -14,6 +15,11 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
 from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
+
+
+def _upstream_from_mapping_accepts_valid_expert_count() -> bool:
+    """Return whether the selected vLLM uses the release mapping contract."""
+    return "num_valid_physical_experts" in inspect.signature(_eplb_state.EplbState.from_mapping).parameters
 
 
 class AscendEplbLayerState(_eplb_state.EplbLayerState):
@@ -230,14 +236,20 @@ class AscendEplbState(_eplb_state.EplbState):
         device: torch.device,
         parallel_config,
         expanded_physical_to_logical: torch.Tensor,
+        num_valid_physical_experts: int | None = None,
     ) -> "AscendEplbState":
-        state = super().from_mapping(
+        from_mapping_kwargs: dict[str, Any] = dict(
             model=model,
             model_config=model_config,
             device=device,
             parallel_config=parallel_config,
             expanded_physical_to_logical=expanded_physical_to_logical,
         )
+        if _upstream_from_mapping_accepts_valid_expert_count():
+            if num_valid_physical_experts is None:
+                raise TypeError("num_valid_physical_experts is required by the selected vLLM release mapping contract")
+            from_mapping_kwargs["num_valid_physical_experts"] = num_valid_physical_experts
+        state = super().from_mapping(**from_mapping_kwargs)
         for model_state in state.model_states.values():
             refresh_model_routing_tables(model_state)
         return state

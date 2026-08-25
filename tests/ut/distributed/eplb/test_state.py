@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from vllm.distributed.eplb import eplb_state as upstream_eplb_state
 
@@ -88,6 +89,73 @@ def test_from_mapping_refreshes_final_mapping(monkeypatch):
 
     assert isinstance(state, AscendEplbState)
     refresh.assert_called_once_with(model_state)
+
+
+def test_from_mapping_forwards_release_valid_expert_count(monkeypatch):
+    model_state = object()
+    received_count = None
+
+    def upstream_from_mapping(
+        cls,
+        model,
+        model_config,
+        device,
+        parallel_config,
+        expanded_physical_to_logical,
+        num_valid_physical_experts,
+    ):
+        del model, model_config, device, parallel_config, expanded_physical_to_logical
+        nonlocal received_count
+        received_count = num_valid_physical_experts
+        state = cls.__new__(cls)
+        state.model_states = {"model": model_state}
+        return state
+
+    monkeypatch.setattr(
+        upstream_eplb_state.EplbState,
+        "from_mapping",
+        classmethod(upstream_from_mapping),
+    )
+    monkeypatch.setattr(eplb_state, "refresh_model_routing_tables", MagicMock())
+
+    AscendEplbState.from_mapping(
+        model=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+        parallel_config=object(),
+        expanded_physical_to_logical=torch.zeros((1, 2)),
+        num_valid_physical_experts=1,
+    )
+
+    assert received_count == 1
+
+
+def test_from_mapping_requires_release_valid_expert_count(monkeypatch):
+    def upstream_from_mapping(
+        cls,
+        model,
+        model_config,
+        device,
+        parallel_config,
+        expanded_physical_to_logical,
+        num_valid_physical_experts,
+    ):
+        raise AssertionError("release mapping must not run without a valid count")
+
+    monkeypatch.setattr(
+        upstream_eplb_state.EplbState,
+        "from_mapping",
+        classmethod(upstream_from_mapping),
+    )
+
+    with pytest.raises(TypeError, match="required by the selected vLLM release"):
+        AscendEplbState.from_mapping(
+            model=object(),
+            model_config=object(),
+            device=torch.device("cpu"),
+            parallel_config=object(),
+            expanded_physical_to_logical=torch.zeros((1, 2)),
+        )
 
 
 def test_init_sets_cuda_device_index_for_npu(monkeypatch):

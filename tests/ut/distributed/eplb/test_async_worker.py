@@ -10,6 +10,13 @@ import pytest
 import torch
 
 from vllm_ascend.distributed.eplb import async_worker as eplb_async_worker
+from vllm_ascend.distributed.eplb.policy.stair_types import (
+    StairBalanceScore,
+    StairBudgetUsage,
+    StairLayerPlan,
+    StairRebalancePlan,
+    StairTransferCost,
+)
 from vllm_ascend.distributed.eplb.state import AscendEplbState
 
 
@@ -32,7 +39,16 @@ def test_rebalance_uses_model_owned_policy(monkeypatch):
     old_map = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32)
     new_map = torch.tensor([[0, 2, 1, 3]], dtype=torch.int32)
     model_policy = MagicMock()
-    model_policy.rebalance_experts.return_value = new_map
+    plan = StairRebalancePlan(
+        new_mapping=new_map,
+        selected_layers=(),
+        rejected_layers=(),
+        budget_usage=StairBudgetUsage(),
+        planner_elapsed_ms=1.0,
+        plan_id="plan",
+        topology_hash="flat",
+    )
+    model_policy.plan_rebalance.return_value = plan
     model_state = SimpleNamespace(
         _ascend_eplb_policy=model_policy,
         _ascend_eplb_policy_load=None,
@@ -49,7 +65,7 @@ def test_rebalance_uses_model_owned_policy(monkeypatch):
     result = eplb_async_worker._run_rebalance_experts(model_state, old_map, MagicMock())
 
     assert result is new_map
-    model_policy.rebalance_experts.assert_called_once_with(
+    model_policy.plan_rebalance.assert_called_once_with(
         load_window,
         4,
         1,
@@ -58,12 +74,40 @@ def test_rebalance_uses_model_owned_policy(monkeypatch):
         old_map,
     )
     assert model_state._ascend_eplb_policy_load is load_window
+    assert model_state._ascend_eplb_active_plan is plan
+
+
+def _plan_from_mapping(old_map: torch.Tensor, new_map: torch.Tensor) -> StairRebalancePlan:
+    score = StairBalanceScore(1.0, 1.0, 1.0)
+    selected = tuple(
+        StairLayerPlan(
+            layer_idx=layer_idx,
+            placement=new_map[layer_idx].reshape(1, -1).numpy(),
+            current_score=score,
+            candidate_score=score,
+            balance_gain=1.0,
+            utility=float(old_map.shape[0] - layer_idx),
+            transfer_cost=StairTransferCost(expert_transfers=1),
+        )
+        for layer_idx in range(old_map.shape[0])
+        if not torch.equal(old_map[layer_idx], new_map[layer_idx])
+    )
+    usage = StairBudgetUsage(selected_layers=len(selected), expert_transfers=len(selected))
+    return StairRebalancePlan(
+        new_mapping=new_map,
+        selected_layers=selected,
+        rejected_layers=(),
+        budget_usage=usage,
+        planner_elapsed_ms=1.0,
+        plan_id="plan",
+        topology_hash="flat",
+    )
 
 
 def _run_one_cycle(monkeypatch, old_map, new_map, *, commit_results=True):
     pending_layers: list[int] = []
     completed_cycles: list[int] = []
-    transfer_metadata = object()
+    transfer_metadata = SimpleNamespace(recv_count=1)
     transfer_layer = MagicMock(return_value=transfer_metadata)
     all_reduce = MagicMock()
     cycle_log = MagicMock()
@@ -78,6 +122,7 @@ def _run_one_cycle(monkeypatch, old_map, new_map, *, commit_results=True):
                 pending_layers.append(result.layer_idx)
                 if commit_results:
                     model_state._ascend_eplb_committed_layers += 1
+                    model_state._ascend_eplb_committed_layer_ids.append(result.layer_idx)
                     if result.layer_idx == model_state.model.num_moe_layers - 1:
                         model_state.rebalanced = False
             model_state.pending_result = None
@@ -94,6 +139,7 @@ def _run_one_cycle(monkeypatch, old_map, new_map, *, commit_results=True):
         expert_buffer=[object()],
         rebalanced=True,
         pending_result=None,
+        _ascend_eplb_policy=MagicMock(),
     )
     state = SimpleNamespace(
         rearrange_event=_OneCycleEvent(),
@@ -107,7 +153,7 @@ def _run_one_cycle(monkeypatch, old_map, new_map, *, commit_results=True):
     coordinator = SimpleNamespace(device_group=device_group, cpu_group=cpu_group)
 
     monkeypatch.setattr(eplb_async_worker, "get_eplb_group", lambda: coordinator)
-    monkeypatch.setattr(eplb_async_worker, "_run_rebalance_experts", lambda *args: new_map)
+    monkeypatch.setattr(eplb_async_worker, "_run_rebalance_plan", lambda *args: _plan_from_mapping(old_map, new_map))
     monkeypatch.setattr(eplb_async_worker, "transfer_layer", transfer_layer)
     monkeypatch.setattr(eplb_async_worker, "CpuGpuEvent", _ConsumedEvent)
     monkeypatch.setattr(eplb_async_worker.torch.cuda, "stream", lambda stream: nullcontext())

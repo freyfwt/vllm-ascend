@@ -107,6 +107,10 @@ class AscendEplbState(_eplb_state.EplbState):
         model_state_any: Any = model_state
         model_state_any._ascend_eplb_policy = StairEplbPolicy()
         model_state_any._ascend_eplb_state = self
+        model_state_any._ascend_eplb_active_plan = None
+        model_state_any._ascend_eplb_policy_load = None
+        model_state_any._ascend_eplb_pending_execution_metrics = None
+        model_state_any._ascend_eplb_committed_layer_ids = []
         # super().add_model() replaces the state-level policy with the
         # configured upstream policy. Restore the STAIR profile policy.
         self.policy = self._profile_policy
@@ -226,7 +230,11 @@ class AscendEplbState(_eplb_state.EplbState):
             layer_idx,
             model_state.physical_to_logical_map[layer_idx].cpu(),
             model_state.eplb_stats.num_gpus,
+            getattr(model_state, "_ascend_eplb_pending_execution_metrics", None),
         )
+        committed_layer_ids = getattr(model_state, "_ascend_eplb_committed_layer_ids", None)
+        if committed_layer_ids is not None:
+            committed_layer_ids.append(layer_idx)
 
     @classmethod
     def from_mapping(

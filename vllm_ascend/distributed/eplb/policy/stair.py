@@ -3,25 +3,27 @@
 
 """Statistical Temporal-Aware Incremental Rebalancing (STAIR) policy."""
 
+import hashlib
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
+from dataclasses import replace
 
 import numpy as np
 import numpy.typing as npt
 import torch
 from vllm.logger import logger
 
-BALANCE_EPSILON = 1e-6
-IMBALANCE_THRESHOLD = 1.01
-SWAP_IMPROVEMENT_RATIO = 0.01
-MAX_COMMUNICATIONS_PER_RANK_PAIR = 1
-MAX_SWAP_ATTEMPTS = 100
-
-TEMPORAL_UPDATE_THRESHOLD_RATIO = 0.9
-TEMPORAL_UPDATE_THRESHOLD_VALUE = 0.85
-SMALL_WORLD_SIZE = 32
-SMALL_WORLD_UPDATE_THRESHOLD_RATIO = 0.95
-SMALL_WORLD_UPDATE_THRESHOLD_VALUE = 0.9
+from vllm_ascend.distributed.eplb.policy import stair_constants as constants
+from vllm_ascend.distributed.eplb.policy.stair_types import (
+    StairBalanceScore,
+    StairBudgetUsage,
+    StairCandidateKind,
+    StairExecutionMetrics,
+    StairLayerPlan,
+    StairRebalancePlan,
+    StairRejectReason,
+    StairTransferCost,
+)
 
 
 def _replica_counts(placement: np.ndarray, num_experts: int) -> np.ndarray:
@@ -158,7 +160,7 @@ def _place_replicas(
         for rank_idx in range(num_ranks):
             if not redundant_slots[rank_idx] or expert_id in assignments[rank_idx]:
                 continue
-            if communication[source, rank_idx] >= MAX_COMMUNICATIONS_PER_RANK_PAIR:
+            if communication[source, rank_idx] >= constants.MAX_TRANSFERS_PER_RANK_PAIR:
                 continue
             if candidate == -1 or rank_loads[rank_idx] < rank_loads[candidate]:
                 candidate = rank_idx
@@ -207,11 +209,11 @@ def _swap_experts(
     num_ranks = assignments.shape[0]
     replica_counts = _replica_counts(assignments, expert_load.size)
     per_replica_load = expert_load / replica_counts
-    minimum_gain = expert_load.sum() / num_ranks * SWAP_IMPROVEMENT_RATIO
+    minimum_gain = expert_load.sum() / num_ranks * constants.SWAP_IMPROVEMENT_RATIO
     rank_experts = [set(int(expert) for expert in rank) for rank in assignments]
 
     exchanged = True
-    attempts = MAX_SWAP_ATTEMPTS
+    attempts = constants.MAX_SWAP_ATTEMPTS
     while exchanged and attempts > 0:
         attempts -= 1
         exchanged = False
@@ -221,8 +223,8 @@ def _swap_experts(
         for cold_rank_value in sorted_ranks[:-1]:
             cold_rank = int(cold_rank_value)
             if (
-                communication[cold_rank, hot_rank] >= MAX_COMMUNICATIONS_PER_RANK_PAIR
-                or communication[hot_rank, cold_rank] >= MAX_COMMUNICATIONS_PER_RANK_PAIR
+                communication[cold_rank, hot_rank] >= constants.MAX_TRANSFERS_PER_RANK_PAIR
+                or communication[hot_rank, cold_rank] >= constants.MAX_TRANSFERS_PER_RANK_PAIR
             ):
                 continue
 
@@ -290,7 +292,7 @@ def _build_incremental_candidate(
     for layer_idx in range(num_layers):
         current_layer = current_by_rank[layer_idx]
         current_score = compute_balance_score(logical_load[layer_idx : layer_idx + 1], current_layer)
-        if current_score < IMBALANCE_THRESHOLD:
+        if current_score < constants.IMBALANCE_THRESHOLD:
             continue
         target_counts = _allocate_replica_counts(logical_load[layer_idx], current_layer.size, num_ranks)
         assignments, rank_loads, communication, received_by_rank = _place_replicas(
@@ -318,10 +320,30 @@ class StairEplbPolicy:
 
     uses_expert_load_time_series = True
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        layer_expert_bytes: tuple[int, ...] | None = None,
+        *,
+        runtime_history: bool = True,
+    ) -> None:
+        constants.validate_stair_constants()
+        self._layer_expert_bytes = layer_expert_bytes
+        self._runtime_history = runtime_history
         self.average_to_peak_history: dict[int, float] = {}
         self._topology: tuple[int, int, int, int] | None = None
         self._expected_layer_placements: dict[int, np.ndarray] = {}
+        self._pending_plan: StairRebalancePlan | None = None
+        self.execution_metrics: list[StairExecutionMetrics] = []
+
+    def configure_runtime(self, layer_expert_bytes: tuple[int, ...] | None) -> None:
+        """Update setup-only weight sizes after rejecting active-plan mutation."""
+        if self._pending_plan is not None:
+            raise RuntimeError("Cannot reconfigure STAIR while a rebalance plan is active.")
+        if self._layer_expert_bytes != layer_expert_bytes:
+            self._layer_expert_bytes = layer_expert_bytes
+            self.average_to_peak_history.clear()
+            self._expected_layer_placements.clear()
+            self._topology = None
 
     def _prepare_history(
         self,
@@ -350,25 +372,24 @@ class StairEplbPolicy:
         past_ratio = self.average_to_peak_history.get(layer_id)
         if past_ratio is None:
             return True
-        if num_ranks < SMALL_WORLD_SIZE:
-            threshold_ratio = SMALL_WORLD_UPDATE_THRESHOLD_RATIO
-            threshold_value = SMALL_WORLD_UPDATE_THRESHOLD_VALUE
+        if num_ranks < constants.SMALL_WORLD_SIZE:
+            threshold_ratio = constants.SMALL_WORLD_UPDATE_THRESHOLD_RATIO
+            threshold_value = constants.SMALL_WORLD_UPDATE_THRESHOLD_VALUE
         else:
-            threshold_ratio = TEMPORAL_UPDATE_THRESHOLD_RATIO
-            threshold_value = TEMPORAL_UPDATE_THRESHOLD_VALUE
+            threshold_ratio = constants.TEMPORAL_UPDATE_THRESHOLD_RATIO
+            threshold_value = constants.TEMPORAL_UPDATE_THRESHOLD_VALUE
         current_ratio = 1.0 / current_score
         return current_ratio < past_ratio * threshold_ratio or current_ratio < threshold_value
 
-    def rebalance_experts(
+    def _prepare_inputs(
         self,
         weight: torch.Tensor,
         num_replicas: int,
         num_groups: int,
         num_nodes: int,
         num_ranks: int,
-        old_global_expert_indices: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return a CPU physical-to-logical map through the vLLM policy contract."""
+        old_global_expert_indices: torch.Tensor | None,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
         if old_global_expert_indices is None:
             raise ValueError("STAIR EPLB requires the current physical-to-logical map.")
         if num_replicas <= 0 or num_groups <= 0 or num_nodes <= 0 or num_ranks <= 0:
@@ -399,34 +420,198 @@ class StairEplbPolicy:
         current_by_rank = current.reshape(current.shape[0], num_ranks, slots_per_rank)
         for layer_placement in current_by_rank:
             _validate_layer_placement(layer_placement, expert_load.shape[2], num_ranks)
-        if not np.any(expert_load):
-            return torch.from_numpy(current).to(dtype=torch.long).contiguous()
+        if self._layer_expert_bytes is not None and len(self._layer_expert_bytes) != current.shape[0]:
+            raise ValueError("STAIR layer expert byte sizes must match the number of MoE layers.")
+        return expert_load, current, slots_per_rank
 
+    def _estimate_transfer_cost(
+        self,
+        layer_idx: int,
+        current: np.ndarray,
+        candidate: np.ndarray,
+    ) -> StairTransferCost:
+        changed = int(np.count_nonzero(current != candidate))
+        expert_bytes = 0 if self._layer_expert_bytes is None else self._layer_expert_bytes[layer_idx]
+        total_bytes = changed * expert_bytes
+        return StairTransferCost(
+            expert_transfers=changed,
+            total_bytes=total_bytes,
+            weighted_bytes=float(total_bytes),
+        )
+
+    def _build_layer_plan(
+        self,
+        layer_idx: int,
+        layer_load: np.ndarray,
+        current: np.ndarray,
+        candidate: np.ndarray,
+        num_ranks: int,
+    ) -> StairLayerPlan:
+        current_value = compute_balance_score(layer_load, current)
+        candidate_value = compute_balance_score(layer_load, candidate)
+        current_score = StairBalanceScore(current_value, current_value, current_value)
+        candidate_score = StairBalanceScore(candidate_value, candidate_value, candidate_value)
+        transfer_cost = self._estimate_transfer_cost(layer_idx, current, candidate)
+        gain = current_value - candidate_value
+        utility_denominator = max(transfer_cost.weighted_bytes, float(transfer_cost.expert_transfers), 1.0)
+        utility = gain / utility_denominator
+        accepted = True
+        reject_reason = StairRejectReason.NONE
+        if not self._needs_temporal_update(layer_idx, current_value, num_ranks):
+            accepted = False
+            reject_reason = StairRejectReason.TEMPORAL_GATE
+        elif gain <= constants.MIN_BALANCE_GAIN:
+            accepted = False
+            reject_reason = StairRejectReason.NO_BALANCE_GAIN
+        return StairLayerPlan(
+            layer_idx=layer_idx,
+            placement=candidate.copy(),
+            current_score=current_score,
+            candidate_score=candidate_score,
+            balance_gain=gain,
+            utility=utility,
+            transfer_cost=transfer_cost,
+            candidate_kind=StairCandidateKind.GREEDY,
+            accepted=accepted,
+            reject_reason=reject_reason,
+        )
+
+    @staticmethod
+    def _compute_plan_digest(
+        current: np.ndarray,
+        selected_layers: tuple[StairLayerPlan, ...],
+        topology_hash: str,
+    ) -> str:
+        digest = hashlib.sha256()
+        digest.update(current.tobytes())
+        digest.update(topology_hash.encode())
+        digest.update(str(constants.STAIR_TUNING_VERSION).encode())
+        digest.update(
+            (
+                f"{constants.MAX_LAYERS_PER_CYCLE}:"
+                f"{constants.MAX_EXPERT_TRANSFERS_PER_CYCLE}:"
+                f"{constants.MAX_TRANSFER_BYTES_PER_CYCLE}:"
+                f"{constants.MAX_CROSS_NODE_BYTES_PER_CYCLE}"
+            ).encode()
+        )
+        for layer_plan in selected_layers:
+            digest.update(layer_plan.layer_idx.to_bytes(4, byteorder="little", signed=False))
+            digest.update(layer_plan.placement.tobytes())
+        return digest.hexdigest()[:16]
+
+    def plan_rebalance(
+        self,
+        weight: torch.Tensor,
+        num_replicas: int,
+        num_groups: int,
+        num_nodes: int,
+        num_ranks: int,
+        old_global_expert_indices: torch.Tensor | None = None,
+    ) -> StairRebalancePlan:
+        """Return a deterministic, budgeted execution plan on CPU."""
+        expert_load, current, slots_per_rank = self._prepare_inputs(
+            weight,
+            num_replicas,
+            num_groups,
+            num_nodes,
+            num_ranks,
+            old_global_expert_indices,
+        )
         start_time = time.perf_counter()
+        topology_hash = f"flat:{num_nodes}:{num_ranks}"
+        self._prepare_history(expert_load, current, num_ranks)
+        current_by_rank = current.reshape(current.shape[0], num_ranks, slots_per_rank)
+        if not np.any(expert_load):
+            selected_layers: tuple[StairLayerPlan, ...] = ()
+            plan = StairRebalancePlan(
+                new_mapping=torch.from_numpy(current.copy()).to(dtype=torch.long).contiguous(),
+                selected_layers=selected_layers,
+                rejected_layers=(),
+                budget_usage=StairBudgetUsage(),
+                planner_elapsed_ms=(time.perf_counter() - start_time) * 1000,
+                plan_id=self._compute_plan_digest(current, selected_layers, topology_hash),
+                topology_hash=topology_hash,
+            )
+            self._pending_plan = plan
+            return plan
+
         candidate = _build_incremental_candidate(expert_load.sum(axis=0), current, num_ranks)
         candidate_by_rank = candidate.reshape(candidate.shape[0], num_ranks, slots_per_rank)
-        self._prepare_history(expert_load, current, num_ranks)
-
-        result = current_by_rank.copy()
         candidate_layers = np.flatnonzero(np.any(candidate != current, axis=1))
+        proposed: list[StairLayerPlan] = []
+        rejected: list[StairLayerPlan] = []
         for layer_id in candidate_layers:
             layer_load = expert_load[:, layer_id, :]
-            current_score = compute_balance_score(layer_load, current_by_rank[layer_id])
-            if not self._needs_temporal_update(int(layer_id), current_score, num_ranks):
-                continue
-            candidate_score = compute_balance_score(layer_load, candidate_by_rank[layer_id])
-            if current_score - candidate_score > BALANCE_EPSILON:
-                result[layer_id] = candidate_by_rank[layer_id]
+            layer_plan = self._build_layer_plan(
+                int(layer_id),
+                layer_load,
+                current_by_rank[layer_id],
+                candidate_by_rank[layer_id],
+                num_ranks,
+            )
+            (proposed if layer_plan.accepted else rejected).append(layer_plan)
 
-        result = result.reshape(current.shape).copy()
-        changed_layers = int(np.count_nonzero(np.any(result != current, axis=1)))
-        logger.info(
-            "STAIR EPLB policy completed in %.3f ms; proposed %d layers and accepted %d layers.",
-            (time.perf_counter() - start_time) * 1000,
-            candidate_layers.size,
-            changed_layers,
+        proposed.sort(key=lambda plan: (-plan.utility, plan.layer_idx))
+        result = current_by_rank.copy()
+        usage = StairBudgetUsage()
+        selected: list[StairLayerPlan] = []
+        for layer_plan in proposed:
+            if not usage.can_add(layer_plan):
+                rejected.append(
+                    replace(
+                        layer_plan,
+                        accepted=False,
+                        reject_reason=StairRejectReason.CYCLE_BUDGET,
+                    )
+                )
+                continue
+            usage.add(layer_plan)
+            selected.append(layer_plan)
+            result[layer_plan.layer_idx] = layer_plan.placement
+
+        selected_layers = tuple(selected)
+        plan = StairRebalancePlan(
+            new_mapping=torch.from_numpy(result.reshape(current.shape).copy()).to(dtype=torch.long).contiguous(),
+            selected_layers=selected_layers,
+            rejected_layers=tuple(sorted(rejected, key=lambda item: item.layer_idx)),
+            budget_usage=usage,
+            planner_elapsed_ms=(time.perf_counter() - start_time) * 1000,
+            plan_id=self._compute_plan_digest(current, selected_layers, topology_hash),
+            topology_hash=topology_hash,
         )
-        return torch.from_numpy(result).to(dtype=torch.long).contiguous()
+        self._pending_plan = plan
+        rejected_by_reason = Counter(item.reject_reason.value for item in plan.rejected_layers)
+        rejection_summary = ",".join(
+            f"{reason}={rejected_by_reason[reason]}" for reason in sorted(rejected_by_reason)
+        )
+        logger.info(
+            "STAIR EPLB plan %s completed in %.3f ms; evaluated %d layers, selected %d layers, rejected [%s].",
+            plan.plan_id,
+            plan.planner_elapsed_ms,
+            candidate_layers.size,
+            len(selected_layers),
+            rejection_summary,
+        )
+        return plan
+
+    def rebalance_experts(
+        self,
+        weight: torch.Tensor,
+        num_replicas: int,
+        num_groups: int,
+        num_nodes: int,
+        num_ranks: int,
+        old_global_expert_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return a CPU physical-to-logical map through the vLLM policy contract."""
+        return self.plan_rebalance(
+            weight,
+            num_replicas,
+            num_groups,
+            num_nodes,
+            num_ranks,
+            old_global_expert_indices,
+        ).new_mapping
 
     def commit_layer(
         self,
@@ -434,8 +619,11 @@ class StairEplbPolicy:
         layer_idx: int,
         committed_placement: torch.Tensor,
         num_ranks: int,
+        execution_metrics: StairExecutionMetrics | None = None,
     ) -> None:
         """Record hysteresis only after one layer is actually committed."""
+        if not self._runtime_history:
+            return
         load_array = expert_load.detach().to(dtype=torch.float64).contiguous().numpy()
         placement_array = committed_placement.detach().to(dtype=torch.long).contiguous().numpy()
         if load_array.ndim != 3 or not 0 <= layer_idx < load_array.shape[1]:
@@ -447,3 +635,21 @@ class StairEplbPolicy:
         score = compute_balance_score(load_array[:, layer_idx, :], placement)
         self.average_to_peak_history[layer_idx] = 1.0 / score
         self._expected_layer_placements[layer_idx] = placement_array.copy()
+        if execution_metrics is not None:
+            self.execution_metrics.append(replace(execution_metrics, committed=True))
+
+    def finish_cycle(self, plan_id: str, committed_layers: tuple[int, ...]) -> None:
+        """Close a plan after the worker observes all main-thread acknowledgements."""
+        if self._pending_plan is None:
+            return
+        if self._pending_plan.plan_id != plan_id:
+            raise RuntimeError("STAIR attempted to finish a stale rebalance plan.")
+        selected = {plan.layer_idx for plan in self._pending_plan.selected_layers}
+        if not set(committed_layers).issubset(selected):
+            raise RuntimeError("STAIR committed a layer that was not selected by the active plan.")
+        self._pending_plan = None
+
+    def abort_cycle(self, plan_id: str) -> None:
+        """Discard an uncommitted plan without changing committed history."""
+        if self._pending_plan is not None and self._pending_plan.plan_id == plan_id:
+            self._pending_plan = None

@@ -5,11 +5,13 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_ascend.distributed.eplb.policy import stair_constants as constants
 from vllm_ascend.distributed.eplb.policy.stair import (
     StairEplbPolicy,
     _build_incremental_candidate,
     compute_balance_score,
 )
+from vllm_ascend.distributed.eplb.policy.stair_types import StairRejectReason
 
 
 def _rebalance(
@@ -126,6 +128,54 @@ def test_stair_keeps_zero_load_and_balanced_placement():
 
     torch.testing.assert_close(zero_result, placement)
     torch.testing.assert_close(balanced_result, placement)
+
+
+def test_plan_rebalance_orders_and_budgets_changed_layers(monkeypatch):
+    load_window = torch.tensor(
+        [
+            [[1, 1, 100, 1], [1, 1, 80, 1]],
+            [[1, 1, 120, 1], [1, 1, 90, 1]],
+        ],
+        dtype=torch.int32,
+    )
+    placement = torch.tensor(
+        [
+            [0, 1, 2, 3, 0, 1],
+            [0, 1, 2, 3, 0, 1],
+        ],
+        dtype=torch.long,
+    )
+    monkeypatch.setattr(constants, "MAX_LAYERS_PER_CYCLE", 1)
+
+    plan = StairEplbPolicy().plan_rebalance(
+        load_window,
+        num_replicas=6,
+        num_groups=1,
+        num_nodes=1,
+        num_ranks=2,
+        old_global_expert_indices=placement,
+    )
+
+    assert len(plan.selected_layers) == 1
+    assert plan.budget_usage.selected_layers == 1
+    assert tuple(plan.selected_layers) == tuple(
+        sorted(plan.selected_layers, key=lambda item: (-item.utility, item.layer_idx))
+    )
+    assert any(item.reject_reason is StairRejectReason.CYCLE_BUDGET for item in plan.rejected_layers)
+    rejected_layer = next(
+        item.layer_idx for item in plan.rejected_layers if item.reject_reason is StairRejectReason.CYCLE_BUDGET
+    )
+    torch.testing.assert_close(plan.new_mapping[rejected_layer], placement[rejected_layer])
+
+
+def test_plan_digest_changes_with_tuning_version(monkeypatch):
+    load_window = torch.tensor([[[1, 1, 100, 1]]], dtype=torch.int32)
+    placement = torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.long)
+    first = StairEplbPolicy().plan_rebalance(load_window, 6, 1, 1, 2, placement)
+    monkeypatch.setattr(constants, "STAIR_TUNING_VERSION", constants.STAIR_TUNING_VERSION + 1)
+    second = StairEplbPolicy().plan_rebalance(load_window, 6, 1, 1, 2, placement)
+
+    assert first.plan_id != second.plan_id
 
 
 def test_stair_uses_temporal_hysteresis_and_absolute_thresholds():

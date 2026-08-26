@@ -9,6 +9,7 @@
 # here and covered by contract tests so this copy cannot silently drift.
 
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,6 +17,13 @@ from vllm.distributed.eplb.eplb_utils import CpuGpuEvent
 from vllm.distributed.eplb.rebalance_execute import AsyncEplbLayerResult, transfer_layer
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.logger import logger
+
+from vllm_ascend.distributed.eplb.policy import stair_constants as constants
+from vllm_ascend.distributed.eplb.policy.stair_types import (
+    StairExecutionMetrics,
+    StairRebalancePlan,
+    StairSourceMode,
+)
 
 if TYPE_CHECKING:
     from vllm.distributed.eplb.eplb_state import EplbModelState
@@ -54,16 +62,16 @@ def start_async_worker(
     return thread
 
 
-def _run_rebalance_experts(
+def _run_rebalance_plan(
     model_state: "EplbModelState",
     physical_to_logical_map_cpu: torch.Tensor,
     cuda_stream: torch.cuda.Stream,
-) -> torch.Tensor:
+) -> StairRebalancePlan:
     assert model_state.eplb_stats is not None
     stats = model_state.eplb_stats
     with torch.cuda.stream(cuda_stream):
         load_window_cpu = stats.global_expert_load_window.cpu()
-    new_mapping = model_state._ascend_eplb_policy.rebalance_experts(
+    plan = model_state._ascend_eplb_policy.plan_rebalance(
         load_window_cpu,
         stats.num_replicas,
         stats.num_groups,
@@ -71,12 +79,43 @@ def _run_rebalance_experts(
         stats.num_gpus,
         physical_to_logical_map_cpu,
     )
-    if new_mapping.device != torch.device("cpu"):
+    if plan.new_mapping.device != torch.device("cpu"):
         raise RuntimeError(
             "Statistical Temporal-Aware Incremental Rebalancing (STAIR) must return a CPU physical-to-logical map."
         )
     model_state._ascend_eplb_policy_load = load_window_cpu
-    return new_mapping
+    model_state._ascend_eplb_active_plan = plan
+    return plan
+
+
+def _run_rebalance_experts(
+    model_state: "EplbModelState",
+    physical_to_logical_map_cpu: torch.Tensor,
+    cuda_stream: torch.cuda.Stream,
+) -> torch.Tensor:
+    """Compatibility wrapper for focused tests and older local callers."""
+    return _run_rebalance_plan(model_state, physical_to_logical_map_cpu, cuda_stream).new_mapping
+
+
+def _validate_plan_budget(plan: StairRebalancePlan) -> None:
+    usage = plan.budget_usage
+    if (
+        usage.selected_layers > constants.MAX_LAYERS_PER_CYCLE
+        or usage.expert_transfers > constants.MAX_EXPERT_TRANSFERS_PER_CYCLE
+        or usage.total_bytes > constants.MAX_TRANSFER_BYTES_PER_CYCLE
+        or usage.cross_node_bytes > constants.MAX_CROSS_NODE_BYTES_PER_CYCLE
+    ):
+        raise RuntimeError(f"STAIR plan {plan.plan_id} exceeds an execution hard budget.")
+
+
+def _validate_plan_collectively(plan: StairRebalancePlan, cpu_group) -> None:
+    """Ensure every EPLB rank will execute the same ordered plan."""
+    if cpu_group.size() <= 1:
+        return
+    plan_ids: list[str | None] = [None] * cpu_group.size()
+    torch.distributed.all_gather_object(plan_ids, plan.plan_id, group=cpu_group)
+    if any(plan_id != plan.plan_id for plan_id in plan_ids):
+        raise RuntimeError(f"STAIR plan digest mismatch across EPLB ranks: {plan_ids}")
 
 
 def _publish_result(
@@ -85,6 +124,7 @@ def _publish_result(
     new_mapping: torch.Tensor,
     transfer_metadata,
     cuda_stream: torch.cuda.Stream,
+    execution_metrics: StairExecutionMetrics | None = None,
 ) -> None:
     consumed_event = CpuGpuEvent()
     model_state.pending_result = AsyncEplbLayerResult(
@@ -93,8 +133,10 @@ def _publish_result(
         transfer_metadata=transfer_metadata,  # type: ignore[arg-type]
         consumed_event=consumed_event,
     )
+    model_state._ascend_eplb_pending_execution_metrics = execution_metrics
     consumed_event.wait(stream=cuda_stream)
     assert model_state.pending_result is None
+    model_state._ascend_eplb_pending_execution_metrics = None
 
 
 def transfer_run_periodically(
@@ -113,16 +155,18 @@ def transfer_run_periodically(
 
         for model_state in state.model_states.values():
             model_state._ascend_eplb_committed_layers = 0
+            model_state._ascend_eplb_committed_layer_ids = []
             model_state.communicator.set_stream(cuda_stream)
             with torch.cuda.stream(cuda_stream):
                 old_mapping = model_state.physical_to_logical_map.cpu()
-            new_mapping = _run_rebalance_experts(model_state, old_mapping, cuda_stream)
-            changed_layers: list[int] = (
-                torch.any(new_mapping != old_mapping, dim=1).nonzero(as_tuple=False).flatten().tolist()
-            )
+            plan = _run_rebalance_plan(model_state, old_mapping, cuda_stream)
+            _validate_plan_budget(plan)
+            _validate_plan_collectively(plan, eplb_cpu_group)
+            new_mapping = plan.new_mapping
             cycle_completed = True
 
-            for layer_idx in changed_layers:
+            for layer_plan in plan.selected_layers:
+                layer_idx = layer_plan.layer_idx
                 flag = torch.tensor([int(model_state.rebalanced)], dtype=torch.int32, device="cpu")
                 torch.distributed.all_reduce(flag, group=eplb_cpu_group)
                 flag_sum = int(flag.item())
@@ -136,8 +180,10 @@ def transfer_run_periodically(
                     )
                     model_state.rebalanced = False
                     cycle_completed = False
+                    model_state._ascend_eplb_policy.abort_cycle(plan.plan_id)
                     break
 
+                transfer_start = time.perf_counter()
                 transfer_metadata = transfer_layer(
                     old_layer_indices=old_mapping[layer_idx],
                     new_layer_indices=new_mapping[layer_idx],
@@ -150,12 +196,21 @@ def transfer_run_periodically(
                     layer_idx=layer_idx,
                 )
                 cuda_stream.synchronize()
+                execution_metrics = StairExecutionMetrics(
+                    plan_id=plan.plan_id,
+                    layer_idx=layer_idx,
+                    recv_count=int(transfer_metadata.recv_count),
+                    actual_remote_bytes=layer_plan.transfer_cost.total_bytes,
+                    transfer_elapsed_ms=(time.perf_counter() - transfer_start) * 1000,
+                    source_mode=StairSourceMode.EXECUTOR_DEFAULT,
+                )
                 _publish_result(
                     model_state,
                     layer_idx,
                     new_mapping[layer_idx],
                     transfer_metadata,
                     cuda_stream,
+                    execution_metrics,
                 )
 
             if cycle_completed and model_state.rebalanced:
@@ -167,6 +222,9 @@ def transfer_run_periodically(
                     cuda_stream,
                 )
             if cycle_completed:
+                committed_layer_ids = tuple(getattr(model_state, "_ascend_eplb_committed_layer_ids", ()))
+                model_state._ascend_eplb_policy.finish_cycle(plan.plan_id, committed_layer_ids)
+                model_state._ascend_eplb_active_plan = None
                 committed_layers = getattr(model_state, "_ascend_eplb_committed_layers", 0)
                 if ep_rank == 0 and committed_layers > 0:
                     logger.info(

@@ -99,7 +99,8 @@ def test_stair_uses_full_time_series_for_temporal_acceptance(monkeypatch):
     candidate = np.array([[0, 2, 1, 3], [0, 2, 1, 3]], dtype=np.int64)
     observed_load = None
 
-    def fake_candidate(logical_load, current_placement, num_ranks):
+    def fake_candidate(logical_load, current_placement, num_ranks, topology=None, deadline=None):
+        del topology, deadline
         nonlocal observed_load
         observed_load = logical_load.copy()
         return candidate.copy()
@@ -115,6 +116,28 @@ def test_stair_uses_full_time_series_for_temporal_acceptance(monkeypatch):
     np.testing.assert_array_equal(observed_load, expected_risk_load)
     torch.testing.assert_close(result[0], torch.from_numpy(candidate[0]))
     torch.testing.assert_close(result[1], placement[1])
+
+
+def test_stair_forwards_planner_deadline_to_greedy_candidate(monkeypatch):
+    observed_deadline = None
+
+    def fake_candidate(logical_load, current_placement, num_ranks, topology=None, deadline=None):
+        del logical_load, num_ranks, topology
+        nonlocal observed_deadline
+        observed_deadline = deadline
+        return current_placement.copy()
+
+    monkeypatch.setattr(
+        "vllm_ascend.distributed.eplb.policy.stair._build_incremental_candidate",
+        fake_candidate,
+    )
+    _rebalance(
+        StairEplbPolicy(),
+        torch.ones((2, 1, 4), dtype=torch.float64),
+        torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+    )
+
+    assert observed_deadline is not None
 
 
 def test_stair_keeps_zero_load_and_balanced_placement():

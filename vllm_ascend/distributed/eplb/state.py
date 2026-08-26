@@ -11,15 +11,57 @@ import torch
 from torch.distributed import all_reduce
 from vllm.distributed import get_ep_group
 from vllm.distributed.eplb import eplb_state as _eplb_state
+from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import logger
 
 from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
+from vllm_ascend.distributed.eplb.policy.stair_types import StairTopology
 from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
 
 
 def _upstream_from_mapping_accepts_valid_expert_count() -> bool:
     """Return whether the selected vLLM uses the release mapping contract."""
     return "num_valid_physical_experts" in inspect.signature(_eplb_state.EplbState.from_mapping).parameters
+
+
+def _discover_stair_topology(rank_mapping: dict[int, int] | None = None) -> StairTopology:
+    """Collect and validate the actual EPLB rank-to-node relation."""
+    coordinator = get_ep_group()
+    num_ranks = coordinator.world_size
+    if rank_mapping is not None:
+        active_ranks = sorted((new_rank, old_rank) for old_rank, new_rank in rank_mapping.items() if new_rank >= 0)
+        if [new_rank for new_rank, _ in active_ranks] != list(range(num_ranks)):
+            raise ValueError("STAIR rank mapping must describe every active EPLB rank exactly once.")
+    if num_ranks == 1:
+        return StairTopology.from_rank_to_node((0,))
+
+    same_node = []
+    for source_rank in range(num_ranks):
+        flags = tuple(bool(value) for value in in_the_same_node_as(coordinator.cpu_group, source_rank))
+        if len(flags) != num_ranks:
+            raise RuntimeError("STAIR topology discovery returned an invalid rank count.")
+        same_node.append(flags)
+    for rank in range(num_ranks):
+        if not same_node[rank][rank]:
+            raise RuntimeError("STAIR topology relation must be reflexive.")
+        for peer in range(num_ranks):
+            if same_node[rank][peer] != same_node[peer][rank]:
+                raise RuntimeError("STAIR topology relation must be symmetric.")
+            if same_node[rank][peer]:
+                for other in range(num_ranks):
+                    if same_node[peer][other] and not same_node[rank][other]:
+                        raise RuntimeError("STAIR topology relation must be transitive.")
+
+    node_by_rank = [-1] * num_ranks
+    next_node_id = 0
+    for rank in range(num_ranks):
+        if node_by_rank[rank] >= 0:
+            continue
+        for peer in range(num_ranks):
+            if same_node[rank][peer]:
+                node_by_rank[peer] = next_node_id
+        next_node_id += 1
+    return StairTopology.from_rank_to_node(tuple(node_by_rank))
 
 
 class AscendEplbLayerState(_eplb_state.EplbLayerState):
@@ -93,7 +135,21 @@ class AscendEplbState(_eplb_state.EplbState):
         # Upstream's profile path still calls the state-level policy. Runtime
         # hysteresis lives on each model state so main and draft models cannot
         # overwrite one another's layer history.
-        self._profile_policy = StairEplbPolicy()
+        self._stair_topology: StairTopology | None
+        try:
+            self._stair_topology = _discover_stair_topology()
+        except Exception as error:
+            try:
+                num_ranks = get_ep_group().world_size
+            except Exception:
+                num_ranks = 0
+            self._stair_topology = StairTopology.flat_fallback(num_ranks) if num_ranks else None
+            logger.warning_once(
+                "STAIR could not discover a reliable node topology and will price all remote transfers "
+                "conservatively: %s",
+                error,
+            )
+        self._profile_policy = StairEplbPolicy(self._stair_topology)
         self.policy = self._profile_policy
         self._has_fresh_recorded_load = False
         self._preserve_expert_load_time_series = False
@@ -105,7 +161,7 @@ class AscendEplbState(_eplb_state.EplbState):
         self.is_async = True
         model_state = self.model_states[model_config.compute_hash()]
         model_state_any: Any = model_state
-        model_state_any._ascend_eplb_policy = StairEplbPolicy()
+        model_state_any._ascend_eplb_policy = StairEplbPolicy(getattr(self, "_stair_topology", None))
         model_state_any._ascend_eplb_state = self
         model_state_any._ascend_eplb_active_plan = None
         model_state_any._ascend_eplb_policy_load = None
@@ -121,9 +177,15 @@ class AscendEplbState(_eplb_state.EplbState):
         rank_mapping: dict[int, int] | None = None,
         is_profile: bool = False,
     ) -> None:
-        del rank_mapping
         if self.async_worker is not None:
             return
+        if rank_mapping is not None:
+            topology = _discover_stair_topology(rank_mapping)
+            if topology != self._stair_topology:
+                self._stair_topology = topology
+                self._profile_policy.configure_runtime(None, topology=topology)
+                for model_state in self.model_states.values():
+                    model_state._ascend_eplb_policy.configure_runtime(None, topology=topology)
         from vllm_ascend.distributed.eplb.async_worker import start_async_worker
 
         self.async_worker = start_async_worker(self, is_profile=is_profile)

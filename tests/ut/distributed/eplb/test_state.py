@@ -13,6 +13,7 @@ from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
 from vllm_ascend.distributed.eplb.state import (
     AscendEplbLayerState,
     AscendEplbState,
+    _discover_stair_topology,
 )
 
 
@@ -169,6 +170,31 @@ def test_init_sets_cuda_device_index_for_npu(monkeypatch):
     state = AscendEplbState(parallel_config, torch.device("cpu"))
 
     assert state.cuda_device_index == 5
+
+
+def test_discover_stair_topology_uses_actual_rank_relation(monkeypatch):
+    same_node = (
+        (True, False, True, False),
+        (False, True, False, True),
+        (True, False, True, False),
+        (False, True, False, True),
+    )
+    cpu_group = object()
+    monkeypatch.setattr(
+        eplb_state,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=4, cpu_group=cpu_group),
+    )
+    monkeypatch.setattr(
+        eplb_state,
+        "in_the_same_node_as",
+        lambda group, source_rank: same_node[source_rank],
+    )
+
+    topology = _discover_stair_topology()
+
+    assert topology.rank_to_node == (0, 1, 0, 1)
+    assert topology.equivalent_rank_groups == ((0, 2), (1, 3))
 
 
 def test_temporal_policy_rebuilds_window_when_upstream_aggregates_load(monkeypatch):

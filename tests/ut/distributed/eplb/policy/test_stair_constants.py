@@ -30,3 +30,10 @@ def test_validate_stair_constants_rejects_unbounded_search(monkeypatch):
 
     with pytest.raises(ValueError, match="safe internal bound"):
         constants.validate_stair_constants()
+
+
+def test_validate_stair_constants_rejects_rank_pair_limit_above_cycle_budget(monkeypatch):
+    monkeypatch.setattr(constants, "MAX_TRANSFERS_PER_RANK_PAIR", constants.MAX_EXPERT_TRANSFERS_PER_CYCLE + 1)
+
+    with pytest.raises(ValueError, match="rank-pair transfer limit"):
+        constants.validate_stair_constants()

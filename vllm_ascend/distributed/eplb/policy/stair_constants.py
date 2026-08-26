@@ -7,7 +7,7 @@ These values are intentionally not part of the user configuration surface.
 Developers should update them together with focused tests and benchmarks.
 """
 
-STAIR_TUNING_VERSION = 1
+STAIR_TUNING_VERSION = 3
 
 # Cycle budgets.
 MAX_LAYERS_PER_CYCLE = 8
@@ -39,7 +39,7 @@ SMALL_WORLD_UPDATE_THRESHOLD_VALUE = 0.9
 # Topology and transfer costs.
 INTRA_NODE_COST_MULTIPLIER = 1.0
 CROSS_NODE_COST_MULTIPLIER = 4.0
-MAX_TRANSFERS_PER_RANK_PAIR = 1
+MAX_TRANSFERS_PER_RANK_PAIR = 16
 MAX_SWAP_ATTEMPTS = 100
 
 # Bounded MiniFlashTree search. Keep disabled until benchmark evidence is
@@ -89,6 +89,8 @@ def validate_stair_constants() -> None:
         raise ValueError("STAIR RISK_Z must be non-negative.")
     if CROSS_NODE_COST_MULTIPLIER < INTRA_NODE_COST_MULTIPLIER or INTRA_NODE_COST_MULTIPLIER < 1:
         raise ValueError("STAIR topology cost multipliers must satisfy cross-node >= intra-node >= 1.")
+    if MAX_TRANSFERS_PER_RANK_PAIR > MAX_EXPERT_TRANSFERS_PER_CYCLE:
+        raise ValueError("STAIR rank-pair transfer limit cannot exceed the cycle transfer budget.")
     if SEARCH_DEPTH > _MAX_SAFE_SEARCH_DEPTH:
         raise ValueError("STAIR SEARCH_DEPTH exceeds the safe internal bound.")
     if SEARCH_WIDTH > _MAX_SAFE_SEARCH_WIDTH:

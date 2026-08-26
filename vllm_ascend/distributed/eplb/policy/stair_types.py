@@ -3,6 +3,7 @@
 
 """Pure data types shared by the STAIR planner and executor."""
 
+import hashlib
 from dataclasses import dataclass
 from enum import Enum
 
@@ -33,6 +34,85 @@ class StairCandidateKind(str, Enum):
 class StairSourceMode(str, Enum):
     PLUGIN_ORDERED = "plugin_ordered"
     EXECUTOR_DEFAULT = "executor_default"
+
+
+@dataclass(frozen=True)
+class StairTopology:
+    """Stable EPLB rank-to-node topology used by the CPU planner."""
+
+    rank_to_node: tuple[int, ...]
+    equivalent_rank_groups: tuple[tuple[int, ...], ...]
+    num_nodes: int
+    is_flat_fallback: bool
+    topology_hash: str
+
+    def __post_init__(self) -> None:
+        if not self.rank_to_node or self.num_nodes <= 0:
+            raise ValueError("STAIR topology must contain at least one rank and node.")
+        if len(set(self.rank_to_node)) != self.num_nodes:
+            raise ValueError("STAIR topology node count does not match rank_to_node.")
+        grouped_ranks = tuple(rank for group in self.equivalent_rank_groups for rank in group)
+        if sorted(grouped_ranks) != list(range(len(self.rank_to_node))):
+            raise ValueError("STAIR equivalent rank groups must cover every rank exactly once.")
+
+    @classmethod
+    def from_rank_to_node(
+        cls,
+        rank_to_node: tuple[int, ...],
+        *,
+        is_flat_fallback: bool = False,
+    ) -> "StairTopology":
+        """Build deterministic node groups and a stable topology digest."""
+        if not rank_to_node:
+            raise ValueError("STAIR rank_to_node cannot be empty.")
+        normalized_nodes: dict[int, int] = {}
+        normalized_mapping = tuple(
+            normalized_nodes.setdefault(node_id, len(normalized_nodes)) for node_id in rank_to_node
+        )
+        if is_flat_fallback:
+            groups: tuple[tuple[int, ...], ...] = tuple((rank,) for rank in range(len(normalized_mapping)))
+        else:
+            groups = tuple(
+                tuple(rank for rank, rank_node in enumerate(normalized_mapping) if rank_node == node_id)
+                for node_id in range(len(normalized_nodes))
+            )
+        payload = f"{normalized_mapping}:{groups}:{int(is_flat_fallback)}"
+        topology_hash = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        return cls(
+            rank_to_node=normalized_mapping,
+            equivalent_rank_groups=groups,
+            num_nodes=len(normalized_nodes),
+            is_flat_fallback=is_flat_fallback,
+            topology_hash=topology_hash,
+        )
+
+    @classmethod
+    def contiguous(cls, num_ranks: int, num_nodes: int) -> "StairTopology":
+        """Build the deterministic fallback used by the public policy contract."""
+        if num_ranks <= 0 or num_nodes <= 0 or num_ranks % num_nodes != 0:
+            raise ValueError("STAIR requires num_ranks to be divisible by num_nodes.")
+        ranks_per_node = num_ranks // num_nodes
+        return cls.from_rank_to_node(tuple(rank // ranks_per_node for rank in range(num_ranks)))
+
+    @classmethod
+    def flat_fallback(cls, num_ranks: int) -> "StairTopology":
+        """Treat every remote rank as unknown and conservatively cross-node."""
+        if num_ranks <= 0:
+            raise ValueError("STAIR flat fallback requires at least one rank.")
+        return cls.from_rank_to_node(tuple(range(num_ranks)), is_flat_fallback=True)
+
+    def same_node(self, src_rank: int, dst_rank: int) -> bool:
+        if src_rank == dst_rank:
+            return True
+        if self.is_flat_fallback:
+            return False
+        return self.rank_to_node[src_rank] == self.rank_to_node[dst_rank]
+
+    def equivalent_group(self, rank: int) -> tuple[int, ...]:
+        for group in self.equivalent_rank_groups:
+            if rank in group:
+                return group
+        raise IndexError(f"Rank {rank} is outside the STAIR topology.")
 
 
 @dataclass(frozen=True)

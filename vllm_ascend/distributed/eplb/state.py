@@ -16,6 +16,7 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
 from vllm_ascend.distributed.eplb.policy.stair_types import StairTopology
+from vllm_ascend.distributed.eplb.transfer_plan import compute_layer_expert_bytes
 from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
 
 
@@ -62,6 +63,14 @@ def _discover_stair_topology(rank_mapping: dict[int, int] | None = None) -> Stai
                 node_by_rank[peer] = next_node_id
         next_node_id += 1
     return StairTopology.from_rank_to_node(tuple(node_by_rank))
+
+
+def _compute_model_layer_expert_bytes(model: Any) -> tuple[int, ...] | None:
+    """Compute transfer bytes when the model exposes real expert weight views."""
+    expert_weights = getattr(model, "expert_weights", None)
+    if expert_weights is None:
+        return None
+    return compute_layer_expert_bytes(expert_weights)
 
 
 class AscendEplbLayerState(_eplb_state.EplbLayerState):
@@ -161,7 +170,12 @@ class AscendEplbState(_eplb_state.EplbState):
         self.is_async = True
         model_state = self.model_states[model_config.compute_hash()]
         model_state_any: Any = model_state
-        model_state_any._ascend_eplb_policy = StairEplbPolicy(getattr(self, "_stair_topology", None))
+        layer_expert_bytes = _compute_model_layer_expert_bytes(model)
+        model_state_any._ascend_eplb_layer_expert_bytes = layer_expert_bytes
+        model_state_any._ascend_eplb_policy = StairEplbPolicy(
+            getattr(self, "_stair_topology", None),
+            layer_expert_bytes,
+        )
         model_state_any._ascend_eplb_state = self
         model_state_any._ascend_eplb_active_plan = None
         model_state_any._ascend_eplb_policy_load = None
@@ -185,7 +199,10 @@ class AscendEplbState(_eplb_state.EplbState):
                 self._stair_topology = topology
                 self._profile_policy.configure_runtime(None, topology=topology)
                 for model_state in self.model_states.values():
-                    model_state._ascend_eplb_policy.configure_runtime(None, topology=topology)
+                    model_state._ascend_eplb_policy.configure_runtime(
+                        model_state._ascend_eplb_layer_expert_bytes,
+                        topology=topology,
+                    )
         from vllm_ascend.distributed.eplb.async_worker import start_async_worker
 
         self.async_worker = start_async_worker(self, is_profile=is_profile)

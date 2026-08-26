@@ -32,8 +32,8 @@ from vllm_ascend.distributed.eplb.policy.stair_types import (
     StairRebalancePlan,
     StairRejectReason,
     StairTopology,
-    StairTransferCost,
 )
+from vllm_ascend.distributed.eplb.transfer_plan import build_transfer_plan
 
 
 def _replica_counts(placement: np.ndarray, num_experts: int) -> np.ndarray:
@@ -203,21 +203,6 @@ class StairEplbPolicy:
             raise ValueError("STAIR layer expert byte sizes must match the number of MoE layers.")
         return expert_load, current, slots_per_rank
 
-    def _estimate_transfer_cost(
-        self,
-        layer_idx: int,
-        current: np.ndarray,
-        candidate: np.ndarray,
-    ) -> StairTransferCost:
-        changed = int(np.count_nonzero(current != candidate))
-        expert_bytes = 0 if self._layer_expert_bytes is None else self._layer_expert_bytes[layer_idx]
-        total_bytes = changed * expert_bytes
-        return StairTransferCost(
-            expert_transfers=changed,
-            total_bytes=total_bytes,
-            weighted_bytes=float(total_bytes),
-        )
-
     def _build_layer_plan(
         self,
         layer_idx: int,
@@ -225,12 +210,25 @@ class StairEplbPolicy:
         current: np.ndarray,
         candidate: np.ndarray,
         num_ranks: int,
+        topology: StairTopology | None = None,
     ) -> StairLayerPlan:
+        resolved_topology = topology or StairTopology.contiguous(num_ranks, 1)
         current_score = compute_balance_metrics(layer_load, current)
         candidate_score = compute_balance_metrics(layer_load, candidate)
-        transfer_cost = self._estimate_transfer_cost(layer_idx, current, candidate)
+        expert_bytes = 0 if self._layer_expert_bytes is None else self._layer_expert_bytes[layer_idx]
+        transfer_plan = build_transfer_plan(
+            current,
+            candidate,
+            resolved_topology,
+            expert_bytes,
+        )
+        transfer_cost = transfer_plan.budget_cost
         gain = compute_balance_gain(current_score, candidate_score)
-        utility_denominator = max(transfer_cost.weighted_bytes, float(transfer_cost.expert_transfers), 1.0)
+        utility_denominator = max(
+            transfer_plan.cost.weighted_bytes,
+            float(transfer_plan.cost.expert_transfers),
+            1.0,
+        )
         utility = gain / utility_denominator
         accepted = True
         reject_reason = StairRejectReason.NONE
@@ -243,6 +241,9 @@ class StairEplbPolicy:
         elif gain <= constants.MIN_BALANCE_GAIN:
             accepted = False
             reject_reason = StairRejectReason.NO_BALANCE_GAIN
+        elif transfer_cost.max_rank_pair_transfers > constants.MAX_TRANSFERS_PER_RANK_PAIR:
+            accepted = False
+            reject_reason = StairRejectReason.INVALID_TOPOLOGY
         return StairLayerPlan(
             layer_idx=layer_idx,
             placement=candidate.copy(),
@@ -251,7 +252,9 @@ class StairEplbPolicy:
             balance_gain=gain,
             utility=utility,
             transfer_cost=transfer_cost,
+            transfer_plan=transfer_plan,
             candidate_kind=StairCandidateKind.GREEDY,
+            source_mode=transfer_plan.source_mode,
             accepted=accepted,
             reject_reason=reject_reason,
         )
@@ -277,6 +280,9 @@ class StairEplbPolicy:
         for layer_plan in selected_layers:
             digest.update(layer_plan.layer_idx.to_bytes(4, byteorder="little", signed=False))
             digest.update(layer_plan.placement.tobytes())
+            if layer_plan.transfer_plan is not None:
+                digest.update(layer_plan.transfer_plan.source_rank_by_position.tobytes())
+                digest.update(layer_plan.transfer_plan.source_mode.value.encode())
         return digest.hexdigest()[:16]
 
     def plan_rebalance(
@@ -338,6 +344,7 @@ class StairEplbPolicy:
                 current_by_rank[layer_id],
                 candidate_by_rank[layer_id],
                 num_ranks,
+                topology,
             )
             self.load_stats.note_candidate(int(layer_id), layer_plan.accepted)
             (proposed if layer_plan.accepted else rejected).append(layer_plan)

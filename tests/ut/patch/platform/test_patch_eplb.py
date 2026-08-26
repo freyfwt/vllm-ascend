@@ -5,10 +5,13 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 from vllm.config import EPLBConfig, ParallelConfig, VllmConfig
 from vllm.config import parallel as parallel_module
 from vllm.platforms import current_platform
 
+from vllm_ascend.distributed.eplb.policy.stair_types import StairSourceMode, StairTopology
+from vllm_ascend.distributed.eplb.transfer_plan import build_transfer_plan, source_ordering_context
 from vllm_ascend.patch.platform import patch_eplb
 
 
@@ -210,3 +213,32 @@ def test_async_workspace_wrapper_acknowledges_no_transfer_cycle(monkeypatch):
     consumed_event.record.assert_called_once_with()
     assert original_move_called is False
     refresh.assert_not_called()
+
+
+def test_source_ordering_wrapper_reorders_without_changing_rank_sets(monkeypatch):
+    current = np.array([[0, 1], [0, 2], [1, 3], [2, 3]], dtype=np.int64)
+    candidate = np.array([[0, 1], [0, 2], [0, 3], [0, 3]], dtype=np.int64)
+    topology = StairTopology.from_rank_to_node((0, 1, 1, 0))
+    monkeypatch.setattr(
+        "vllm_ascend.distributed.eplb.transfer_plan._SOURCE_ORDERING_PATCH_ENABLED",
+        True,
+    )
+    plan = build_transfer_plan(current, candidate, topology, expert_bytes=1)
+
+    def original_helper(expert_ids, num_local_experts, old_indices, new_indices):
+        del expert_ids, num_local_experts, old_indices, new_indices
+        return {0: [0, 1]}, {0: [2, 3]}
+
+    wrapped = patch_eplb._wrap_get_ep_ranks_with_experts_batch(original_helper)
+    with source_ordering_context(plan):
+        send_map, recv_map = wrapped(
+            np.array([0]),
+            2,
+            current.reshape(-1),
+            candidate.reshape(-1),
+        )
+
+    assert set(send_map[0]) == {0, 1}
+    assert set(recv_map[0]) == {2, 3}
+    assert recv_map[0] == list(plan.recv_order(0))
+    assert plan.source_mode is StairSourceMode.PLUGIN_ORDERED

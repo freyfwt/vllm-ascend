@@ -9,10 +9,16 @@ from inspect import signature
 from vllm.config import parallel as _parallel_config
 from vllm.distributed.eplb import eplb_communicator as _eplb_communicator
 from vllm.distributed.eplb import eplb_state as _eplb_state
+from vllm.distributed.eplb import rebalance_execute as _eplb_rebalance_execute
+from vllm.logger import logger
 
 from vllm_ascend.distributed.eplb.async_worker import NO_TRANSFER_CYCLE_COMPLETE
 from vllm_ascend.distributed.eplb.communicator import AscendGlooEplbCommunicator
 from vllm_ascend.distributed.eplb.state import refresh_model_routing_tables
+from vllm_ascend.distributed.eplb.transfer_plan import (
+    get_active_source_ordering,
+    set_source_ordering_patch_enabled,
+)
 
 _PATCH_MARKER = "_vllm_ascend_eplb_patch"
 
@@ -154,6 +160,58 @@ def _patch_async_move_to_workspace() -> None:
         _eplb_state._move_to_workspace = _wrap_move_to_workspace(original_move)
 
 
+def _wrap_get_ep_ranks_with_experts_batch(original_helper):
+    helper_signature = signature(original_helper)
+    required_parameters = {
+        "expert_ids",
+        "num_local_experts",
+        "old_indices",
+        "new_indices",
+    }
+    if not required_parameters.issubset(helper_signature.parameters):
+        raise RuntimeError("Unsupported vLLM EPLB contract: source-rank helper signature changed.")
+
+    @wraps(original_helper)
+    def _get_ep_ranks_with_experts_batch(*args, **kwargs):
+        send_map, recv_map = original_helper(*args, **kwargs)
+        ordering = get_active_source_ordering()
+        if ordering is None:
+            return send_map, recv_map
+        ordered_send_map = dict(send_map)
+        ordered_recv_map = dict(recv_map)
+        for expert_id in send_map:
+            planned_send = ordering.send_order(expert_id)
+            planned_recv = ordering.recv_order(expert_id)
+            if planned_send is None or planned_recv is None:
+                raise RuntimeError(f"STAIR source ordering omitted expert {expert_id}.")
+            if len(planned_send) != len(set(planned_send)) or len(planned_recv) != len(set(planned_recv)):
+                raise RuntimeError(f"STAIR source ordering duplicated ranks for expert {expert_id}.")
+            if set(planned_send) != set(send_map[expert_id]) or set(planned_recv) != set(recv_map[expert_id]):
+                raise RuntimeError(f"STAIR source ordering drifted from executor sets for expert {expert_id}.")
+            ordered_send_map[expert_id] = list(planned_send)
+            ordered_recv_map[expert_id] = list(planned_recv)
+        return ordered_send_map, ordered_recv_map
+
+    setattr(_get_ep_ranks_with_experts_batch, _PATCH_MARKER, True)
+    return _get_ep_ranks_with_experts_batch
+
+
+def _patch_source_ordering() -> None:
+    original_helper = _eplb_rebalance_execute.get_ep_ranks_with_experts_batch
+    if getattr(original_helper, _PATCH_MARKER, False):
+        set_source_ordering_patch_enabled(True)
+        return
+    try:
+        wrapped_helper = _wrap_get_ep_ranks_with_experts_batch(original_helper)
+    except RuntimeError as error:
+        set_source_ordering_patch_enabled(False)
+        logger.warning_once("STAIR source ordering is disabled: %s", error)
+        return
+    _eplb_rebalance_execute.get_ep_ranks_with_experts_batch = wrapped_helper
+    set_source_ordering_patch_enabled(True)
+
+
 _patch_parallel_config()
 _patch_communicator_factory()
 _patch_async_move_to_workspace()
+_patch_source_ordering()

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.distributed.eplb.eplb_utils import CpuGpuEvent
-from vllm.distributed.eplb.rebalance_execute import AsyncEplbLayerResult, transfer_layer
+from vllm.distributed.eplb.rebalance_execute import AsyncEplbLayerResult
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.logger import logger
 
@@ -24,6 +24,7 @@ from vllm_ascend.distributed.eplb.policy.stair_types import (
     StairRebalancePlan,
     StairSourceMode,
 )
+from vllm_ascend.distributed.eplb.transfer_plan import transfer_layer_with_plan
 
 if TYPE_CHECKING:
     from vllm.distributed.eplb.eplb_state import EplbModelState
@@ -184,7 +185,8 @@ def transfer_run_periodically(
                     break
 
                 transfer_start = time.perf_counter()
-                transfer_metadata = transfer_layer(
+                transfer_metadata, source_mode = transfer_layer_with_plan(
+                    layer_plan=layer_plan,
                     old_layer_indices=old_mapping[layer_idx],
                     new_layer_indices=new_mapping[layer_idx],
                     expert_weights=model_state.model.expert_weights[layer_idx],
@@ -196,13 +198,20 @@ def transfer_run_periodically(
                     layer_idx=layer_idx,
                 )
                 cuda_stream.synchronize()
+                transfer_cost = layer_plan.transfer_cost
+                if layer_plan.transfer_plan is not None:
+                    transfer_cost = (
+                        layer_plan.transfer_plan.cost
+                        if source_mode is StairSourceMode.PLUGIN_ORDERED
+                        else layer_plan.transfer_plan.executor_default_cost
+                    )
                 execution_metrics = StairExecutionMetrics(
                     plan_id=plan.plan_id,
                     layer_idx=layer_idx,
                     recv_count=int(transfer_metadata.recv_count),
-                    actual_remote_bytes=layer_plan.transfer_cost.total_bytes,
+                    actual_remote_bytes=transfer_cost.total_bytes - transfer_cost.local_copy_bytes,
                     transfer_elapsed_ms=(time.perf_counter() - transfer_start) * 1000,
-                    source_mode=StairSourceMode.EXECUTOR_DEFAULT,
+                    source_mode=source_mode,
                 )
                 _publish_result(
                     model_state,

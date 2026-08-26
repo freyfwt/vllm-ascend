@@ -13,6 +13,7 @@ from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
 from vllm_ascend.distributed.eplb.state import (
     AscendEplbLayerState,
     AscendEplbState,
+    _compute_model_layer_expert_bytes,
     _discover_stair_topology,
 )
 
@@ -195,6 +196,19 @@ def test_discover_stair_topology_uses_actual_rank_relation(monkeypatch):
 
     assert topology.rank_to_node == (0, 1, 0, 1)
     assert topology.equivalent_rank_groups == ((0, 2), (1, 3))
+
+
+def test_model_layer_expert_bytes_include_quantization_views():
+    model = SimpleNamespace(
+        expert_weights=[
+            [
+                torch.empty((2, 3), dtype=torch.float32),
+                torch.empty((2, 5), dtype=torch.int8),
+            ]
+        ]
+    )
+
+    assert _compute_model_layer_expert_bytes(model) == (17,)
 
 
 def test_temporal_policy_rebuilds_window_when_upstream_aggregates_load(monkeypatch):

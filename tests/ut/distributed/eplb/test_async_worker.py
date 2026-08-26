@@ -15,6 +15,7 @@ from vllm_ascend.distributed.eplb.policy.stair_types import (
     StairBudgetUsage,
     StairLayerPlan,
     StairRebalancePlan,
+    StairSourceMode,
     StairTransferCost,
 )
 from vllm_ascend.distributed.eplb.state import AscendEplbState
@@ -108,7 +109,7 @@ def _run_one_cycle(monkeypatch, old_map, new_map, *, commit_results=True):
     pending_layers: list[int] = []
     completed_cycles: list[int] = []
     transfer_metadata = SimpleNamespace(recv_count=1)
-    transfer_layer = MagicMock(return_value=transfer_metadata)
+    transfer_layer = MagicMock(return_value=(transfer_metadata, StairSourceMode.EXECUTOR_DEFAULT))
     all_reduce = MagicMock()
     cycle_log = MagicMock()
 
@@ -154,7 +155,7 @@ def _run_one_cycle(monkeypatch, old_map, new_map, *, commit_results=True):
 
     monkeypatch.setattr(eplb_async_worker, "get_eplb_group", lambda: coordinator)
     monkeypatch.setattr(eplb_async_worker, "_run_rebalance_plan", lambda *args: _plan_from_mapping(old_map, new_map))
-    monkeypatch.setattr(eplb_async_worker, "transfer_layer", transfer_layer)
+    monkeypatch.setattr(eplb_async_worker, "transfer_layer_with_plan", transfer_layer)
     monkeypatch.setattr(eplb_async_worker, "CpuGpuEvent", _ConsumedEvent)
     monkeypatch.setattr(eplb_async_worker.torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(eplb_async_worker.torch.distributed, "all_reduce", all_reduce)

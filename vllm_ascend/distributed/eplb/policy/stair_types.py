@@ -36,6 +36,14 @@ class StairSourceMode(str, Enum):
     EXECUTOR_DEFAULT = "executor_default"
 
 
+class StairTransferKind(str, Enum):
+    UNCHANGED = "unchanged"
+    LOCAL_COPY = "local_copy"
+    INTRA_NODE = "intra_node"
+    CROSS_NODE = "cross_node"
+    REMOTE_UNKNOWN = "remote_unknown"
+
+
 @dataclass(frozen=True)
 class StairTopology:
     """Stable EPLB rank-to-node topology used by the CPU planner."""
@@ -129,6 +137,63 @@ class StairTransferCost:
     cross_node_bytes: int = 0
     weighted_bytes: float = 0.0
     max_rank_pair_transfers: int = 0
+    local_copy_count: int = 0
+    local_copy_bytes: int = 0
+    intra_node_count: int = 0
+    intra_node_bytes: int = 0
+    cross_node_count: int = 0
+    unknown_remote_count: int = 0
+    unknown_remote_bytes: int = 0
+    max_sender_transfers: int = 0
+
+    @classmethod
+    def conservative_max(
+        cls,
+        first: "StairTransferCost",
+        second: "StairTransferCost",
+    ) -> "StairTransferCost":
+        """Return the component-wise budget envelope of two executor modes."""
+        values = {
+            field_name: max(getattr(first, field_name), getattr(second, field_name))
+            for field_name in cls.__dataclass_fields__
+        }
+        return cls(**values)
+
+
+@dataclass(frozen=True)
+class StairTransfer:
+    expert_id: int
+    src_rank: int
+    dst_rank: int
+    dst_slot: int
+    kind: StairTransferKind
+    bytes: int
+
+
+@dataclass(frozen=True)
+class StairTransferPlan:
+    assignments: tuple[StairTransfer, ...]
+    source_rank_by_position: np.ndarray
+    send_order_by_expert: tuple[tuple[int, tuple[int, ...]], ...]
+    recv_order_by_expert: tuple[tuple[int, tuple[int, ...]], ...]
+    cost: StairTransferCost
+    executor_default_cost: StairTransferCost
+    source_mode: StairSourceMode
+
+    def __post_init__(self) -> None:
+        if self.source_rank_by_position.ndim != 1:
+            raise ValueError("STAIR source rank positions must be one-dimensional.")
+        self.source_rank_by_position.setflags(write=False)
+
+    def send_order(self, expert_id: int) -> tuple[int, ...] | None:
+        return dict(self.send_order_by_expert).get(expert_id)
+
+    def recv_order(self, expert_id: int) -> tuple[int, ...] | None:
+        return dict(self.recv_order_by_expert).get(expert_id)
+
+    @property
+    def budget_cost(self) -> StairTransferCost:
+        return StairTransferCost.conservative_max(self.cost, self.executor_default_cost)
 
 
 @dataclass(frozen=True)
@@ -140,6 +205,7 @@ class StairLayerPlan:
     balance_gain: float
     utility: float
     transfer_cost: StairTransferCost
+    transfer_plan: StairTransferPlan | None = None
     candidate_kind: StairCandidateKind = StairCandidateKind.GREEDY
     source_mode: StairSourceMode = StairSourceMode.EXECUTOR_DEFAULT
     accepted: bool = True

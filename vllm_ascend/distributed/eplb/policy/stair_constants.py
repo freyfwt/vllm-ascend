@@ -52,6 +52,7 @@ MAX_CANDIDATES_PER_LAYER = 16
 MAX_SEARCH_MS_PER_LAYER = 10.0
 MAX_PLANNER_MS = 100.0
 SEARCH_STAGNATION_CYCLES = 2
+SEARCH_MAX_GREEDY_GAIN_RATIO = 0.1
 
 _MAX_SAFE_SEARCH_DEPTH = 4
 _MAX_SAFE_SEARCH_WIDTH = 16
@@ -101,3 +102,5 @@ def validate_stair_constants() -> None:
         raise ValueError("STAIR planner deadlines are inconsistent or unbounded.")
     if ENABLE_SPARSE_COVARIANCE and COVARIANCE_TOP_K <= 0:
         raise ValueError("STAIR COVARIANCE_TOP_K must be positive when covariance is enabled.")
+    if not 0 <= SEARCH_MAX_GREEDY_GAIN_RATIO <= 1:
+        raise ValueError("STAIR SEARCH_MAX_GREEDY_GAIN_RATIO must be in [0, 1].")

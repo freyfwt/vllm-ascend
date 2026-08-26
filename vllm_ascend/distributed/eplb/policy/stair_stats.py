@@ -145,3 +145,20 @@ class StairLoadStats:
         if self.stagnation_cycles is None:
             return
         self.stagnation_cycles[layer_idx] = 0 if improved else self.stagnation_cycles[layer_idx] + 1
+
+    def should_search(
+        self,
+        layer_idx: int,
+        current_score: StairBalanceScore,
+        greedy_gain: float,
+    ) -> bool:
+        """Return whether a persistently difficult layer may use bounded search."""
+        if not constants.ENABLE_MINI_FLASH_TREE or self.stagnation_cycles is None:
+            return False
+        if self.stagnation_cycles[layer_idx] < constants.SEARCH_STAGNATION_CYCLES:
+            return False
+        excess_imbalance = max(current_score.p95_imbalance - 1.0, constants.BALANCE_EPSILON)
+        return (
+            current_score.p95_imbalance >= constants.IMBALANCE_THRESHOLD
+            and greedy_gain <= excess_imbalance * constants.SEARCH_MAX_GREEDY_GAIN_RATIO
+        )

@@ -10,6 +10,7 @@ from vllm_ascend.distributed.eplb.policy.stair_stats import (
     compute_balance_gain,
     compute_balance_metrics,
 )
+from vllm_ascend.distributed.eplb.policy.stair_types import StairBalanceScore
 
 
 def test_balance_metrics_preserve_mean_p95_and_max():
@@ -74,3 +75,16 @@ def test_load_stats_reset_on_shape_or_tuning_key_change():
     np.testing.assert_allclose(stats.ewma_mean, [[5, 5]])
     np.testing.assert_array_equal(stats.stagnation_cycles, [0])
     assert stats.sample_count == 1
+
+
+def test_load_stats_search_gate_requires_enabled_stagnation(monkeypatch):
+    stats = StairLoadStats()
+    stats.update(np.ones((2, 1, 2)), (1, 2, constants.STAIR_TUNING_VERSION))
+    assert stats.stagnation_cycles is not None
+    stats.stagnation_cycles[0] = constants.SEARCH_STAGNATION_CYCLES
+    current_score = StairBalanceScore(1.2, 1.3, 1.4)
+
+    assert not stats.should_search(0, current_score, greedy_gain=0.0)
+    monkeypatch.setattr(constants, "ENABLE_MINI_FLASH_TREE", True)
+    assert stats.should_search(0, current_score, greedy_gain=0.01)
+    assert not stats.should_search(0, current_score, greedy_gain=1.0)

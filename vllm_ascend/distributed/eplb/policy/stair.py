@@ -14,6 +14,9 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.eplb.policy import stair_constants as constants
 from vllm_ascend.distributed.eplb.policy.stair_search import (
+    MiniFlashTreeSearch,
+    SearchCandidate,
+    build_candidate_from_replica_counts,
     build_greedy_candidate,
     validate_layer_placement,
 )
@@ -87,6 +90,7 @@ class StairEplbPolicy:
         self._expected_layer_placements: dict[int, np.ndarray] = {}
         self._pending_plan: StairRebalancePlan | None = None
         self.execution_metrics: list[StairExecutionMetrics] = []
+        self._mini_search = MiniFlashTreeSearch()
 
     def configure_runtime(
         self,
@@ -211,6 +215,9 @@ class StairEplbPolicy:
         candidate: np.ndarray,
         num_ranks: int,
         topology: StairTopology | None = None,
+        candidate_kind: StairCandidateKind = StairCandidateKind.GREEDY,
+        search_candidates: int = 0,
+        search_elapsed_ms: float = 0.0,
     ) -> StairLayerPlan:
         resolved_topology = topology or StairTopology.contiguous(num_ranks, 1)
         current_score = compute_balance_metrics(layer_load, current)
@@ -244,6 +251,18 @@ class StairEplbPolicy:
         elif transfer_cost.max_rank_pair_transfers > constants.MAX_TRANSFERS_PER_RANK_PAIR:
             accepted = False
             reject_reason = StairRejectReason.INVALID_TOPOLOGY
+        elif (
+            transfer_cost.expert_transfers > constants.MAX_EXPERT_TRANSFERS_PER_CYCLE
+            or transfer_cost.total_bytes > constants.MAX_TRANSFER_BYTES_PER_CYCLE
+            or transfer_cost.cross_node_bytes > constants.MAX_CROSS_NODE_BYTES_PER_CYCLE
+        ):
+            accepted = False
+            reject_reason = StairRejectReason.LAYER_BUDGET
+        elif transfer_cost.weighted_bytes > 0:
+            gain_per_gib = gain / (transfer_cost.weighted_bytes / 1024**3)
+            if gain_per_gib < constants.MIN_GAIN_PER_GIB:
+                accepted = False
+                reject_reason = StairRejectReason.LOW_UTILITY
         return StairLayerPlan(
             layer_idx=layer_idx,
             placement=candidate.copy(),
@@ -253,10 +272,109 @@ class StairEplbPolicy:
             utility=utility,
             transfer_cost=transfer_cost,
             transfer_plan=transfer_plan,
-            candidate_kind=StairCandidateKind.GREEDY,
+            candidate_kind=candidate_kind,
             source_mode=transfer_plan.source_mode,
             accepted=accepted,
             reject_reason=reject_reason,
+            search_candidates=search_candidates,
+            search_elapsed_ms=search_elapsed_ms,
+        )
+
+    def _search_layer_plan(
+        self,
+        greedy_plan: StairLayerPlan,
+        layer_load: np.ndarray,
+        layer_risk_load: np.ndarray,
+        current: np.ndarray,
+        num_ranks: int,
+        topology: StairTopology,
+        cycle_deadline: float,
+    ) -> StairLayerPlan:
+        """Search a small replica-count neighborhood and reuse all hard gates."""
+        search_deadline = min(
+            cycle_deadline,
+            time.perf_counter() + constants.MAX_SEARCH_MS_PER_LAYER / 1000,
+        )
+        root_counts = _replica_counts(greedy_plan.placement, layer_risk_load.size)
+        root = SearchCandidate(
+            placement=greedy_plan.placement,
+            replica_counts=root_counts,
+            objective=greedy_plan.utility,
+            path_key=tuple(int(value) for value in root_counts),
+        )
+
+        def evaluate(counts: np.ndarray, deadline: float) -> SearchCandidate | None:
+            if time.perf_counter() >= deadline:
+                return None
+            placement = build_candidate_from_replica_counts(
+                layer_risk_load,
+                current,
+                topology,
+                counts,
+                deadline=deadline,
+            )
+            if time.perf_counter() >= deadline or np.array_equal(placement, current):
+                return None
+            current_score = compute_balance_metrics(layer_load, current)
+            candidate_score = compute_balance_metrics(layer_load, placement)
+            gain = compute_balance_gain(current_score, candidate_score)
+            if (
+                gain <= constants.MIN_BALANCE_GAIN
+                or candidate_score.p95_imbalance > current_score.p95_imbalance + constants.TAIL_REGRESSION_TOLERANCE
+            ):
+                return None
+            expert_bytes = 0 if self._layer_expert_bytes is None else self._layer_expert_bytes[greedy_plan.layer_idx]
+            transfer_plan = build_transfer_plan(
+                current,
+                placement,
+                topology,
+                expert_bytes,
+            )
+            if time.perf_counter() >= deadline:
+                return None
+            cost = transfer_plan.budget_cost
+            if (
+                cost.max_rank_pair_transfers > constants.MAX_TRANSFERS_PER_RANK_PAIR
+                or cost.expert_transfers > constants.MAX_EXPERT_TRANSFERS_PER_CYCLE
+                or cost.total_bytes > constants.MAX_TRANSFER_BYTES_PER_CYCLE
+                or cost.cross_node_bytes > constants.MAX_CROSS_NODE_BYTES_PER_CYCLE
+            ):
+                return None
+            objective = gain / max(
+                transfer_plan.cost.weighted_bytes,
+                float(transfer_plan.cost.expert_transfers),
+                1.0,
+            )
+            return SearchCandidate(
+                placement=placement,
+                replica_counts=counts.copy(),
+                objective=objective,
+                path_key=tuple(int(value) for value in counts),
+            )
+
+        result = self._mini_search.search(
+            root,
+            layer_risk_load,
+            num_ranks,
+            evaluate,
+            search_deadline,
+        )
+        if result.candidate.path_key == root.path_key:
+            return replace(
+                greedy_plan,
+                search_candidates=result.evaluated_candidates,
+                search_elapsed_ms=result.elapsed_ms,
+            )
+        return self._build_layer_plan(
+            greedy_plan.layer_idx,
+            layer_load,
+            current,
+            result.candidate.placement,
+            num_ranks,
+            topology,
+            StairCandidateKind.MINI_FLASH_TREE,
+            result.evaluated_candidates,
+            result.elapsed_ms,
         )
 
     @staticmethod
@@ -325,8 +443,9 @@ class StairEplbPolicy:
             self._pending_plan = plan
             return plan
 
+        risk_load = self.load_stats.risk_load()
         candidate = _build_incremental_candidate(
-            self.load_stats.risk_load(),
+            risk_load,
             current,
             num_ranks,
             topology,
@@ -334,19 +453,58 @@ class StairEplbPolicy:
         )
         candidate_by_rank = candidate.reshape(candidate.shape[0], num_ranks, slots_per_rank)
         candidate_layers = np.flatnonzero(np.any(candidate != current, axis=1))
+        candidate_layer_ids = set(int(layer_id) for layer_id in candidate_layers)
+        risk_scores = [
+            compute_balance_metrics(
+                risk_load[layer_id : layer_id + 1],
+                current_by_rank[layer_id],
+            ).p95_imbalance
+            for layer_id in range(current.shape[0])
+        ]
+        search_layer_ids = set(
+            sorted(
+                (layer_id for layer_id, score in enumerate(risk_scores) if score >= constants.IMBALANCE_THRESHOLD),
+                key=lambda layer_id: (-risk_scores[layer_id], layer_id),
+            )[: constants.MAX_SEARCH_LAYERS]
+        )
         proposed: list[StairLayerPlan] = []
         rejected: list[StairLayerPlan] = []
-        for layer_id in candidate_layers:
+        evaluated_layers = 0
+        for layer_id in range(current.shape[0]):
+            if risk_scores[layer_id] < constants.IMBALANCE_THRESHOLD:
+                self.load_stats.note_candidate(layer_id, True)
+                continue
             layer_load = expert_load[:, layer_id, :]
+            current_score = compute_balance_metrics(layer_load, current_by_rank[layer_id])
+            if layer_id not in candidate_layer_ids and not (
+                layer_id in search_layer_ids and self.load_stats.should_search(layer_id, current_score, 0.0)
+            ):
+                self.load_stats.note_candidate(layer_id, False)
+                continue
             layer_plan = self._build_layer_plan(
-                int(layer_id),
+                layer_id,
                 layer_load,
                 current_by_rank[layer_id],
                 candidate_by_rank[layer_id],
                 num_ranks,
                 topology,
             )
-            self.load_stats.note_candidate(int(layer_id), layer_plan.accepted)
+            if (
+                layer_id in search_layer_ids
+                and time.perf_counter() < cycle_deadline
+                and self.load_stats.should_search(layer_id, layer_plan.current_score, layer_plan.balance_gain)
+            ):
+                layer_plan = self._search_layer_plan(
+                    layer_plan,
+                    layer_load,
+                    risk_load[layer_id],
+                    current_by_rank[layer_id],
+                    num_ranks,
+                    topology,
+                    cycle_deadline,
+                )
+            evaluated_layers += 1
+            self.load_stats.note_candidate(layer_id, layer_plan.accepted)
             (proposed if layer_plan.accepted else rejected).append(layer_plan)
 
         proposed.sort(key=lambda plan: (-plan.utility, plan.layer_idx))
@@ -389,7 +547,7 @@ class StairEplbPolicy:
             "rejected [%s], rejected rank-pair transfers [%s].",
             plan.plan_id,
             plan.planner_elapsed_ms,
-            candidate_layers.size,
+            evaluated_layers,
             len(selected_layers),
             rejection_summary,
             pair_transfer_range,

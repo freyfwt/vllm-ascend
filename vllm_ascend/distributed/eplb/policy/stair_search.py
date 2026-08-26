@@ -4,6 +4,7 @@
 """Topology-aware deterministic placement search for STAIR EPLB."""
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -61,6 +62,24 @@ class _PlacementWorkspace:
     rank_loads: npt.NDArray[np.float64]
     node_loads: npt.NDArray[np.float64]
     source_catalog: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class SearchCandidate:
+    """One bounded replica-count candidate evaluated by the policy."""
+
+    placement: np.ndarray
+    replica_counts: np.ndarray
+    objective: float
+    path_key: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class MiniFlashTreeResult:
+    candidate: SearchCandidate
+    evaluated_candidates: int
+    elapsed_ms: float
+    timed_out: bool
 
 
 def _build_source_catalog(current: np.ndarray, num_experts: int) -> tuple[tuple[int, ...], ...]:
@@ -334,6 +353,33 @@ def build_greedy_layer_candidate(
     num_experts = risk_load.size
     validate_layer_placement(current, num_experts, num_ranks)
     target_counts = allocate_replica_counts(risk_load, current.size, num_ranks)
+    return build_candidate_from_replica_counts(
+        risk_load,
+        current,
+        topology,
+        target_counts,
+        deadline=deadline,
+    )
+
+
+def build_candidate_from_replica_counts(
+    risk_load: np.ndarray,
+    current: np.ndarray,
+    topology: StairTopology,
+    target_counts: np.ndarray,
+    *,
+    deadline: float | None = None,
+) -> np.ndarray:
+    """Reuse the production placement backend for an explicit count vector."""
+    num_ranks = current.shape[0]
+    num_experts = risk_load.size
+    if (
+        target_counts.shape != (num_experts,)
+        or int(target_counts.sum()) != current.size
+        or np.any(target_counts < 1)
+        or np.any(target_counts > num_ranks)
+    ):
+        raise ValueError("STAIR search replica counts violate placement bounds.")
     workspace = _reserve_resident_replicas(current, target_counts, risk_load, topology)
     assigned = _assign_replica_ranks(workspace, target_counts, risk_load, topology)
     if assigned is None:
@@ -345,6 +391,98 @@ def build_greedy_layer_candidate(
     current_score = compute_balance_metrics(risk_load[None, :], current).mean_imbalance
     candidate_score = compute_balance_metrics(risk_load[None, :], candidate).mean_imbalance
     return candidate if candidate_score < current_score else current.copy()
+
+
+def _replica_count_neighbors(
+    counts: np.ndarray,
+    risk_load: np.ndarray,
+    num_ranks: int,
+    width: int,
+) -> tuple[np.ndarray, ...]:
+    """Move one redundant copy along the highest marginal-gain edges."""
+    neighbors: list[tuple[float, int, int, np.ndarray]] = []
+    for donor in np.flatnonzero(counts > 1):
+        donor_penalty = risk_load[donor] / (counts[donor] - 1) - risk_load[donor] / counts[donor]
+        for receiver in np.flatnonzero(counts < num_ranks):
+            if receiver == donor:
+                continue
+            receiver_gain = risk_load[receiver] / counts[receiver] - risk_load[receiver] / (counts[receiver] + 1)
+            neighbor = counts.copy()
+            neighbor[donor] -= 1
+            neighbor[receiver] += 1
+            neighbors.append((float(receiver_gain - donor_penalty), int(receiver), int(donor), neighbor))
+    neighbors.sort(key=lambda item: (-item[0], item[1], item[2]))
+    unique: list[np.ndarray] = []
+    seen: set[tuple[int, ...]] = set()
+    for _gain, _receiver, _donor, neighbor in neighbors:
+        key = tuple(int(value) for value in neighbor)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(neighbor)
+        if len(unique) >= width:
+            break
+    return tuple(unique)
+
+
+class MiniFlashTreeSearch:
+    """Small deterministic beam search around the greedy count vector."""
+
+    def search(
+        self,
+        root: SearchCandidate,
+        risk_load: np.ndarray,
+        num_ranks: int,
+        evaluator: Callable[[np.ndarray, float], SearchCandidate | None],
+        deadline: float,
+    ) -> MiniFlashTreeResult:
+        start = time.perf_counter()
+        best = root
+        beam = [root]
+        visited = {root.path_key}
+        evaluated = 1
+        timed_out = False
+        for _depth in range(constants.SEARCH_DEPTH):
+            next_beam: list[SearchCandidate] = []
+            for node in beam:
+                for neighbor_counts in _replica_count_neighbors(
+                    node.replica_counts,
+                    risk_load,
+                    num_ranks,
+                    constants.SEARCH_WIDTH,
+                ):
+                    if evaluated >= constants.MAX_CANDIDATES_PER_LAYER or time.perf_counter() >= deadline:
+                        timed_out = time.perf_counter() >= deadline
+                        break
+                    path_key = tuple(int(value) for value in neighbor_counts)
+                    if path_key in visited:
+                        continue
+                    visited.add(path_key)
+                    evaluation = evaluator(neighbor_counts, deadline)
+                    evaluated += 1
+                    if time.perf_counter() >= deadline:
+                        timed_out = True
+                        break
+                    if evaluation is None:
+                        continue
+                    next_beam.append(evaluation)
+                    if (evaluation.objective, tuple(-value for value in evaluation.path_key)) > (
+                        best.objective,
+                        tuple(-value for value in best.path_key),
+                    ):
+                        best = evaluation
+                if evaluated >= constants.MAX_CANDIDATES_PER_LAYER or timed_out:
+                    break
+            if not next_beam or timed_out:
+                break
+            next_beam.sort(key=lambda item: (-item.objective, item.path_key))
+            beam = next_beam[: constants.SEARCH_WIDTH]
+        return MiniFlashTreeResult(
+            candidate=root if timed_out else best,
+            evaluated_candidates=evaluated,
+            elapsed_ms=(time.perf_counter() - start) * 1000,
+            timed_out=timed_out,
+        )
 
 
 def build_greedy_candidate(

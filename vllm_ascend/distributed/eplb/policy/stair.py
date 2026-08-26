@@ -14,8 +14,14 @@ import torch
 from vllm.logger import logger
 
 from vllm_ascend.distributed.eplb.policy import stair_constants as constants
+from vllm_ascend.distributed.eplb.policy.stair_stats import (
+    StairLoadStats,
+    compute_balance_gain,
+    compute_balance_metrics,
+    rank_loads,
+    replica_counts,
+)
 from vllm_ascend.distributed.eplb.policy.stair_types import (
-    StairBalanceScore,
     StairBudgetUsage,
     StairCandidateKind,
     StairExecutionMetrics,
@@ -27,43 +33,16 @@ from vllm_ascend.distributed.eplb.policy.stair_types import (
 
 
 def _replica_counts(placement: np.ndarray, num_experts: int) -> np.ndarray:
-    return np.bincount(placement.reshape(-1), minlength=num_experts).astype(np.int64, copy=False)
+    return replica_counts(placement, num_experts)
 
 
 def _rank_loads(expert_load: np.ndarray, placement: np.ndarray, num_experts: int) -> np.ndarray:
-    replica_counts = _replica_counts(placement, num_experts)
-    if np.any(replica_counts == 0):
-        raise ValueError("Every logical expert must have at least one physical replica.")
-
-    rank_loads = np.zeros((expert_load.shape[0], placement.shape[0]), dtype=np.float64)
-    for rank_id, rank in enumerate(placement):
-        rank_loads[:, rank_id] = np.sum(expert_load[:, rank] / replica_counts[rank], axis=1)
-    return rank_loads
-
-
-def _score_rank_loads(rank_loads: np.ndarray) -> float:
-    total_load = np.sum(rank_loads, axis=1)
-    scores = np.ones(rank_loads.shape[0], dtype=np.float64)
-    nonzero = total_load > 0
-    if np.any(nonzero):
-        average_load = total_load[nonzero] / rank_loads.shape[1]
-        scores[nonzero] = np.max(rank_loads[nonzero], axis=1) / average_load
-    return float(np.mean(scores))
+    return rank_loads(expert_load, placement, num_experts)
 
 
 def compute_balance_score(expert_load: np.ndarray, placement: np.ndarray) -> float:
     """Return the mean peak-to-average rank load for one MoE layer."""
-    expert_load = np.asarray(expert_load, dtype=np.float64)
-    placement = np.asarray(placement, dtype=np.int64)
-    if expert_load.ndim != 2:
-        raise ValueError(f"expert_load must have shape [window, experts], got {expert_load.shape}.")
-    if placement.ndim != 2:
-        raise ValueError(f"placement must have shape [ranks, slots], got {placement.shape}.")
-    if expert_load.shape[0] == 0 or expert_load.shape[1] == 0:
-        raise ValueError("expert_load window and expert dimensions must be nonzero.")
-    if np.any(placement < 0) or np.any(placement >= expert_load.shape[1]):
-        raise ValueError("placement contains an invalid logical expert index.")
-    return _score_rank_loads(_rank_loads(expert_load, placement, expert_load.shape[1]))
+    return compute_balance_metrics(expert_load, placement).mean_imbalance
 
 
 def _validate_layer_placement(placement: np.ndarray, num_experts: int, num_ranks: int) -> None:
@@ -330,7 +309,8 @@ class StairEplbPolicy:
         self._layer_expert_bytes = layer_expert_bytes
         self._runtime_history = runtime_history
         self.average_to_peak_history: dict[int, float] = {}
-        self._topology: tuple[int, int, int, int] | None = None
+        self.load_stats = StairLoadStats()
+        self._topology: tuple[int, ...] | None = None
         self._expected_layer_placements: dict[int, np.ndarray] = {}
         self._pending_plan: StairRebalancePlan | None = None
         self.execution_metrics: list[StairExecutionMetrics] = []
@@ -343,30 +323,38 @@ class StairEplbPolicy:
             self._layer_expert_bytes = layer_expert_bytes
             self.average_to_peak_history.clear()
             self._expected_layer_placements.clear()
+            self.load_stats.reset()
             self._topology = None
 
     def _prepare_history(
         self,
         expert_load: np.ndarray,
         current_placement: np.ndarray,
+        num_nodes: int,
         num_ranks: int,
     ) -> None:
         topology = (
             expert_load.shape[1],
             expert_load.shape[2],
             current_placement.shape[1],
+            num_nodes,
             num_ranks,
+            constants.STAIR_TUNING_VERSION,
         )
         if self._topology != topology:
             self.average_to_peak_history.clear()
             self._expected_layer_placements.clear()
+            self.load_stats.reset()
             self._topology = topology
             return
 
+        reset_layers: list[int] = []
         for layer_id, expected in list(self._expected_layer_placements.items()):
             if layer_id >= current_placement.shape[0] or not np.array_equal(current_placement[layer_id], expected):
                 self.average_to_peak_history.pop(layer_id, None)
                 self._expected_layer_placements.pop(layer_id, None)
+                reset_layers.append(layer_id)
+        self.load_stats.reset_layers(reset_layers)
 
     def _needs_temporal_update(self, layer_id: int, current_score: float, num_ranks: int) -> bool:
         past_ratio = self.average_to_peak_history.get(layer_id)
@@ -447,19 +435,20 @@ class StairEplbPolicy:
         candidate: np.ndarray,
         num_ranks: int,
     ) -> StairLayerPlan:
-        current_value = compute_balance_score(layer_load, current)
-        candidate_value = compute_balance_score(layer_load, candidate)
-        current_score = StairBalanceScore(current_value, current_value, current_value)
-        candidate_score = StairBalanceScore(candidate_value, candidate_value, candidate_value)
+        current_score = compute_balance_metrics(layer_load, current)
+        candidate_score = compute_balance_metrics(layer_load, candidate)
         transfer_cost = self._estimate_transfer_cost(layer_idx, current, candidate)
-        gain = current_value - candidate_value
+        gain = compute_balance_gain(current_score, candidate_score)
         utility_denominator = max(transfer_cost.weighted_bytes, float(transfer_cost.expert_transfers), 1.0)
         utility = gain / utility_denominator
         accepted = True
         reject_reason = StairRejectReason.NONE
-        if not self._needs_temporal_update(layer_idx, current_value, num_ranks):
+        if not self._needs_temporal_update(layer_idx, current_score.mean_imbalance, num_ranks):
             accepted = False
             reject_reason = StairRejectReason.TEMPORAL_GATE
+        elif candidate_score.p95_imbalance > current_score.p95_imbalance + constants.TAIL_REGRESSION_TOLERANCE:
+            accepted = False
+            reject_reason = StairRejectReason.TAIL_REGRESSION
         elif gain <= constants.MIN_BALANCE_GAIN:
             accepted = False
             reject_reason = StairRejectReason.NO_BALANCE_GAIN
@@ -519,7 +508,9 @@ class StairEplbPolicy:
         )
         start_time = time.perf_counter()
         topology_hash = f"flat:{num_nodes}:{num_ranks}"
-        self._prepare_history(expert_load, current, num_ranks)
+        self._prepare_history(expert_load, current, num_nodes, num_ranks)
+        assert self._topology is not None
+        self.load_stats.update(expert_load, self._topology)
         current_by_rank = current.reshape(current.shape[0], num_ranks, slots_per_rank)
         if not np.any(expert_load):
             selected_layers: tuple[StairLayerPlan, ...] = ()
@@ -535,7 +526,7 @@ class StairEplbPolicy:
             self._pending_plan = plan
             return plan
 
-        candidate = _build_incremental_candidate(expert_load.sum(axis=0), current, num_ranks)
+        candidate = _build_incremental_candidate(self.load_stats.risk_load(), current, num_ranks)
         candidate_by_rank = candidate.reshape(candidate.shape[0], num_ranks, slots_per_rank)
         candidate_layers = np.flatnonzero(np.any(candidate != current, axis=1))
         proposed: list[StairLayerPlan] = []
@@ -549,6 +540,7 @@ class StairEplbPolicy:
                 candidate_by_rank[layer_id],
                 num_ranks,
             )
+            self.load_stats.note_candidate(int(layer_id), layer_plan.accepted)
             (proposed if layer_plan.accepted else rejected).append(layer_plan)
 
         proposed.sort(key=lambda plan: (-plan.utility, plan.layer_idx))

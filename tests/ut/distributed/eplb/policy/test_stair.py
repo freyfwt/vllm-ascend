@@ -11,7 +11,10 @@ from vllm_ascend.distributed.eplb.policy.stair import (
     _build_incremental_candidate,
     compute_balance_score,
 )
-from vllm_ascend.distributed.eplb.policy.stair_types import StairRejectReason
+from vllm_ascend.distributed.eplb.policy.stair_types import (
+    StairBalanceScore,
+    StairRejectReason,
+)
 
 
 def _rebalance(
@@ -107,7 +110,9 @@ def test_stair_uses_full_time_series_for_temporal_acceptance(monkeypatch):
     )
     result = _rebalance(StairEplbPolicy(), load_window, placement)
 
-    np.testing.assert_array_equal(observed_load, load_window.sum(dim=0).numpy())
+    expected_risk_load = load_window.to(dtype=torch.float64).mean(dim=0).numpy()
+    expected_risk_load += load_window.to(dtype=torch.float64).std(dim=0, unbiased=False).numpy()
+    np.testing.assert_array_equal(observed_load, expected_risk_load)
     torch.testing.assert_close(result[0], torch.from_numpy(candidate[0]))
     torch.testing.assert_close(result[1], placement[1])
 
@@ -187,6 +192,28 @@ def test_stair_uses_temporal_hysteresis_and_absolute_thresholds():
 
     policy.average_to_peak_history[0] = 0.92
     assert policy._needs_temporal_update(0, current_score=1 / 0.89, num_ranks=2)
+
+
+def test_stair_rejects_mean_gain_that_regresses_p95(monkeypatch):
+    policy = StairEplbPolicy()
+    current_score = StairBalanceScore(1.5, 1.6, 1.7)
+    candidate_score = StairBalanceScore(1.1, 1.7, 1.8)
+    scores = iter((current_score, candidate_score))
+    monkeypatch.setattr(
+        "vllm_ascend.distributed.eplb.policy.stair.compute_balance_metrics",
+        lambda *_args: next(scores),
+    )
+
+    layer_plan = policy._build_layer_plan(
+        layer_idx=0,
+        layer_load=np.ones((2, 4)),
+        current=np.array([[0, 1], [2, 3]]),
+        candidate=np.array([[0, 2], [1, 3]]),
+        num_ranks=2,
+    )
+
+    assert not layer_plan.accepted
+    assert layer_plan.reject_reason is StairRejectReason.TAIL_REGRESSION
 
 
 def test_stair_commits_history_only_after_real_layer_commit():

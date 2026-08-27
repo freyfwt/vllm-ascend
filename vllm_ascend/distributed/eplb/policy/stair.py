@@ -288,11 +288,7 @@ class StairEplbPolicy:
         elif transfer_cost.max_rank_pair_transfers > constants.MAX_TRANSFERS_PER_RANK_PAIR:
             accepted = False
             reject_reason = StairRejectReason.INVALID_TOPOLOGY
-        elif (
-            transfer_cost.expert_transfers > min(constants.MAX_EXPERT_TRANSFERS_PER_CYCLE, layer_transfer_limit)
-            or transfer_cost.total_bytes > constants.MAX_TRANSFER_BYTES_PER_CYCLE
-            or transfer_cost.cross_node_bytes > constants.MAX_CROSS_NODE_BYTES_PER_CYCLE
-        ):
+        elif transfer_cost.expert_transfers > layer_transfer_limit:
             accepted = False
             reject_reason = StairRejectReason.LAYER_BUDGET
         elif transfer_cost.weighted_bytes > 0:
@@ -370,11 +366,9 @@ class StairEplbPolicy:
             if time.perf_counter() >= deadline:
                 return None
             cost = transfer_plan.budget_cost
-            if (
-                cost.max_rank_pair_transfers > constants.MAX_TRANSFERS_PER_RANK_PAIR
-                or cost.expert_transfers > constants.MAX_EXPERT_TRANSFERS_PER_CYCLE
-                or cost.total_bytes > constants.MAX_TRANSFER_BYTES_PER_CYCLE
-                or cost.cross_node_bytes > constants.MAX_CROSS_NODE_BYTES_PER_CYCLE
+            if cost.max_rank_pair_transfers > constants.MAX_TRANSFERS_PER_RANK_PAIR or cost.expert_transfers > max(
+                2,
+                (current.size - layer_load.shape[1]) * constants.MAX_LAYER_TRANSFER_REDUNDANCY_MULTIPLIER,
             ):
                 return None
             objective = gain / max(
@@ -427,12 +421,7 @@ class StairEplbPolicy:
         digest.update(topology_hash.encode())
         digest.update(str(constants.STAIR_TUNING_VERSION).encode())
         digest.update(
-            (
-                f"{constants.MAX_LAYERS_PER_CYCLE}:"
-                f"{constants.MAX_EXPERT_TRANSFERS_PER_CYCLE}:"
-                f"{constants.MAX_TRANSFER_BYTES_PER_CYCLE}:"
-                f"{constants.MAX_CROSS_NODE_BYTES_PER_CYCLE}"
-            ).encode()
+            (f"{constants.MAX_TRANSFERS_PER_RANK_PAIR}:{constants.MAX_LAYER_TRANSFER_REDUNDANCY_MULTIPLIER}").encode()
         )
         for layer_plan in selected_layers:
             digest.update(layer_plan.layer_idx.to_bytes(4, byteorder="little", signed=False))
@@ -525,9 +514,8 @@ class StairEplbPolicy:
                 layer_id,
             )
         )
-        candidate_limit = constants.MAX_LAYERS_PER_CYCLE + constants.CANDIDATE_LAYER_SLACK
         timed_out = False
-        for layer_id in eligible_layers[:candidate_limit]:
+        for layer_id in eligible_layers:
             if time.perf_counter() >= cycle_deadline:
                 timed_out = True
                 break

@@ -241,6 +241,7 @@ def _improve_by_swaps(
     risk_load: np.ndarray,
     topology: StairTopology,
     protected_positions: tuple[tuple[int, int], ...] | None = None,
+    reserved_pair_counts: Counter[tuple[int, int]] | None = None,
     deadline: float | None = None,
 ) -> np.ndarray:
     """Relocate redundant capacity with a bounded hot/cold rank search."""
@@ -251,6 +252,7 @@ def _improve_by_swaps(
     counts = replica_counts(improved, risk_load.size)
     per_replica_load = risk_load / counts
     rank_load = np.sum(per_replica_load[improved], axis=1)
+    pair_counts = Counter(reserved_pair_counts or {})
     minimum_gain = risk_load.sum() / improved.shape[0] * constants.SWAP_IMPROVEMENT_RATIO
     rank_experts = [set(int(expert) for expert in rank) for rank in improved]
     attempt_limit = min(constants.MAX_SWAP_ATTEMPTS, len(protected) * 2)
@@ -262,6 +264,11 @@ def _improve_by_swaps(
         for cold_rank_value in np.argsort(rank_load, kind="stable"):
             cold_rank = int(cold_rank_value)
             if cold_rank == hot_rank or rank_load[cold_rank] >= rank_load[hot_rank]:
+                continue
+            if (
+                pair_counts[(hot_rank, cold_rank)] >= constants.MAX_TRANSFERS_PER_RANK_PAIR
+                or pair_counts[(cold_rank, hot_rank)] >= constants.MAX_TRANSFERS_PER_RANK_PAIR
+            ):
                 continue
             cost_multiplier = (
                 constants.INTRA_NODE_COST_MULTIPLIER
@@ -304,6 +311,8 @@ def _improve_by_swaps(
         hot_expert = int(improved[hot_rank, hot_slot])
         cold_expert = int(improved[cold_rank, cold_slot])
         improved[hot_rank, hot_slot], improved[cold_rank, cold_slot] = cold_expert, hot_expert
+        pair_counts[(hot_rank, cold_rank)] += 1
+        pair_counts[(cold_rank, hot_rank)] += 1
         rank_experts[hot_rank].remove(hot_expert)
         rank_experts[hot_rank].add(cold_expert)
         rank_experts[cold_rank].remove(cold_expert)
@@ -480,6 +489,7 @@ def build_candidate_from_replica_counts(
         risk_load,
         topology,
         workspace.replaceable_positions,
+        workspace.pair_counts,
         deadline,
     )
     if _deadline_expired(deadline):

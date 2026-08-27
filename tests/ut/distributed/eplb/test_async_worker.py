@@ -256,6 +256,27 @@ def test_worker_rejects_overdue_nonempty_plan():
         eplb_async_worker._validate_plan_budget(plan)
 
 
+def test_worker_rejects_layer_that_exceeds_rank_pair_limit():
+    old_map = torch.tensor([[0, 1]], dtype=torch.int32)
+    new_map = torch.tensor([[1, 0]], dtype=torch.int32)
+    plan = _plan_from_mapping(old_map, new_map)
+    invalid_layer = replace(
+        plan.selected_layers[0],
+        transfer_cost=StairTransferCost(
+            expert_transfers=2,
+            max_rank_pair_transfers=2,
+        ),
+    )
+    invalid_plan = replace(
+        plan,
+        selected_layers=(invalid_layer,),
+        budget_usage=StairBudgetUsage(selected_layers=1, expert_transfers=2),
+    )
+
+    with pytest.raises(RuntimeError, match="rank-pair transfer limit"):
+        eplb_async_worker._validate_plan_budget(invalid_plan)
+
+
 def test_nonzero_rank_adopts_rank_zero_plan(monkeypatch):
     old_map = torch.tensor([[0, 1]], dtype=torch.int32)
     new_map = torch.tensor([[1, 0]], dtype=torch.int32)

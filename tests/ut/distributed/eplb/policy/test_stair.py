@@ -221,13 +221,16 @@ def test_production_shape_candidate_work_is_bounded(monkeypatch):
         return real_build(*args, **kwargs)
 
     monkeypatch.setattr(stair_module, "build_greedy_layer_candidate", counted_build)
+    monkeypatch.setattr(constants, "MAX_PLANNER_MS", 1000.0)
     plan = StairEplbPolicy(runtime_history=False).plan_rebalance(load, 132, 1, 1, 4, placement)
 
-    assert build_count <= constants.MAX_LAYERS_PER_CYCLE + constants.CANDIDATE_LAYER_SLACK
-    assert plan.budget_usage.selected_layers <= constants.MAX_LAYERS_PER_CYCLE
-    assert plan.budget_usage.expert_transfers <= constants.MAX_EXPERT_TRANSFERS_PER_CYCLE
-    if plan.timed_out:
-        torch.testing.assert_close(plan.new_mapping, placement)
+    assert not plan.timed_out
+    assert build_count == placement.shape[0]
+    assert all(
+        layer.transfer_cost.max_rank_pair_transfers <= constants.MAX_TRANSFERS_PER_RANK_PAIR
+        for layer in plan.selected_layers
+    )
+    assert not any(layer.reject_reason is StairRejectReason.INVALID_TOPOLOGY for layer in plan.rejected_layers)
 
 
 def test_stair_keeps_zero_load_and_balanced_placement():
@@ -248,7 +251,7 @@ def test_stair_keeps_zero_load_and_balanced_placement():
     torch.testing.assert_close(balanced_result, placement)
 
 
-def test_plan_rebalance_orders_and_budgets_changed_layers(monkeypatch):
+def test_plan_rebalance_orders_and_selects_all_eligible_layers():
     load_window = torch.tensor(
         [
             [[1, 1, 100, 1], [1, 1, 80, 1]],
@@ -263,8 +266,6 @@ def test_plan_rebalance_orders_and_budgets_changed_layers(monkeypatch):
         ],
         dtype=torch.long,
     )
-    monkeypatch.setattr(constants, "MAX_LAYERS_PER_CYCLE", 1)
-
     plan = StairEplbPolicy().plan_rebalance(
         load_window,
         num_replicas=6,
@@ -274,16 +275,31 @@ def test_plan_rebalance_orders_and_budgets_changed_layers(monkeypatch):
         old_global_expert_indices=placement,
     )
 
-    assert len(plan.selected_layers) == 1
-    assert plan.budget_usage.selected_layers == 1
+    assert len(plan.selected_layers) == 2
+    assert plan.budget_usage.selected_layers == 2
     assert tuple(plan.selected_layers) == tuple(
         sorted(plan.selected_layers, key=lambda item: (-item.utility, item.layer_idx))
     )
-    assert any(item.reject_reason is StairRejectReason.CYCLE_BUDGET for item in plan.rejected_layers)
-    rejected_layer = next(
-        item.layer_idx for item in plan.rejected_layers if item.reject_reason is StairRejectReason.CYCLE_BUDGET
+    assert all(
+        layer.transfer_cost.max_rank_pair_transfers <= constants.MAX_TRANSFERS_PER_RANK_PAIR
+        for layer in plan.selected_layers
     )
-    torch.testing.assert_close(plan.new_mapping[rejected_layer], placement[rejected_layer])
+
+
+def test_all_eligible_layers_converge_in_one_cycle_under_pair_limit():
+    num_layers = 8
+    load_window = torch.tensor([[[1, 1, 100, 1]] * num_layers] * 2, dtype=torch.int32)
+    placement = torch.tensor([[0, 1, 2, 3, 0, 1]] * num_layers, dtype=torch.long)
+    policy = StairEplbPolicy(runtime_history=False)
+
+    first = policy.plan_rebalance(load_window, 6, 1, 1, 2, placement)
+    policy.finish_cycle(first.plan_id, ())
+    second = policy.plan_rebalance(load_window, 6, 1, 1, 2, first.new_mapping)
+
+    assert not first.timed_out
+    assert len(first.selected_layers) == num_layers
+    assert all(layer.transfer_cost.max_rank_pair_transfers == 1 for layer in first.selected_layers)
+    assert second.selected_layers == ()
 
 
 def test_plan_digest_changes_with_tuning_version(monkeypatch):

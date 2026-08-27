@@ -11,7 +11,7 @@ def test_validate_stair_constants_accepts_repository_defaults():
 
 
 def test_validate_stair_constants_rejects_nonpositive_hard_budget(monkeypatch):
-    monkeypatch.setattr(constants, "MAX_LAYERS_PER_CYCLE", 0)
+    monkeypatch.setattr(constants, "MAX_TRANSFERS_PER_RANK_PAIR", 0)
 
     with pytest.raises(ValueError, match="hard limits"):
         constants.validate_stair_constants()
@@ -32,8 +32,8 @@ def test_validate_stair_constants_rejects_unbounded_search(monkeypatch):
         constants.validate_stair_constants()
 
 
-def test_validate_stair_constants_rejects_rank_pair_limit_above_cycle_budget(monkeypatch):
-    monkeypatch.setattr(constants, "MAX_TRANSFERS_PER_RANK_PAIR", constants.MAX_EXPERT_TRANSFERS_PER_CYCLE + 1)
+def test_validate_stair_constants_requires_one_transfer_per_directed_pair(monkeypatch):
+    monkeypatch.setattr(constants, "MAX_TRANSFERS_PER_RANK_PAIR", 2)
 
-    with pytest.raises(ValueError, match="rank-pair transfer limit"):
+    with pytest.raises(ValueError, match="exactly one transfer"):
         constants.validate_stair_constants()

@@ -224,13 +224,7 @@ class StairBudgetUsage:
     def can_add(self, layer_plan: StairLayerPlan) -> bool:
         from vllm_ascend.distributed.eplb.policy import stair_constants as constants
 
-        cost = layer_plan.transfer_cost
-        return (
-            self.selected_layers + 1 <= constants.MAX_LAYERS_PER_CYCLE
-            and self.expert_transfers + cost.expert_transfers <= constants.MAX_EXPERT_TRANSFERS_PER_CYCLE
-            and self.total_bytes + cost.total_bytes <= constants.MAX_TRANSFER_BYTES_PER_CYCLE
-            and self.cross_node_bytes + cost.cross_node_bytes <= constants.MAX_CROSS_NODE_BYTES_PER_CYCLE
-        )
+        return layer_plan.transfer_cost.max_rank_pair_transfers <= constants.MAX_TRANSFERS_PER_RANK_PAIR
 
     def add(self, layer_plan: StairLayerPlan) -> None:
         cost = layer_plan.transfer_cost

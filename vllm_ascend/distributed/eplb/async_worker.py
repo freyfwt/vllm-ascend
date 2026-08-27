@@ -20,6 +20,7 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.eplb.policy import stair_constants as constants
 from vllm_ascend.distributed.eplb.policy.stair_types import (
+    StairBudgetUsage,
     StairExecutionMetrics,
     StairRebalancePlan,
     StairSourceMode,
@@ -133,13 +134,13 @@ def _validate_plan_budget(plan: StairRebalancePlan) -> None:
         raise RuntimeError(f"STAIR timed-out plan {plan.plan_id} must not contain executable layers.")
     if plan.planner_elapsed_ms >= constants.MAX_PLANNER_MS and plan.selected_layers:
         raise RuntimeError(f"STAIR overdue plan {plan.plan_id} must not contain executable layers.")
-    if (
-        usage.selected_layers > constants.MAX_LAYERS_PER_CYCLE
-        or usage.expert_transfers > constants.MAX_EXPERT_TRANSFERS_PER_CYCLE
-        or usage.total_bytes > constants.MAX_TRANSFER_BYTES_PER_CYCLE
-        or usage.cross_node_bytes > constants.MAX_CROSS_NODE_BYTES_PER_CYCLE
-    ):
-        raise RuntimeError(f"STAIR plan {plan.plan_id} exceeds an execution hard budget.")
+    expected_usage = StairBudgetUsage()
+    for layer_plan in plan.selected_layers:
+        if layer_plan.transfer_cost.max_rank_pair_transfers > constants.MAX_TRANSFERS_PER_RANK_PAIR:
+            raise RuntimeError(f"STAIR plan {plan.plan_id} exceeds the per-layer directed rank-pair transfer limit.")
+        expected_usage.add(layer_plan)
+    if usage != expected_usage:
+        raise RuntimeError(f"STAIR plan {plan.plan_id} contains inconsistent execution telemetry.")
 
 
 def _publish_result(

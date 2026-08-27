@@ -7,14 +7,7 @@ These values are intentionally not part of the user configuration surface.
 Developers should update them together with focused tests and benchmarks.
 """
 
-STAIR_TUNING_VERSION = 5
-
-# Cycle budgets.
-MAX_LAYERS_PER_CYCLE = 1
-CANDIDATE_LAYER_SLACK = 1
-MAX_EXPERT_TRANSFERS_PER_CYCLE = 16
-MAX_TRANSFER_BYTES_PER_CYCLE = 64 * 1024**3
-MAX_CROSS_NODE_BYTES_PER_CYCLE = 32 * 1024**3
+STAIR_TUNING_VERSION = 6
 
 # Admission and scoring.
 BALANCE_EPSILON = 1e-6
@@ -40,7 +33,9 @@ SMALL_WORLD_UPDATE_THRESHOLD_VALUE = 0.9
 # Topology and transfer costs.
 INTRA_NODE_COST_MULTIPLIER = 1.0
 CROSS_NODE_COST_MULTIPLIER = 4.0
-MAX_TRANSFERS_PER_RANK_PAIR = 16
+# A directed rank pair may carry at most one logical expert migration in each
+# layer. Different layers have independent pair budgets.
+MAX_TRANSFERS_PER_RANK_PAIR = 1
 MAX_LAYER_TRANSFER_REDUNDANCY_MULTIPLIER = 4
 MAX_SWAP_ATTEMPTS = 2
 MAX_SWAP_SLOT_CANDIDATES = 4
@@ -66,11 +61,6 @@ _MAX_SAFE_PLANNER_MS = 1000.0
 def validate_stair_constants() -> None:
     """Reject contradictory or unbounded repository tuning constants."""
     positive_limits = {
-        "MAX_LAYERS_PER_CYCLE": MAX_LAYERS_PER_CYCLE,
-        "CANDIDATE_LAYER_SLACK": CANDIDATE_LAYER_SLACK,
-        "MAX_EXPERT_TRANSFERS_PER_CYCLE": MAX_EXPERT_TRANSFERS_PER_CYCLE,
-        "MAX_TRANSFER_BYTES_PER_CYCLE": MAX_TRANSFER_BYTES_PER_CYCLE,
-        "MAX_CROSS_NODE_BYTES_PER_CYCLE": MAX_CROSS_NODE_BYTES_PER_CYCLE,
         "MAX_TRANSFERS_PER_RANK_PAIR": MAX_TRANSFERS_PER_RANK_PAIR,
         "MAX_LAYER_TRANSFER_REDUNDANCY_MULTIPLIER": MAX_LAYER_TRANSFER_REDUNDANCY_MULTIPLIER,
         "MAX_SWAP_ATTEMPTS": MAX_SWAP_ATTEMPTS,
@@ -96,8 +86,8 @@ def validate_stair_constants() -> None:
         raise ValueError("STAIR RISK_Z must be non-negative.")
     if CROSS_NODE_COST_MULTIPLIER < INTRA_NODE_COST_MULTIPLIER or INTRA_NODE_COST_MULTIPLIER < 1:
         raise ValueError("STAIR topology cost multipliers must satisfy cross-node >= intra-node >= 1.")
-    if MAX_TRANSFERS_PER_RANK_PAIR > MAX_EXPERT_TRANSFERS_PER_CYCLE:
-        raise ValueError("STAIR rank-pair transfer limit cannot exceed the cycle transfer budget.")
+    if MAX_TRANSFERS_PER_RANK_PAIR != 1:
+        raise ValueError("STAIR requires exactly one transfer per directed rank pair and layer.")
     if SEARCH_DEPTH > _MAX_SAFE_SEARCH_DEPTH:
         raise ValueError("STAIR SEARCH_DEPTH exceeds the safe internal bound.")
     if SEARCH_WIDTH > _MAX_SAFE_SEARCH_WIDTH:

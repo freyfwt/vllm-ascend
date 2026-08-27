@@ -21,7 +21,6 @@ class StairRejectReason(str, Enum):
     LAYER_BUDGET = "layer_budget"
     CYCLE_BUDGET = "cycle_budget"
     INVALID_TOPOLOGY = "invalid_topology"
-    SEARCH_TIMEOUT = "search_timeout"
     SEARCH_NO_GAIN = "search_no_gain"
 
 
@@ -243,7 +242,6 @@ class StairRebalancePlan:
     planner_elapsed_ms: float
     plan_id: str
     topology_hash: str
-    timed_out: bool = False
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from vllm_ascend.distributed.eplb import async_worker as eplb_async_worker
-from vllm_ascend.distributed.eplb.policy import stair_constants as constants
 from vllm_ascend.distributed.eplb.policy.stair_types import (
     StairBalanceScore,
     StairBudgetUsage,
@@ -53,6 +52,7 @@ def test_rebalance_uses_model_owned_policy(monkeypatch):
     )
     model_policy.plan_rebalance.return_value = plan
     model_state = SimpleNamespace(
+        _ascend_eplb_state=SimpleNamespace(_use_process_planner=False),
         _ascend_eplb_policy=model_policy,
         _ascend_eplb_policy_load=None,
         eplb_stats=SimpleNamespace(
@@ -149,6 +149,14 @@ def _run_one_cycle(monkeypatch, old_map, new_map, *, commit_results=True):
         is_async=True,
         model_states={"model": model_state},
     )
+    state.finish_policy_cycle = lambda selected_model, plan, aborted=False: (
+        selected_model._ascend_eplb_policy.abort_cycle(plan.plan_id)
+        if aborted
+        else selected_model._ascend_eplb_policy.finish_cycle(
+            plan.plan_id,
+            tuple(selected_model._ascend_eplb_committed_layer_ids),
+        )
+    )
     device_group = MagicMock()
     device_group.rank.return_value = 0
     cpu_group = MagicMock()
@@ -244,18 +252,6 @@ def test_async_worker_logs_cycle_when_final_layer_changes(monkeypatch):
     )
 
 
-def test_worker_rejects_overdue_nonempty_plan():
-    old_map = torch.tensor([[0, 1]], dtype=torch.int32)
-    new_map = torch.tensor([[1, 0]], dtype=torch.int32)
-    plan = replace(
-        _plan_from_mapping(old_map, new_map),
-        planner_elapsed_ms=constants.MAX_PLANNER_MS,
-    )
-
-    with pytest.raises(RuntimeError, match="overdue plan"):
-        eplb_async_worker._validate_plan_budget(plan)
-
-
 def test_worker_rejects_layer_that_exceeds_rank_pair_limit():
     old_map = torch.tensor([[0, 1]], dtype=torch.int32)
     new_map = torch.tensor([[1, 0]], dtype=torch.int32)
@@ -295,7 +291,7 @@ def test_nonzero_rank_adopts_rank_zero_plan(monkeypatch):
         assert src == 7
         assert group is cpu_group
         assert payload == [None]
-        payload[0] = plan
+        payload[0] = eplb_async_worker._PlanBroadcast(plan)
 
     monkeypatch.setattr(eplb_async_worker.torch.distributed, "get_global_rank", get_global_rank)
     monkeypatch.setattr(eplb_async_worker.torch.distributed, "broadcast_object_list", broadcast)

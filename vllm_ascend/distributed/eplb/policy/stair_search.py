@@ -81,7 +81,6 @@ class MiniFlashTreeResult:
     candidate: SearchCandidate
     evaluated_candidates: int
     elapsed_ms: float
-    timed_out: bool
 
 
 def _build_source_catalog(current: np.ndarray, num_experts: int) -> tuple[tuple[int, ...], ...]:
@@ -90,10 +89,6 @@ def _build_source_catalog(current: np.ndarray, num_experts: int) -> tuple[tuple[
         for expert_id in rank_experts:
             sources[int(expert_id)].append(rank_idx)
     return tuple(tuple(ranks) for ranks in sources)
-
-
-def _deadline_expired(deadline: float | None) -> bool:
-    return deadline is not None and time.perf_counter() >= deadline
 
 
 def _reserve_resident_replicas(
@@ -163,7 +158,6 @@ def _assign_replica_ranks(
     target_counts: np.ndarray,
     risk_load: np.ndarray,
     topology: StairTopology,
-    deadline: float | None = None,
 ) -> npt.NDArray[np.int64] | None:
     """Place only redundant replicas with topology and pair budgets."""
     target_load = risk_load / target_counts
@@ -173,8 +167,6 @@ def _assign_replica_ranks(
     assigned_counts: npt.NDArray[np.int64] = np.ones(target_counts.size, dtype=np.int64)
 
     for requested_expert in replicas_to_place:
-        if _deadline_expired(deadline):
-            return None
         fallback_experts = sorted(
             (expert_id for expert_id in range(target_counts.size) if expert_id != requested_expert),
             key=lambda expert_id: (
@@ -242,7 +234,6 @@ def _improve_by_swaps(
     topology: StairTopology,
     protected_positions: tuple[tuple[int, int], ...] | None = None,
     reserved_pair_counts: Counter[tuple[int, int]] | None = None,
-    deadline: float | None = None,
 ) -> np.ndarray:
     """Relocate redundant capacity with a bounded hot/cold rank search."""
     improved = candidate.copy()
@@ -257,8 +248,6 @@ def _improve_by_swaps(
     rank_experts = [set(int(expert) for expert in rank) for rank in improved]
     attempt_limit = min(constants.MAX_SWAP_ATTEMPTS, len(protected) * 2)
     for _ in range(attempt_limit):
-        if _deadline_expired(deadline):
-            return candidate.copy()
         best: tuple[float, int, int, int, int] | None = None
         hot_rank = int(np.argmax(rank_load))
         for cold_rank_value in np.argsort(rank_load, kind="stable"):
@@ -334,7 +323,6 @@ def _build_rank_cost_matrix(current: np.ndarray, desired: np.ndarray) -> npt.NDA
 
 def _solve_linear_assignment(
     cost: np.ndarray,
-    deadline: float | None = None,
 ) -> npt.NDArray[np.int64] | None:
     """Solve a square assignment deterministically with O(R^3) memory-bounded work."""
     if cost.ndim != 2 or cost.shape[0] != cost.shape[1] or not np.all(np.isfinite(cost)):
@@ -345,8 +333,6 @@ def _solve_linear_assignment(
     matching = np.zeros(size + 1, dtype=np.int64)
     path = np.zeros(size + 1, dtype=np.int64)
     for row in range(1, size + 1):
-        if deadline is not None and time.perf_counter() >= deadline:
-            return None
         matching[0] = row
         column = 0
         minimum = np.full(size + 1, np.inf, dtype=np.float64)
@@ -397,7 +383,6 @@ def _match_equivalent_ranks(
     current: np.ndarray,
     desired: np.ndarray,
     topology: StairTopology,
-    deadline: float | None = None,
 ) -> np.ndarray:
     """Reorder only topology-equivalent rows to reduce remote expert moves."""
     matched = desired.copy()
@@ -407,10 +392,7 @@ def _match_equivalent_ranks(
         group_indices = np.asarray(group, dtype=np.int64)
         current_group = current[group_indices]
         desired_group = desired[group_indices]
-        assignment = _solve_linear_assignment(
-            _build_rank_cost_matrix(current_group, desired_group),
-            deadline,
-        )
+        assignment = _solve_linear_assignment(_build_rank_cost_matrix(current_group, desired_group))
         if assignment is None:
             continue
         for desired_idx, physical_idx in enumerate(assignment):
@@ -437,8 +419,6 @@ def build_greedy_layer_candidate(
     risk_load: np.ndarray,
     current: np.ndarray,
     topology: StairTopology,
-    *,
-    deadline: float | None = None,
 ) -> np.ndarray:
     """Build one complete topology-aware candidate or return current."""
     num_ranks = current.shape[0]
@@ -450,7 +430,6 @@ def build_greedy_layer_candidate(
         current,
         topology,
         target_counts,
-        deadline=deadline,
     )
 
 
@@ -459,8 +438,6 @@ def build_candidate_from_replica_counts(
     current: np.ndarray,
     topology: StairTopology,
     target_counts: np.ndarray,
-    *,
-    deadline: float | None = None,
 ) -> np.ndarray:
     """Reuse the production placement backend for an explicit count vector."""
     num_ranks = current.shape[0]
@@ -472,17 +449,14 @@ def build_candidate_from_replica_counts(
         or np.any(target_counts > num_ranks)
     ):
         raise ValueError("STAIR search replica counts violate placement bounds.")
-    if _deadline_expired(deadline):
-        return current.copy()
     workspace = _reserve_resident_replicas(current, target_counts, risk_load, topology)
     assigned = _assign_replica_ranks(
         workspace,
         target_counts,
         risk_load,
         topology,
-        deadline,
     )
-    if assigned is None or _deadline_expired(deadline):
+    if assigned is None:
         return current.copy()
     desired = _improve_by_swaps(
         assigned,
@@ -490,13 +464,8 @@ def build_candidate_from_replica_counts(
         topology,
         workspace.replaceable_positions,
         workspace.pair_counts,
-        deadline,
     )
-    if _deadline_expired(deadline):
-        return current.copy()
-    matched = _match_equivalent_ranks(current, desired, topology, deadline)
-    if _deadline_expired(deadline):
-        return current.copy()
+    matched = _match_equivalent_ranks(current, desired, topology)
     candidate = align_local_slots(current, matched)
     validate_layer_placement(candidate, num_experts, num_ranks)
     current_score = compute_balance_metrics(risk_load[None, :], current).mean_imbalance
@@ -544,15 +513,13 @@ class MiniFlashTreeSearch:
         root: SearchCandidate,
         risk_load: np.ndarray,
         num_ranks: int,
-        evaluator: Callable[[np.ndarray, float], SearchCandidate | None],
-        deadline: float,
+        evaluator: Callable[[np.ndarray], SearchCandidate | None],
     ) -> MiniFlashTreeResult:
         start = time.perf_counter()
         best = root
         beam = [root]
         visited = {root.path_key}
         evaluated = 1
-        timed_out = False
         for _depth in range(constants.SEARCH_DEPTH):
             next_beam: list[SearchCandidate] = []
             for node in beam:
@@ -562,18 +529,14 @@ class MiniFlashTreeSearch:
                     num_ranks,
                     constants.SEARCH_WIDTH,
                 ):
-                    if evaluated >= constants.MAX_CANDIDATES_PER_LAYER or time.perf_counter() >= deadline:
-                        timed_out = time.perf_counter() >= deadline
+                    if evaluated >= constants.MAX_CANDIDATES_PER_LAYER:
                         break
                     path_key = tuple(int(value) for value in neighbor_counts)
                     if path_key in visited:
                         continue
                     visited.add(path_key)
-                    evaluation = evaluator(neighbor_counts, deadline)
+                    evaluation = evaluator(neighbor_counts)
                     evaluated += 1
-                    if time.perf_counter() >= deadline:
-                        timed_out = True
-                        break
                     if evaluation is None:
                         continue
                     next_beam.append(evaluation)
@@ -582,17 +545,16 @@ class MiniFlashTreeSearch:
                         tuple(-value for value in best.path_key),
                     ):
                         best = evaluation
-                if evaluated >= constants.MAX_CANDIDATES_PER_LAYER or timed_out:
+                if evaluated >= constants.MAX_CANDIDATES_PER_LAYER:
                     break
-            if not next_beam or timed_out:
+            if not next_beam:
                 break
             next_beam.sort(key=lambda item: (-item.objective, item.path_key))
             beam = next_beam[: constants.SEARCH_WIDTH]
         return MiniFlashTreeResult(
-            candidate=root if timed_out else best,
+            candidate=best,
             evaluated_candidates=evaluated,
             elapsed_ms=(time.perf_counter() - start) * 1000,
-            timed_out=timed_out,
         )
 
 
@@ -600,8 +562,6 @@ def build_greedy_candidate(
     risk_load: np.ndarray,
     current_placement: np.ndarray,
     topology: StairTopology,
-    *,
-    deadline: float | None = None,
 ) -> np.ndarray:
     """Build topology-aware candidates for all MoE layers."""
     num_layers = risk_load.shape[0]
@@ -621,14 +581,11 @@ def build_greedy_candidate(
         key=lambda layer_idx: (-current_scores[layer_idx], layer_idx),
     )
     for layer_idx in layer_order:
-        if deadline is not None and time.perf_counter() >= deadline:
-            break
         if current_scores[layer_idx] < constants.IMBALANCE_THRESHOLD:
             continue
         candidate[layer_idx] = build_greedy_layer_candidate(
             risk_load[layer_idx],
             current_by_rank[layer_idx],
             topology,
-            deadline=deadline,
         )
     return candidate.reshape(current_placement.shape)

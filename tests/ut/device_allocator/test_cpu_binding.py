@@ -27,6 +27,7 @@ from vllm_ascend.utils import AscendDeviceType
 def make_cpu_alloc(rank_id=0):
     cpu_alloc = object.__new__(CpuAlloc)
     cpu_alloc.rank_id = rank_id
+    cpu_alloc.planner_pid = None
     cpu_alloc.device_info = SimpleNamespace(
         running_npu_list=[0],
         all_logic_npus=[0],
@@ -40,6 +41,7 @@ def make_cpu_alloc(rank_id=0):
     cpu_alloc.assign_main = {}
     cpu_alloc.assign_acl = {}
     cpu_alloc.assign_rel = {}
+    cpu_alloc.assign_planner = {}
     cpu_alloc.uvb_cpu_pool = []
     return cpu_alloc
 
@@ -913,7 +915,7 @@ class TestCpuBindingSupplemental(unittest.TestCase):
             mock_logger_info.call_args_list,
             [
                 call("The CPU allocation plan is as follows:"),
-                call("Ascend 950 NPU%s: worker=[%s]", 1, "2 3"),
+                call("Ascend 950 NPU%s: worker=[%s] planner=[%s]", 1, "2 3", ""),
             ],
         )
 
@@ -1185,6 +1187,7 @@ class TestCpuBindingSupplemental(unittest.TestCase):
 
     def test_run_all_invokes_steps_in_order(self):
         cpu_alloc = make_cpu_alloc()
+        cpu_alloc.assign_main = {0: [4, 5]}
         calls = []
 
         def build_cpu_pools() -> bool:
@@ -1196,11 +1199,15 @@ class TestCpuBindingSupplemental(unittest.TestCase):
             patch.object(cpu_alloc, "allocate", side_effect=lambda: calls.append("allocate")),
             patch.object(cpu_alloc, "print_plan", side_effect=lambda: calls.append("print_plan")),
             patch.object(cpu_alloc, "bind_threads", side_effect=lambda: calls.append("bind_threads")),
+            patch.object(cpu_alloc, "bind_planner", side_effect=lambda: calls.append("bind_planner")),
             patch.object(cpu_alloc, "bind_npu_irq", side_effect=lambda: calls.append("bind_npu_irq")),
         ):
             cpu_alloc.run_all()
 
-        self.assertEqual(calls, ["build_cpu_pools", "allocate", "print_plan", "bind_threads", "bind_npu_irq"])
+        self.assertEqual(
+            calls,
+            ["build_cpu_pools", "allocate", "print_plan", "bind_threads", "bind_planner", "bind_npu_irq"],
+        )
 
     def test_run_all_returns_when_cpu_pool_build_is_skipped(self):
         cpu_alloc = make_cpu_alloc()
@@ -1246,8 +1253,37 @@ class TestBindingSwitch(unittest.TestCase):
     def test_bind_cpus_runs_allocator_on_arm(self, _mock_is_arm_cpu, mock_cpu_alloc):
         bind_cpus(1)
 
-        mock_cpu_alloc.assert_called_once_with(1)
+        mock_cpu_alloc.assert_called_once_with(1, None)
         mock_cpu_alloc.return_value.run_all.assert_called_once_with()
+
+    @patch("vllm_ascend.cpu_binding.is_arm_cpu", return_value=False)
+    def test_bind_cpus_rejects_planner_without_arm_binding(self, _mock_is_arm_cpu):
+        with self.assertRaisesRegex(RuntimeError, "requires CPU binding"):
+            bind_cpus(0, planner_pid=123)
+
+
+class TestPlannerCoreReservation(unittest.TestCase):
+    def test_reserves_all_siblings_and_removes_them_from_worker(self):
+        cpu_alloc = make_cpu_alloc()
+        cpu_alloc.planner_pid = 123
+        cpu_alloc.assign_main = {0: [2, 3, 6, 7]}
+
+        with patch.object(CpuAlloc, "_thread_siblings", side_effect=lambda cpu: (2, 6) if cpu in (2, 6) else (3, 7)):
+            cpu_alloc._reserve_planner_core()
+
+        self.assertEqual(cpu_alloc.assign_planner[0], [3, 7])
+        self.assertEqual(cpu_alloc.assign_main[0], [2, 6])
+
+    def test_rejects_reservation_that_would_empty_worker_pool(self):
+        cpu_alloc = make_cpu_alloc()
+        cpu_alloc.planner_pid = 123
+        cpu_alloc.assign_main = {0: [2, 6]}
+
+        with (
+            patch.object(CpuAlloc, "_thread_siblings", return_value=(2, 6)),
+            self.assertRaisesRegex(RuntimeError, "complete physical core"),
+        ):
+            cpu_alloc._reserve_planner_core()
 
 
 if __name__ == "__main__":

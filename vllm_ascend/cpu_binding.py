@@ -5,6 +5,7 @@ import platform
 import shutil
 import subprocess
 from collections import defaultdict
+from dataclasses import dataclass
 
 import psutil
 import regex as re
@@ -29,6 +30,15 @@ DEVICE_BINDING_MODE: dict["AscendDeviceType", str] = {
     AscendDeviceType.A5: TOPO_AFFINITY_MODE,
 }
 NO_IRQ_BINDING_DEVICE_TYPES = {AscendDeviceType.A5}
+CPU_TOPOLOGY_ROOT = "/sys/devices/system/cpu"
+
+
+@dataclass(frozen=True)
+class CpuBindingPlan:
+    """CPU roles applied to one worker and its optional STAIR planner."""
+
+    worker_cpus: tuple[int, ...]
+    planner_cpus: tuple[int, ...] = ()
 
 
 def is_arm_cpu() -> bool:
@@ -205,8 +215,9 @@ class DeviceInfo:
 
 
 class CpuAlloc:
-    def __init__(self, rank_id: int):
+    def __init__(self, rank_id: int, planner_pid: int | None = None):
         self.rank_id = rank_id
+        self.planner_pid = planner_pid
         self.device_info: DeviceInfo = DeviceInfo()
         self.cpu_node: dict[int, int] = {}
         self.numa_to_cpu_map: dict[int, list[int]] = defaultdict(list)
@@ -214,6 +225,7 @@ class CpuAlloc:
         self.assign_main: dict[int, list[int]] = {}
         self.assign_acl: dict[int, list[int]] = {}
         self.assign_rel: dict[int, list[int]] = {}
+        self.assign_planner: dict[int, list[int]] = {}
         self.uvb_cpu_pool: list[int] = []
 
     @staticmethod
@@ -595,8 +607,37 @@ class CpuAlloc:
     def allocate(self) -> None:
         if self._is_ascend_950():
             self._allocate_ascend_950_roles()
+        else:
+            self._allocate_default_roles()
+        self._reserve_planner_core()
+
+    @staticmethod
+    def _thread_siblings(cpu: int) -> tuple[int, ...]:
+        siblings_path = os.path.join(CPU_TOPOLOGY_ROOT, f"cpu{cpu}", "topology", "thread_siblings_list")
+        try:
+            with open(siblings_path) as siblings_file:
+                siblings = DeviceInfo.expand_cpu_list(siblings_file.read().strip())
+        except (FileNotFoundError, ValueError):
+            siblings = [cpu]
+        return tuple(sorted(set(siblings)))
+
+    def _reserve_planner_core(self) -> None:
+        if self.planner_pid is None:
             return
-        self._allocate_default_roles()
+        current_npu = self.device_info.running_npu_list[self.rank_id]
+        main_cpus = set(self.assign_main[current_npu])
+        complete_cores = sorted(
+            {self._thread_siblings(cpu) for cpu in main_cpus if set(self._thread_siblings(cpu)).issubset(main_cpus)}
+        )
+        candidates = [siblings for siblings in complete_cores if main_cpus - set(siblings)]
+        if not candidates:
+            raise RuntimeError(
+                "Insufficient CPUs for process-isolated STAIR: one complete physical core must be "
+                "reserved while at least one CPU remains in the worker main pool."
+            )
+        planner_cpus = list(candidates[-1])
+        self.assign_planner[current_npu] = planner_cpus
+        self.assign_main[current_npu] = sorted(main_cpus - set(planner_cpus))
 
     def _allocate_ascend_950_roles(self) -> None:
         self.assign_main = {npu: cpu_pool for npu, cpu_pool in self.npu_cpu_pool.items()}
@@ -632,13 +673,15 @@ class CpuAlloc:
 
     def _print_ascend_950_plan(self, current_npu: int) -> None:
         main = " ".join(map(str, self.assign_main[current_npu]))
-        logger.info("Ascend 950 NPU%s: worker=[%s]", current_npu, main)
+        planner = " ".join(map(str, self.assign_planner.get(current_npu, ())))
+        logger.info("Ascend 950 NPU%s: worker=[%s] planner=[%s]", current_npu, main, planner)
 
     def _print_default_plan(self, current_npu: int) -> None:
         main = " ".join(map(str, self.assign_main[current_npu]))
         acl = " ".join(map(str, self.assign_acl[current_npu]))
         rel = str(self.assign_rel[current_npu]) if self.assign_rel[current_npu] else ""
-        logger.info("NPU%s: main=[%s]  acl=[%s]  release=[%s]", current_npu, main, acl, rel)
+        planner = " ".join(map(str, self.assign_planner.get(current_npu, ())))
+        logger.info("NPU%s: main=[%s]  acl=[%s]  release=[%s]  planner=[%s]", current_npu, main, acl, rel, planner)
 
     def bind_memory(self, pid: str, npu: int) -> None:
         def _get_npu_numa_node(npu_id: int) -> int | None:
@@ -679,6 +722,15 @@ class CpuAlloc:
             self.bind_ascend_950_threads()
             return
         self._bind_default_threads()
+
+    def bind_planner(self) -> None:
+        if self.planner_pid is None:
+            return
+        current_npu = self.device_info.running_npu_list[self.rank_id]
+        planner_cpus = self.assign_planner.get(current_npu)
+        if not planner_cpus:
+            raise RuntimeError("STAIR planner CPU reservation is missing.")
+        self.bind(str(self.planner_pid), planner_cpus, True)
 
     def _bind_default_threads(self) -> None:
         thread_message, _ = execute_command(["ps", "-Te"])
@@ -792,18 +844,28 @@ class CpuAlloc:
         with open(f"/proc/irq/{cq_irq}/smp_affinity", "w") as f:
             f.write(self.cpu_to_mask(cq_cpu))
 
-    def run_all(self) -> None:
+    def run_all(self) -> CpuBindingPlan | None:
         if not self.build_cpu_pools():
-            return
+            if self.planner_pid is not None:
+                raise RuntimeError("STAIR planner requires CPU binding, but no valid CPU pool was built.")
+            return None
         self.allocate()
         self.print_plan()
         self.bind_threads()
+        self.bind_planner()
         self.bind_npu_irq()
+        current_npu = self.device_info.running_npu_list[self.rank_id]
+        return CpuBindingPlan(
+            worker_cpus=tuple(self.assign_main[current_npu]),
+            planner_cpus=tuple(self.assign_planner.get(current_npu, ())),
+        )
 
 
-def bind_cpus(rank_id: int) -> None:
+def bind_cpus(rank_id: int, planner_pid: int | None = None) -> CpuBindingPlan | None:
     if not is_arm_cpu():
+        if planner_pid is not None:
+            raise RuntimeError("Process-isolated STAIR requires CPU binding on an ARM host.")
         logger.info("CPU binding skipped: non-ARM CPU detected.")
-        return
-    binder = CpuAlloc(rank_id)
-    binder.run_all()
+        return None
+    binder = CpuAlloc(rank_id, planner_pid)
+    return binder.run_all()

@@ -135,6 +135,66 @@ and waits for the model-runner thread to acknowledge consumption before reusing
 the staging workspace. A cycle with no changed layers publishes an explicit
 completion marker and performs no expert transfer.
 
+## Process-isolated STAIR planning
+
+STAIR planning is CPU intensive and must not execute in the worker process. A
+Python background thread shares the GIL, allocator, CPU affinity, and cache
+hierarchy with request processing; a controlled four-card A3 experiment found
+that running one real STAIR plan per second in that thread increased mean TTFT
+by 28.42% and p95 TTFT by 47.78%. Moving the identical deterministic work to a
+child process reduced the deltas to 0.97% and 2.78%, respectively, while
+preserving the input digest, plan digest, selected layers, and convergence
+sequence. The child-process design is therefore part of the runtime
+architecture rather than an optional tuning mode.
+
+Each EP group's rank-zero worker owns one persistent planner process. It is
+started with a fresh Python interpreter, does not initialize an NPU or a
+distributed process group, and serially owns the independent STAIR policy
+state for every model registered before the asynchronous loop starts. The
+other EP ranks receive the immutable plan through the existing CPU-group
+broadcast. Dynamic model registration is rejected after planner startup;
+topology and tuning versions are carried by the protocol so a plan cannot be
+applied to incompatible state.
+
+Bulk inputs use a typed, double-buffered anonymous shared-memory region. The
+parent writes a contiguous float64 load window and int64 physical-to-logical
+mapping, publishes the slot sequence and digest over a local inherited socket,
+and does not reuse the slot before the child replies. The child validates the
+protocol version, model identifier, shapes, sequence, and input digest before
+planning. Results remain immutable `StairRebalancePlan` objects on the local
+control socket because they are small, infrequent, and already need to be
+serialized for the rank-zero broadcast. Generic manager dictionaries,
+unbounded queues, queue polling, and device tensors are not used across the
+process boundary.
+
+Planning and execution form one transaction. A model has at most one in-flight
+plan. The child retains its pending policy plan while the movement worker
+publishes selected layers. The parent verifies that each main-thread mapping
+commit matches that plan and records the actual execution metrics. A finalize
+message returns the committed layer identifiers and metrics to the child,
+which updates temporal history only for layers that really committed; an
+aborted or partially completed cycle cannot teach the planner an uncommitted
+placement. A newer load sample alone does not invalidate an executable plan,
+but a model, mapping, topology, protocol, or tuning-version mismatch does.
+
+The planner has deterministic work bounds (search depth, width, candidate
+count, and per-layer transfer rules), not an algorithm wall-clock deadline.
+There is no silent timeout rollback and no in-process thread fallback. A
+30-second control-channel health timeout detects a hung process rather than
+limiting valid search. Child exit, planner exception, protocol corruption,
+shared-memory validation failure, or health timeout is fatal to the worker and
+therefore to the service. The child is never restarted; normal server shutdown
+is the only graceful close path.
+
+CPU isolation is established after model warm-up. Rank zero reserves one whole
+physical CPU core, including all SMT siblings, from the worker's main CPU pool,
+binds the planner exclusively to it, and excludes those logical CPUs from the
+parent worker affinity. The planner remains unavailable until that affinity
+handshake succeeds. Asynchronous STAIR startup fails when CPU binding is
+disabled, a complete core cannot be reserved, or either affinity operation
+fails. This strict contract prevents a nominal child process from competing
+with inference on the same constrained cpuset.
+
 ## Invariants
 
 Changes to this integration must preserve these invariants:

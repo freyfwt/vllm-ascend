@@ -15,7 +15,11 @@ from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import logger
 
 from vllm_ascend.distributed.eplb.policy.stair import StairEplbPolicy
-from vllm_ascend.distributed.eplb.policy.stair_types import StairTopology
+from vllm_ascend.distributed.eplb.policy.stair_types import (
+    StairExecutionMetrics,
+    StairRebalancePlan,
+    StairTopology,
+)
 from vllm_ascend.distributed.eplb.transfer_plan import compute_layer_expert_bytes
 from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
 
@@ -162,10 +166,15 @@ class AscendEplbState(_eplb_state.EplbState):
         self.policy = self._profile_policy
         self._has_fresh_recorded_load = False
         self._preserve_expert_load_time_series = False
+        self._planner_client: Any = None
+        self._use_process_planner = False
+        self._planner_topology_epoch = 0
         if self.cuda_device_index is None:
             self.cuda_device_index = torch.accelerator.current_device_index()
 
     def add_model(self, model, model_config) -> None:
+        if getattr(self, "_use_process_planner", False):
+            raise RuntimeError("Models cannot be registered after the STAIR planner process has started.")
         super().add_model(model, model_config)
         self.is_async = True
         model_state = self.model_states[model_config.compute_hash()]
@@ -177,10 +186,13 @@ class AscendEplbState(_eplb_state.EplbState):
             layer_expert_bytes,
         )
         model_state_any._ascend_eplb_state = self
+        model_state_any._ascend_eplb_model_id = model_config.compute_hash()
+        model_state_any._ascend_eplb_mapping_version = 0
         model_state_any._ascend_eplb_active_plan = None
         model_state_any._ascend_eplb_policy_load = None
         model_state_any._ascend_eplb_pending_execution_metrics = None
         model_state_any._ascend_eplb_committed_layer_ids = []
+        model_state_any._ascend_eplb_execution_metrics = []
         # super().add_model() replaces the state-level policy with the
         # configured upstream policy. Restore the STAIR profile policy.
         self.policy = self._profile_policy
@@ -198,14 +210,82 @@ class AscendEplbState(_eplb_state.EplbState):
             if topology != self._stair_topology:
                 self._stair_topology = topology
                 self._profile_policy.configure_runtime(None, topology=topology)
+                self._planner_topology_epoch += 1
                 for model_state in self.model_states.values():
                     model_state._ascend_eplb_policy.configure_runtime(
                         model_state._ascend_eplb_layer_expert_bytes,
                         topology=topology,
                     )
+        if not is_profile:
+            self._start_process_planner()
         from vllm_ascend.distributed.eplb.async_worker import start_async_worker
 
         self.async_worker = start_async_worker(self, is_profile=is_profile)
+
+    def _start_process_planner(self) -> None:
+        """Create the one persistent planner owned by EP rank zero."""
+        if getattr(self, "_use_process_planner", False):
+            return
+        topology = self._stair_topology
+        if topology is None:
+            raise RuntimeError("STAIR process planner requires a validated EPLB topology.")
+        from vllm.distributed.parallel_state import get_eplb_group
+
+        ep_rank = get_eplb_group().device_group.rank()
+        self._use_process_planner = True
+        if ep_rank != 0:
+            return
+        from vllm_ascend.distributed.eplb.planner_client import StairPlannerClient
+        from vllm_ascend.distributed.eplb.planner_protocol import PlannerModelRegistration
+
+        registrations = []
+        for model_id, model_state in self.model_states.items():
+            model = model_state.model
+            registrations.append(
+                PlannerModelRegistration(
+                    model_id=model_id,
+                    load_shape=(
+                        self.expert_load_window_size,
+                        model.num_moe_layers,
+                        model.num_logical_experts,
+                    ),
+                    mapping_shape=(model.num_moe_layers, model.num_physical_experts),
+                    num_replicas=model.num_physical_experts,
+                    num_groups=model.num_expert_groups,
+                    num_nodes=topology.num_nodes,
+                    num_ranks=len(topology.rank_to_node),
+                    topology=topology,
+                    layer_expert_bytes=model_state._ascend_eplb_layer_expert_bytes,
+                )
+            )
+        self._planner_client = StairPlannerClient(tuple(registrations))
+
+    @property
+    def planner_pid(self) -> int | None:
+        client = self._planner_client
+        return None if client is None else client.pid
+
+    def mark_planner_affinity_ready(self, planner_cpus: tuple[int, ...]) -> None:
+        client = self._planner_client
+        if client is not None:
+            client.mark_affinity_ready(planner_cpus)
+
+    def plan_with_process(
+        self,
+        model_state: Any,
+        load_window: torch.Tensor,
+        mapping: torch.Tensor,
+    ) -> StairRebalancePlan:
+        client = self._planner_client
+        if client is None:
+            raise RuntimeError("Only EPLB rank zero owns the STAIR planner process.")
+        return client.plan(
+            model_state._ascend_eplb_model_id,
+            load_window,
+            mapping,
+            mapping_version=model_state._ascend_eplb_mapping_version,
+            topology_epoch=self._planner_topology_epoch,
+        )
 
     def step(
         self,
@@ -304,16 +384,67 @@ class AscendEplbState(_eplb_state.EplbState):
         load_window = getattr(model_state, "_ascend_eplb_policy_load", None)
         if load_window is None or model_state.eplb_stats is None:
             return
-        model_state._ascend_eplb_policy.commit_layer(
-            load_window,
-            layer_idx,
-            model_state.physical_to_logical_map[layer_idx].cpu(),
-            model_state.eplb_stats.num_gpus,
-            getattr(model_state, "_ascend_eplb_pending_execution_metrics", None),
-        )
+        committed_mapping = model_state.physical_to_logical_map[layer_idx].cpu()
+        if getattr(self, "_use_process_planner", False):
+            active_plan: StairRebalancePlan | None = model_state._ascend_eplb_active_plan
+            if active_plan is None:
+                raise RuntimeError("STAIR observed a mapping commit without an active process plan.")
+            selected_layers = {item.layer_idx for item in active_plan.selected_layers}
+            if layer_idx not in selected_layers:
+                raise RuntimeError(f"STAIR observed an unplanned mapping commit for layer {layer_idx}.")
+            if not torch.equal(committed_mapping.to(dtype=torch.long), active_plan.new_mapping[layer_idx]):
+                raise RuntimeError(f"STAIR committed mapping does not match the active plan for layer {layer_idx}.")
+        else:
+            model_state._ascend_eplb_policy.commit_layer(
+                load_window,
+                layer_idx,
+                committed_mapping,
+                model_state.eplb_stats.num_gpus,
+                getattr(model_state, "_ascend_eplb_pending_execution_metrics", None),
+            )
         committed_layer_ids = getattr(model_state, "_ascend_eplb_committed_layer_ids", None)
         if committed_layer_ids is not None:
             committed_layer_ids.append(layer_idx)
+        execution_metrics: StairExecutionMetrics | None = getattr(
+            model_state,
+            "_ascend_eplb_pending_execution_metrics",
+            None,
+        )
+        if execution_metrics is not None:
+            model_state._ascend_eplb_execution_metrics.append(execution_metrics)
+        model_state._ascend_eplb_mapping_version = getattr(model_state, "_ascend_eplb_mapping_version", 0) + 1
+
+    def finish_policy_cycle(
+        self,
+        model_state: Any,
+        plan: StairRebalancePlan,
+        *,
+        aborted: bool = False,
+    ) -> None:
+        """Finalize process-owned history after main-thread commit acknowledgements."""
+        committed_layer_ids = tuple(getattr(model_state, "_ascend_eplb_committed_layer_ids", ()))
+        execution_metrics = tuple(getattr(model_state, "_ascend_eplb_execution_metrics", ()))
+        if getattr(self, "_use_process_planner", False):
+            if self._planner_client is not None:
+                self._planner_client.finalize(
+                    model_state._ascend_eplb_model_id,
+                    mapping_version=model_state._ascend_eplb_mapping_version,
+                    topology_epoch=self._planner_topology_epoch,
+                    committed_layer_ids=committed_layer_ids,
+                    execution_metrics=execution_metrics,
+                    aborted=aborted,
+                )
+        elif aborted:
+            model_state._ascend_eplb_policy.abort_cycle(plan.plan_id)
+        else:
+            model_state._ascend_eplb_policy.finish_cycle(plan.plan_id, committed_layer_ids)
+        model_state._ascend_eplb_active_plan = None
+
+    def close(self) -> None:
+        client = self._planner_client
+        if client is not None:
+            client.close()
+            self._planner_client = None
 
     @classmethod
     def from_mapping(

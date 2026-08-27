@@ -47,15 +47,12 @@ MAX_SEARCH_LAYERS = 4
 SEARCH_DEPTH = 2
 SEARCH_WIDTH = 4
 MAX_CANDIDATES_PER_LAYER = 16
-MAX_SEARCH_MS_PER_LAYER = 10.0
-MAX_PLANNER_MS = 100.0
 SEARCH_STAGNATION_CYCLES = 2
 SEARCH_MAX_GREEDY_GAIN_RATIO = 0.1
 
 _MAX_SAFE_SEARCH_DEPTH = 4
 _MAX_SAFE_SEARCH_WIDTH = 16
 _MAX_SAFE_CANDIDATES_PER_LAYER = 64
-_MAX_SAFE_PLANNER_MS = 1000.0
 
 
 def validate_stair_constants() -> None:
@@ -69,8 +66,6 @@ def validate_stair_constants() -> None:
         "SEARCH_DEPTH": SEARCH_DEPTH,
         "SEARCH_WIDTH": SEARCH_WIDTH,
         "MAX_CANDIDATES_PER_LAYER": MAX_CANDIDATES_PER_LAYER,
-        "MAX_SEARCH_MS_PER_LAYER": MAX_SEARCH_MS_PER_LAYER,
-        "MAX_PLANNER_MS": MAX_PLANNER_MS,
         "SEARCH_STAGNATION_CYCLES": SEARCH_STAGNATION_CYCLES,
     }
     invalid = [name for name, value in positive_limits.items() if value <= 0]
@@ -94,8 +89,6 @@ def validate_stair_constants() -> None:
         raise ValueError("STAIR SEARCH_WIDTH exceeds the safe internal bound.")
     if MAX_CANDIDATES_PER_LAYER < SEARCH_WIDTH or MAX_CANDIDATES_PER_LAYER > _MAX_SAFE_CANDIDATES_PER_LAYER:
         raise ValueError("STAIR candidate count must cover search width and remain bounded.")
-    if MAX_PLANNER_MS > _MAX_SAFE_PLANNER_MS or MAX_SEARCH_MS_PER_LAYER > MAX_PLANNER_MS:
-        raise ValueError("STAIR planner deadlines are inconsistent or unbounded.")
     if ENABLE_SPARSE_COVARIANCE and COVARIANCE_TOP_K <= 0:
         raise ValueError("STAIR COVARIANCE_TOP_K must be positive when covariance is enabled.")
     if not 0 <= SEARCH_MAX_GREEDY_GAIN_RATIO <= 1:

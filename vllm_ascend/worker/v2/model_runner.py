@@ -204,6 +204,13 @@ class NPUModelRunner(GPUModelRunner):
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
         return AscendPCPManager
 
+    def shutdown(self) -> None:
+        """Close the mandatory STAIR child before releasing model state."""
+        eplb_state = getattr(self.eplb, "state", None)
+        if eplb_state is not None:
+            eplb_state.close()
+        super().shutdown()
+
     def sample_tokens(self, grammar_output):
         output = super().sample_tokens(grammar_output)
 

@@ -100,8 +100,8 @@ def test_stair_uses_full_time_series_for_temporal_acceptance(monkeypatch):
     observed_load: list[np.ndarray] = []
     candidates = iter(candidate.reshape(2, 2, 2))
 
-    def fake_candidate(logical_load, current_placement, topology, *, deadline=None):
-        del current_placement, topology, deadline
+    def fake_candidate(logical_load, current_placement, topology):
+        del current_placement, topology
         observed_load.append(logical_load.copy())
         return next(candidates).copy()
 
@@ -116,28 +116,6 @@ def test_stair_uses_full_time_series_for_temporal_acceptance(monkeypatch):
     np.testing.assert_array_equal(np.stack(observed_load), expected_risk_load)
     torch.testing.assert_close(result[0], torch.from_numpy(candidate[0]))
     torch.testing.assert_close(result[1], placement[1])
-
-
-def test_stair_forwards_planner_deadline_to_greedy_candidate(monkeypatch):
-    observed_deadline = None
-
-    def fake_candidate(logical_load, current_placement, topology, *, deadline=None):
-        del logical_load, topology
-        nonlocal observed_deadline
-        observed_deadline = deadline
-        return current_placement.copy()
-
-    monkeypatch.setattr(
-        "vllm_ascend.distributed.eplb.policy.stair.build_greedy_layer_candidate",
-        fake_candidate,
-    )
-    _rebalance(
-        StairEplbPolicy(),
-        torch.tensor([[[1, 1, 100, 1]], [[1, 1, 100, 1]]], dtype=torch.float64),
-        torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.long),
-    )
-
-    assert observed_deadline is not None
 
 
 def test_temporal_gate_runs_before_candidate_construction(monkeypatch):
@@ -187,25 +165,6 @@ def test_mini_flash_tree_disabled_skips_search(monkeypatch):
     assert not search_called
 
 
-def test_expired_planner_returns_safe_noop(monkeypatch):
-    monkeypatch.setattr(constants, "MAX_PLANNER_MS", 1e-9)
-    monkeypatch.setattr(constants, "MAX_SEARCH_MS_PER_LAYER", 1e-10)
-    placement = torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.long)
-
-    plan = StairEplbPolicy().plan_rebalance(
-        torch.tensor([[[1, 1, 100, 1]], [[1, 1, 120, 1]]], dtype=torch.float64),
-        6,
-        1,
-        1,
-        2,
-        placement,
-    )
-
-    assert plan.timed_out
-    assert plan.selected_layers == ()
-    torch.testing.assert_close(plan.new_mapping, placement)
-
-
 def test_production_shape_candidate_work_is_bounded(monkeypatch):
     random = np.random.default_rng(17)
     load = torch.from_numpy(random.lognormal(mean=2.0, sigma=1.5, size=(2, 48, 128)))
@@ -221,10 +180,8 @@ def test_production_shape_candidate_work_is_bounded(monkeypatch):
         return real_build(*args, **kwargs)
 
     monkeypatch.setattr(stair_module, "build_greedy_layer_candidate", counted_build)
-    monkeypatch.setattr(constants, "MAX_PLANNER_MS", 1000.0)
     plan = StairEplbPolicy(runtime_history=False).plan_rebalance(load, 132, 1, 1, 4, placement)
 
-    assert not plan.timed_out
     assert build_count == placement.shape[0]
     assert all(
         layer.transfer_cost.max_rank_pair_transfers <= constants.MAX_TRANSFERS_PER_RANK_PAIR
@@ -296,7 +253,6 @@ def test_all_eligible_layers_converge_in_one_cycle_under_pair_limit():
     policy.finish_cycle(first.plan_id, ())
     second = policy.plan_rebalance(load_window, 6, 1, 1, 2, first.new_mapping)
 
-    assert not first.timed_out
     assert len(first.selected_layers) == num_layers
     assert all(layer.transfer_cost.max_rank_pair_transfers == 1 for layer in first.selected_layers)
     assert second.selected_layers == ()

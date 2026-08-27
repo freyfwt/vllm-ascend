@@ -386,3 +386,59 @@ def test_commit_policy_layer_uses_committed_mapping(monkeypatch):
     assert args[1] == 0
     torch.testing.assert_close(args[2], model_state.physical_to_logical_map[0])
     assert args[3] == 2
+
+
+def test_process_policy_transaction_uses_only_verified_commits():
+    state = AscendEplbState.__new__(AscendEplbState)
+    state._use_process_planner = True
+    state._planner_topology_epoch = 4
+    state._planner_client = MagicMock()
+    plan = SimpleNamespace(
+        plan_id="plan",
+        selected_layers=(SimpleNamespace(layer_idx=0),),
+        new_mapping=torch.tensor([[0, 2, 1, 3]], dtype=torch.long),
+    )
+    metrics = SimpleNamespace(layer_idx=0)
+    model_state = SimpleNamespace(
+        _ascend_eplb_model_id="main",
+        _ascend_eplb_mapping_version=7,
+        _ascend_eplb_active_plan=plan,
+        _ascend_eplb_policy_load=torch.ones((2, 1, 4)),
+        _ascend_eplb_pending_execution_metrics=metrics,
+        _ascend_eplb_committed_layer_ids=[],
+        _ascend_eplb_execution_metrics=[],
+        eplb_stats=SimpleNamespace(num_gpus=2),
+        physical_to_logical_map=plan.new_mapping.clone(),
+    )
+
+    state.commit_policy_layer(model_state, 0)
+    state.finish_policy_cycle(model_state, plan)
+
+    assert model_state._ascend_eplb_mapping_version == 8
+    state._planner_client.finalize.assert_called_once_with(
+        "main",
+        mapping_version=8,
+        topology_epoch=4,
+        committed_layer_ids=(0,),
+        execution_metrics=(metrics,),
+        aborted=False,
+    )
+    assert model_state._ascend_eplb_active_plan is None
+
+
+def test_process_policy_rejects_mapping_that_differs_from_plan():
+    state = AscendEplbState.__new__(AscendEplbState)
+    state._use_process_planner = True
+    plan = SimpleNamespace(
+        selected_layers=(SimpleNamespace(layer_idx=0),),
+        new_mapping=torch.tensor([[0, 2, 1, 3]], dtype=torch.long),
+    )
+    model_state = SimpleNamespace(
+        _ascend_eplb_active_plan=plan,
+        _ascend_eplb_policy_load=torch.ones((2, 1, 4)),
+        eplb_stats=SimpleNamespace(num_gpus=2),
+        physical_to_logical_map=torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+    )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        state.commit_policy_layer(model_state, 0)

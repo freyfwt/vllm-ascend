@@ -8,8 +8,10 @@
 # Until then, changes to the upstream async-worker protocol must be mirrored
 # here and covered by contract tests so this copy cannot silently drift.
 
+import os
 import threading
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -56,8 +58,9 @@ def start_async_worker(
         stream = torch.cuda.Stream(device=device_index)
         try:
             transfer_run_periodically(state=state, cuda_stream=stream, is_profile=is_profile)
-        except Exception as exc:  # pragma: no cover - diagnostic path
+        except BaseException as exc:  # pragma: no cover - terminates the worker process.
             logger.exception("async loop error (Rank %d): %s", rank, str(exc))
+            os._exit(1)
 
     thread = threading.Thread(target=thread_target, daemon=True)
     thread.start()
@@ -73,14 +76,19 @@ def _run_rebalance_plan(
     stats = model_state.eplb_stats
     with torch.cuda.stream(cuda_stream):
         load_window_cpu = stats.global_expert_load_window.cpu()
-    plan = model_state._ascend_eplb_policy.plan_rebalance(
-        load_window_cpu,
-        stats.num_replicas,
-        stats.num_groups,
-        stats.num_nodes,
-        stats.num_gpus,
-        physical_to_logical_map_cpu,
-    )
+    state = getattr(model_state, "_ascend_eplb_state", None)
+    if getattr(state, "_use_process_planner", False):
+        assert state is not None
+        plan = state.plan_with_process(model_state, load_window_cpu, physical_to_logical_map_cpu)
+    else:
+        plan = model_state._ascend_eplb_policy.plan_rebalance(
+            load_window_cpu,
+            stats.num_replicas,
+            stats.num_groups,
+            stats.num_nodes,
+            stats.num_gpus,
+            physical_to_logical_map_cpu,
+        )
     if plan.new_mapping.device != torch.device("cpu"):
         raise RuntimeError(
             "Statistical Temporal-Aware Incremental Rebalancing (STAIR) must return a CPU physical-to-logical map."
@@ -88,6 +96,12 @@ def _run_rebalance_plan(
     model_state._ascend_eplb_policy_load = load_window_cpu
     model_state._ascend_eplb_active_plan = plan
     return plan
+
+
+@dataclass(frozen=True)
+class _PlanBroadcast:
+    plan: StairRebalancePlan | None
+    fatal_error: str | None = None
 
 
 def _broadcast_rank_zero_plan(
@@ -101,22 +115,30 @@ def _broadcast_rank_zero_plan(
     if cpu_group.size() <= 1:
         return _run_rebalance_plan(model_state, physical_to_logical_map_cpu, cuda_stream)
 
-    plan: StairRebalancePlan | None = None
+    envelope: _PlanBroadcast | None = None
     if ep_rank == 0:
-        plan = _run_rebalance_plan(model_state, physical_to_logical_map_cpu, cuda_stream)
-    payload = [plan]
+        try:
+            envelope = _PlanBroadcast(_run_rebalance_plan(model_state, physical_to_logical_map_cpu, cuda_stream))
+        except BaseException as error:
+            envelope = _PlanBroadcast(None, f"{type(error).__name__}: {error}")
+    payload = [envelope]
     group_root = torch.distributed.get_global_rank(cpu_group, 0)
     torch.distributed.broadcast_object_list(payload, src=group_root, group=cpu_group)
     received = payload[0]
-    if not isinstance(received, StairRebalancePlan):
+    if not isinstance(received, _PlanBroadcast):
         raise RuntimeError("STAIR rank-zero plan broadcast returned an invalid payload.")
+    if received.fatal_error is not None:
+        raise RuntimeError(f"STAIR rank-zero planner failed: {received.fatal_error}")
+    plan = received.plan
+    if not isinstance(plan, StairRebalancePlan):
+        raise RuntimeError("STAIR rank-zero plan broadcast did not contain a plan.")
     if ep_rank != 0:
         assert model_state.eplb_stats is not None
         with torch.cuda.stream(cuda_stream):
             load_window_cpu = model_state.eplb_stats.global_expert_load_window.cpu()
         model_state._ascend_eplb_policy_load = load_window_cpu
-        model_state._ascend_eplb_active_plan = received
-    return received
+        model_state._ascend_eplb_active_plan = plan
+    return plan
 
 
 def _run_rebalance_experts(
@@ -130,10 +152,6 @@ def _run_rebalance_experts(
 
 def _validate_plan_budget(plan: StairRebalancePlan) -> None:
     usage = plan.budget_usage
-    if plan.timed_out and plan.selected_layers:
-        raise RuntimeError(f"STAIR timed-out plan {plan.plan_id} must not contain executable layers.")
-    if plan.planner_elapsed_ms >= constants.MAX_PLANNER_MS and plan.selected_layers:
-        raise RuntimeError(f"STAIR overdue plan {plan.plan_id} must not contain executable layers.")
     expected_usage = StairBudgetUsage()
     for layer_plan in plan.selected_layers:
         if layer_plan.transfer_cost.max_rank_pair_transfers > constants.MAX_TRANSFERS_PER_RANK_PAIR:
@@ -181,6 +199,7 @@ def transfer_run_periodically(
         for model_state in state.model_states.values():
             model_state._ascend_eplb_committed_layers = 0
             model_state._ascend_eplb_committed_layer_ids = []
+            model_state._ascend_eplb_execution_metrics = []
             model_state.communicator.set_stream(cuda_stream)
             with torch.cuda.stream(cuda_stream):
                 old_mapping = model_state.physical_to_logical_map.cpu()
@@ -210,7 +229,7 @@ def transfer_run_periodically(
                     )
                     model_state.rebalanced = False
                     cycle_completed = False
-                    model_state._ascend_eplb_policy.abort_cycle(plan.plan_id)
+                    state.finish_policy_cycle(model_state, plan, aborted=True)
                     break
 
                 transfer_start = time.perf_counter()
@@ -260,9 +279,7 @@ def transfer_run_periodically(
                     cuda_stream,
                 )
             if cycle_completed:
-                committed_layer_ids = tuple(getattr(model_state, "_ascend_eplb_committed_layer_ids", ()))
-                model_state._ascend_eplb_policy.finish_cycle(plan.plan_id, committed_layer_ids)
-                model_state._ascend_eplb_active_plan = None
+                state.finish_policy_cycle(model_state, plan)
                 committed_layers = getattr(model_state, "_ascend_eplb_committed_layers", 0)
                 if ep_rank == 0 and committed_layers > 0:
                     logger.info(

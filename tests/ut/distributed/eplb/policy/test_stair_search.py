@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
-import time
-
 import numpy as np
 
 from vllm_ascend.distributed.eplb.policy import stair_constants as constants
@@ -61,19 +59,6 @@ def test_hierarchical_placement_prefers_same_node_capacity():
     assert 2 in noncontiguous_ranks and 1 not in noncontiguous_ranks
 
 
-def test_layer_candidate_expired_deadline_returns_current():
-    current = np.array([[0, 1, 2], [3, 0, 1]], dtype=np.int64)
-
-    candidate = build_greedy_layer_candidate(
-        np.array([1, 1, 100, 1], dtype=np.float64),
-        current,
-        StairTopology.contiguous(num_ranks=2, num_nodes=1),
-        deadline=0.0,
-    )
-
-    np.testing.assert_array_equal(candidate, current)
-
-
 def test_rank_matching_never_crosses_equivalent_group():
     topology = StairTopology.from_rank_to_node((0, 1, 0, 1))
     current = np.array([[0, 1], [2, 3], [4, 5], [6, 7]], dtype=np.int64)
@@ -84,8 +69,8 @@ def test_rank_matching_never_crosses_equivalent_group():
     np.testing.assert_array_equal(matched, current)
 
 
-def test_linear_assignment_deadline_returns_none():
-    assert _solve_linear_assignment(np.zeros((4, 4)), deadline=0.0) is None
+def test_linear_assignment_solves_deterministically():
+    np.testing.assert_array_equal(_solve_linear_assignment(np.zeros((4, 4))), np.arange(4))
 
 
 def test_mini_flash_tree_is_bounded_and_deterministic(monkeypatch):
@@ -100,8 +85,7 @@ def test_mini_flash_tree_is_bounded_and_deterministic(monkeypatch):
         path_key=(2, 1, 1),
     )
 
-    def evaluate(candidate_counts, deadline):
-        assert time.perf_counter() < deadline
+    def evaluate(candidate_counts):
         return SearchCandidate(
             placement=candidate_counts[None, :],
             replica_counts=candidate_counts.copy(),
@@ -114,21 +98,19 @@ def test_mini_flash_tree_is_bounded_and_deterministic(monkeypatch):
         np.array([100, 50, 10], dtype=np.float64),
         num_ranks=2,
         evaluator=evaluate,
-        deadline=time.perf_counter() + 1,
     )
     second = MiniFlashTreeSearch().search(
         root,
         np.array([100, 50, 10], dtype=np.float64),
         num_ranks=2,
         evaluator=evaluate,
-        deadline=time.perf_counter() + 1,
     )
 
     assert first.candidate.path_key == second.candidate.path_key == (1, 2, 1)
     assert first.evaluated_candidates <= constants.MAX_CANDIDATES_PER_LAYER
 
 
-def test_mini_flash_tree_timeout_returns_root():
+def test_mini_flash_tree_returns_root_when_no_candidate_is_valid():
     root = SearchCandidate(
         placement=np.zeros((2, 2), dtype=np.int64),
         replica_counts=np.array([2, 1, 1], dtype=np.int64),
@@ -141,9 +123,7 @@ def test_mini_flash_tree_timeout_returns_root():
         np.ones(3),
         num_ranks=2,
         evaluator=lambda *_args: None,
-        deadline=0.0,
     )
 
     assert result.candidate is root
-    assert result.timed_out
-    assert result.evaluated_candidates == 1
+    assert result.evaluated_candidates <= constants.MAX_CANDIDATES_PER_LAYER

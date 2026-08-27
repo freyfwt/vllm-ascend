@@ -826,10 +826,26 @@ class NPUWorker(WorkerBase):
             self._warm_up_atb()
         # Bind after warmup so hot allocations are already materialized on the
         # worker process before migratepages/taskset run.
+        eplb_controller = getattr(self.model_runner, "eplb", None)
+        eplb_state = getattr(eplb_controller, "state", None)
+        planner_pid_value = getattr(eplb_state, "planner_pid", None)
+        planner_pid = planner_pid_value if isinstance(planner_pid_value, int) and planner_pid_value > 0 else None
+        if planner_pid is not None and not get_ascend_config().enable_cpu_binding:
+            raise RuntimeError(
+                "Process-isolated STAIR requires additional_config.enable_cpu_binding=true; "
+                "the planner cannot share the worker CPU pool."
+            )
         if get_ascend_config().enable_cpu_binding:
             try:
-                bind_cpus(self.local_rank)
+                binding_plan = bind_cpus(self.local_rank, planner_pid=planner_pid)
+                if planner_pid is not None:
+                    assert eplb_state is not None
+                    if binding_plan is None or not binding_plan.planner_cpus:
+                        raise RuntimeError("STAIR planner CPU binding did not reserve a complete physical core.")
+                    eplb_state.mark_planner_affinity_ready(binding_plan.planner_cpus)
             except Exception as e:
+                if planner_pid is not None:
+                    raise RuntimeError(f"STAIR planner CPU isolation failed in rank {self.local_rank}: {e}") from e
                 logger.warning("Bind cpus failed in rank%s: %s Skip binding cpu.", self.local_rank, e)
 
         # Reset the seed to ensure that the random state is not affected by

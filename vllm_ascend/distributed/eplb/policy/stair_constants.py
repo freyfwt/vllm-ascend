@@ -7,12 +7,12 @@ These values are intentionally not part of the user configuration surface.
 Developers should update them together with focused tests and benchmarks.
 """
 
-STAIR_TUNING_VERSION = 4
+STAIR_TUNING_VERSION = 5
 
 # Cycle budgets.
-MAX_LAYERS_PER_CYCLE = 8
+MAX_LAYERS_PER_CYCLE = 1
 CANDIDATE_LAYER_SLACK = 1
-MAX_EXPERT_TRANSFERS_PER_CYCLE = 128
+MAX_EXPERT_TRANSFERS_PER_CYCLE = 16
 MAX_TRANSFER_BYTES_PER_CYCLE = 64 * 1024**3
 MAX_CROSS_NODE_BYTES_PER_CYCLE = 32 * 1024**3
 

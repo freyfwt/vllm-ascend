@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock
@@ -10,6 +11,7 @@ import pytest
 import torch
 
 from vllm_ascend.distributed.eplb import async_worker as eplb_async_worker
+from vllm_ascend.distributed.eplb.policy import stair_constants as constants
 from vllm_ascend.distributed.eplb.policy.stair_types import (
     StairBalanceScore,
     StairBudgetUsage,
@@ -240,3 +242,53 @@ def test_async_worker_logs_cycle_when_final_layer_changes(monkeypatch):
         "model",
         1,
     )
+
+
+def test_worker_rejects_overdue_nonempty_plan():
+    old_map = torch.tensor([[0, 1]], dtype=torch.int32)
+    new_map = torch.tensor([[1, 0]], dtype=torch.int32)
+    plan = replace(
+        _plan_from_mapping(old_map, new_map),
+        planner_elapsed_ms=constants.MAX_PLANNER_MS,
+    )
+
+    with pytest.raises(RuntimeError, match="overdue plan"):
+        eplb_async_worker._validate_plan_budget(plan)
+
+
+def test_nonzero_rank_adopts_rank_zero_plan(monkeypatch):
+    old_map = torch.tensor([[0, 1]], dtype=torch.int32)
+    new_map = torch.tensor([[1, 0]], dtype=torch.int32)
+    plan = _plan_from_mapping(old_map, new_map)
+    load_window = torch.ones((2, 1, 2), dtype=torch.int32)
+    model_state = SimpleNamespace(
+        eplb_stats=SimpleNamespace(global_expert_load_window=load_window),
+        _ascend_eplb_policy_load=None,
+        _ascend_eplb_active_plan=None,
+    )
+    cpu_group = MagicMock()
+    cpu_group.size.return_value = 2
+    get_global_rank = MagicMock(return_value=7)
+
+    def broadcast(payload, src, group):
+        assert src == 7
+        assert group is cpu_group
+        assert payload == [None]
+        payload[0] = plan
+
+    monkeypatch.setattr(eplb_async_worker.torch.distributed, "get_global_rank", get_global_rank)
+    monkeypatch.setattr(eplb_async_worker.torch.distributed, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(eplb_async_worker.torch.cuda, "stream", lambda stream: nullcontext())
+
+    result = eplb_async_worker._broadcast_rank_zero_plan(
+        model_state,
+        old_map,
+        MagicMock(),
+        cpu_group,
+        ep_rank=1,
+    )
+
+    assert result is plan
+    get_global_rank.assert_called_once_with(cpu_group, 0)
+    assert model_state._ascend_eplb_policy_load is load_window
+    assert model_state._ascend_eplb_active_plan is plan

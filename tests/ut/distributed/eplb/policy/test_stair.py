@@ -97,23 +97,23 @@ def test_stair_uses_full_time_series_for_temporal_acceptance(monkeypatch):
     )
     placement = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.long)
     candidate = np.array([[0, 2, 1, 3], [0, 2, 1, 3]], dtype=np.int64)
-    observed_load = None
+    observed_load: list[np.ndarray] = []
+    candidates = iter(candidate.reshape(2, 2, 2))
 
-    def fake_candidate(logical_load, current_placement, num_ranks, topology=None, deadline=None):
-        del topology, deadline
-        nonlocal observed_load
-        observed_load = logical_load.copy()
-        return candidate.copy()
+    def fake_candidate(logical_load, current_placement, topology, *, deadline=None):
+        del current_placement, topology, deadline
+        observed_load.append(logical_load.copy())
+        return next(candidates).copy()
 
     monkeypatch.setattr(
-        "vllm_ascend.distributed.eplb.policy.stair._build_incremental_candidate",
+        "vllm_ascend.distributed.eplb.policy.stair.build_greedy_layer_candidate",
         fake_candidate,
     )
     result = _rebalance(StairEplbPolicy(), load_window, placement)
 
     expected_risk_load = load_window.to(dtype=torch.float64).mean(dim=0).numpy()
     expected_risk_load += load_window.to(dtype=torch.float64).std(dim=0, unbiased=False).numpy()
-    np.testing.assert_array_equal(observed_load, expected_risk_load)
+    np.testing.assert_array_equal(np.stack(observed_load), expected_risk_load)
     torch.testing.assert_close(result[0], torch.from_numpy(candidate[0]))
     torch.testing.assert_close(result[1], placement[1])
 
@@ -121,23 +121,113 @@ def test_stair_uses_full_time_series_for_temporal_acceptance(monkeypatch):
 def test_stair_forwards_planner_deadline_to_greedy_candidate(monkeypatch):
     observed_deadline = None
 
-    def fake_candidate(logical_load, current_placement, num_ranks, topology=None, deadline=None):
-        del logical_load, num_ranks, topology
+    def fake_candidate(logical_load, current_placement, topology, *, deadline=None):
+        del logical_load, topology
         nonlocal observed_deadline
         observed_deadline = deadline
         return current_placement.copy()
 
     monkeypatch.setattr(
-        "vllm_ascend.distributed.eplb.policy.stair._build_incremental_candidate",
+        "vllm_ascend.distributed.eplb.policy.stair.build_greedy_layer_candidate",
         fake_candidate,
     )
     _rebalance(
         StairEplbPolicy(),
-        torch.ones((2, 1, 4), dtype=torch.float64),
-        torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        torch.tensor([[[1, 1, 100, 1]], [[1, 1, 100, 1]]], dtype=torch.float64),
+        torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.long),
     )
 
     assert observed_deadline is not None
+
+
+def test_temporal_gate_runs_before_candidate_construction(monkeypatch):
+    policy = StairEplbPolicy()
+    topology = policy._resolve_topology(num_nodes=1, num_ranks=2)
+    policy._shape_key = (1, 4, 4, 2, int(topology.topology_hash, 16), constants.STAIR_TUNING_VERSION)
+    policy.average_to_peak_history[0] = 1.0
+
+    def fail_candidate(*_args, **_kwargs):
+        raise AssertionError("candidate construction must not run behind the temporal gate")
+
+    monkeypatch.setattr(
+        "vllm_ascend.distributed.eplb.policy.stair.build_greedy_layer_candidate",
+        fail_candidate,
+    )
+    load = torch.tensor([[[100, 96, 1, 1]], [[96, 100, 1, 1]]], dtype=torch.float64)
+    placement = torch.tensor([[0, 2, 1, 3]], dtype=torch.long)
+
+    plan = policy.plan_rebalance(load, 4, 1, 1, 2, placement)
+
+    assert plan.selected_layers == ()
+    assert any(item.reject_reason is StairRejectReason.TEMPORAL_GATE for item in plan.rejected_layers)
+
+
+def test_mini_flash_tree_disabled_skips_search(monkeypatch):
+    policy = StairEplbPolicy()
+    search_called = False
+    monkeypatch.setattr(constants, "ENABLE_MINI_FLASH_TREE", False)
+
+    def fail_search(*_args, **_kwargs):
+        nonlocal search_called
+        search_called = True
+        raise AssertionError("search must stay disabled")
+
+    monkeypatch.setattr(
+        policy._mini_search,
+        "search",
+        fail_search,
+    )
+
+    _rebalance(
+        policy,
+        torch.tensor([[[1, 1, 100, 1]], [[1, 1, 120, 1]]], dtype=torch.float64),
+        torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.long),
+    )
+
+    assert not search_called
+
+
+def test_expired_planner_returns_safe_noop(monkeypatch):
+    monkeypatch.setattr(constants, "MAX_PLANNER_MS", 1e-9)
+    monkeypatch.setattr(constants, "MAX_SEARCH_MS_PER_LAYER", 1e-10)
+    placement = torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.long)
+
+    plan = StairEplbPolicy().plan_rebalance(
+        torch.tensor([[[1, 1, 100, 1]], [[1, 1, 120, 1]]], dtype=torch.float64),
+        6,
+        1,
+        1,
+        2,
+        placement,
+    )
+
+    assert plan.timed_out
+    assert plan.selected_layers == ()
+    torch.testing.assert_close(plan.new_mapping, placement)
+
+
+def test_production_shape_candidate_work_is_bounded(monkeypatch):
+    random = np.random.default_rng(17)
+    load = torch.from_numpy(random.lognormal(mean=2.0, sigma=1.5, size=(2, 48, 128)))
+    placement = torch.from_numpy(np.tile(np.arange(132, dtype=np.int64) % 128, (48, 1)))
+    build_count = 0
+    from vllm_ascend.distributed.eplb.policy import stair as stair_module
+
+    real_build = stair_module.build_greedy_layer_candidate
+
+    def counted_build(*args, **kwargs):
+        nonlocal build_count
+        build_count += 1
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(stair_module, "build_greedy_layer_candidate", counted_build)
+    plan = StairEplbPolicy(runtime_history=False).plan_rebalance(load, 132, 1, 1, 4, placement)
+
+    assert build_count <= constants.MAX_LAYERS_PER_CYCLE + constants.CANDIDATE_LAYER_SLACK
+    assert plan.budget_usage.selected_layers <= constants.MAX_LAYERS_PER_CYCLE
+    assert plan.budget_usage.expert_transfers <= constants.MAX_EXPERT_TRANSFERS_PER_CYCLE
+    if plan.timed_out:
+        torch.testing.assert_close(plan.new_mapping, placement)
 
 
 def test_stair_keeps_zero_load_and_balanced_placement():

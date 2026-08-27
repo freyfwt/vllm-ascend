@@ -201,7 +201,14 @@ def _default_source_assignments(
     dict[int, tuple[int, ...]],
     dict[int, tuple[int, ...]],
 ]:
-    expert_ids = np.unique(candidate)
+    changed_positions = candidate != current
+    if not np.any(changed_positions):
+        return {}, {}, {}
+    expert_ids = np.unique(
+        np.concatenate(
+            (current[changed_positions], candidate[changed_positions]),
+        )
+    )
     send_map, recv_map = _rebalance_execute.get_ep_ranks_with_experts_batch(
         expert_ids,
         current.shape[1],
@@ -361,7 +368,9 @@ def build_transfer_plan(
         default_recv_orders,
         StairSourceMode.EXECUTOR_DEFAULT,
     )
-    if not _SOURCE_ORDERING_PATCH_ENABLED:
+    if not _SOURCE_ORDERING_PATCH_ENABLED or topology.num_nodes <= 1:
+        return default_plan
+    if all(len(send_ranks) <= 1 for send_ranks in default_send_orders.values()):
         return default_plan
     chosen = _choose_low_cost_sources(default_send_orders, default_recv_orders, topology)
     if chosen is None:

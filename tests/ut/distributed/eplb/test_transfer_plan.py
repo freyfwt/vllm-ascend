@@ -72,7 +72,10 @@ def test_transfer_plan_reorders_sources_to_avoid_cross_node_bytes(monkeypatch):
     assert plan.cost.cross_node_bytes == 0
     assert plan.executor_default_cost.cross_node_bytes == 2 * 1024
     assert plan.cost.weighted_bytes < plan.executor_default_cost.weighted_bytes
-    assert _decode_executor_sources(plan.send_order(0), plan.recv_order(0)) == {
+    send_order = plan.send_order(0)
+    recv_order = plan.recv_order(0)
+    assert send_order is not None and recv_order is not None
+    assert _decode_executor_sources(send_order, recv_order) == {
         2: 1,
         3: 0,
     }
@@ -86,6 +89,26 @@ def test_transfer_plan_falls_back_when_ordering_patch_is_disabled(monkeypatch):
 
     assert plan.source_mode is StairSourceMode.EXECUTOR_DEFAULT
     assert plan.cost.cross_node_bytes == 2 * 1024
+
+
+def test_transfer_plan_skips_source_search_on_single_node(monkeypatch):
+    current = np.array([[0, 1], [2, 3]], dtype=np.int64)
+    candidate = np.array([[0, 2], [1, 3]], dtype=np.int64)
+    monkeypatch.setattr(transfer_plan_module, "_SOURCE_ORDERING_PATCH_ENABLED", True)
+    monkeypatch.setattr(
+        transfer_plan_module,
+        "_choose_low_cost_sources",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("single-node source search must be skipped")),
+    )
+
+    plan = build_transfer_plan(
+        current,
+        candidate,
+        StairTopology.contiguous(num_ranks=2, num_nodes=1),
+        expert_bytes=1,
+    )
+
+    assert plan.source_mode is StairSourceMode.EXECUTOR_DEFAULT
 
 
 def test_source_ordering_context_is_exception_safe(monkeypatch):

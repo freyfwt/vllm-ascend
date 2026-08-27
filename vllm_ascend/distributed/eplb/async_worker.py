@@ -89,6 +89,35 @@ def _run_rebalance_plan(
     return plan
 
 
+def _broadcast_rank_zero_plan(
+    model_state: "EplbModelState",
+    physical_to_logical_map_cpu: torch.Tensor,
+    cuda_stream: torch.cuda.Stream,
+    cpu_group,
+    ep_rank: int,
+) -> StairRebalancePlan:
+    """Plan once on rank zero and install the immutable result everywhere."""
+    if cpu_group.size() <= 1:
+        return _run_rebalance_plan(model_state, physical_to_logical_map_cpu, cuda_stream)
+
+    plan: StairRebalancePlan | None = None
+    if ep_rank == 0:
+        plan = _run_rebalance_plan(model_state, physical_to_logical_map_cpu, cuda_stream)
+    payload = [plan]
+    group_root = torch.distributed.get_global_rank(cpu_group, 0)
+    torch.distributed.broadcast_object_list(payload, src=group_root, group=cpu_group)
+    received = payload[0]
+    if not isinstance(received, StairRebalancePlan):
+        raise RuntimeError("STAIR rank-zero plan broadcast returned an invalid payload.")
+    if ep_rank != 0:
+        assert model_state.eplb_stats is not None
+        with torch.cuda.stream(cuda_stream):
+            load_window_cpu = model_state.eplb_stats.global_expert_load_window.cpu()
+        model_state._ascend_eplb_policy_load = load_window_cpu
+        model_state._ascend_eplb_active_plan = received
+    return received
+
+
 def _run_rebalance_experts(
     model_state: "EplbModelState",
     physical_to_logical_map_cpu: torch.Tensor,
@@ -100,6 +129,10 @@ def _run_rebalance_experts(
 
 def _validate_plan_budget(plan: StairRebalancePlan) -> None:
     usage = plan.budget_usage
+    if plan.timed_out and plan.selected_layers:
+        raise RuntimeError(f"STAIR timed-out plan {plan.plan_id} must not contain executable layers.")
+    if plan.planner_elapsed_ms >= constants.MAX_PLANNER_MS and plan.selected_layers:
+        raise RuntimeError(f"STAIR overdue plan {plan.plan_id} must not contain executable layers.")
     if (
         usage.selected_layers > constants.MAX_LAYERS_PER_CYCLE
         or usage.expert_transfers > constants.MAX_EXPERT_TRANSFERS_PER_CYCLE
@@ -107,16 +140,6 @@ def _validate_plan_budget(plan: StairRebalancePlan) -> None:
         or usage.cross_node_bytes > constants.MAX_CROSS_NODE_BYTES_PER_CYCLE
     ):
         raise RuntimeError(f"STAIR plan {plan.plan_id} exceeds an execution hard budget.")
-
-
-def _validate_plan_collectively(plan: StairRebalancePlan, cpu_group) -> None:
-    """Ensure every EPLB rank will execute the same ordered plan."""
-    if cpu_group.size() <= 1:
-        return
-    plan_ids: list[str | None] = [None] * cpu_group.size()
-    torch.distributed.all_gather_object(plan_ids, plan.plan_id, group=cpu_group)
-    if any(plan_id != plan.plan_id for plan_id in plan_ids):
-        raise RuntimeError(f"STAIR plan digest mismatch across EPLB ranks: {plan_ids}")
 
 
 def _publish_result(
@@ -160,9 +183,14 @@ def transfer_run_periodically(
             model_state.communicator.set_stream(cuda_stream)
             with torch.cuda.stream(cuda_stream):
                 old_mapping = model_state.physical_to_logical_map.cpu()
-            plan = _run_rebalance_plan(model_state, old_mapping, cuda_stream)
+            plan = _broadcast_rank_zero_plan(
+                model_state,
+                old_mapping,
+                cuda_stream,
+                eplb_cpu_group,
+                ep_rank,
+            )
             _validate_plan_budget(plan)
-            _validate_plan_collectively(plan, eplb_cpu_group)
             new_mapping = plan.new_mapping
             cycle_completed = True
 

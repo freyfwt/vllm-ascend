@@ -41,8 +41,8 @@ def test_greedy_candidate_preserves_all_placement_invariants():
 
 
 def test_hierarchical_placement_prefers_same_node_capacity():
-    current = np.array([[0, 1], [2, 3], [4, 5], [6, 1]], dtype=np.int64)
-    risk_load = np.array([100, 1, 1, 1, 1, 1, 1], dtype=np.float64)
+    current = np.array([[0, 4], [1, 2], [2, 3], [3, 5]], dtype=np.int64)
+    risk_load = np.array([100, 90, 1, 1, 1, 1], dtype=np.float64)
 
     contiguous = build_greedy_layer_candidate(
         risk_load,
@@ -55,8 +55,23 @@ def test_hierarchical_placement_prefers_same_node_capacity():
         StairTopology.from_rank_to_node((0, 1, 0, 1)),
     )
 
-    np.testing.assert_array_equal(np.flatnonzero(np.any(contiguous == 0, axis=1)), [0, 1])
-    np.testing.assert_array_equal(np.flatnonzero(np.any(noncontiguous == 0, axis=1)), [0, 2])
+    contiguous_ranks = set(np.flatnonzero(np.any(contiguous == 0, axis=1)))
+    noncontiguous_ranks = set(np.flatnonzero(np.any(noncontiguous == 0, axis=1)))
+    assert 1 in contiguous_ranks and 2 not in contiguous_ranks
+    assert 2 in noncontiguous_ranks and 1 not in noncontiguous_ranks
+
+
+def test_layer_candidate_expired_deadline_returns_current():
+    current = np.array([[0, 1, 2], [3, 0, 1]], dtype=np.int64)
+
+    candidate = build_greedy_layer_candidate(
+        np.array([1, 1, 100, 1], dtype=np.float64),
+        current,
+        StairTopology.contiguous(num_ranks=2, num_nodes=1),
+        deadline=0.0,
+    )
+
+    np.testing.assert_array_equal(candidate, current)
 
 
 def test_rank_matching_never_crosses_equivalent_group():

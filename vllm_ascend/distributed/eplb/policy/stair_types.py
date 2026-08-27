@@ -249,6 +249,7 @@ class StairRebalancePlan:
     planner_elapsed_ms: float
     plan_id: str
     topology_hash: str
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)

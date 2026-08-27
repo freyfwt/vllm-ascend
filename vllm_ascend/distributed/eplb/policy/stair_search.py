@@ -4,6 +4,7 @@
 """Topology-aware deterministic placement search for STAIR EPLB."""
 
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -57,11 +58,12 @@ def allocate_replica_counts(
 @dataclass
 class _PlacementWorkspace:
     assignments: npt.NDArray[np.int64]
-    empty_slots: list[list[int]]
-    remaining_counts: npt.NDArray[np.int64]
+    replaceable_slots: list[list[int]]
+    replaceable_positions: tuple[tuple[int, int], ...]
     rank_loads: npt.NDArray[np.float64]
     node_loads: npt.NDArray[np.float64]
     source_catalog: tuple[tuple[int, ...], ...]
+    pair_counts: Counter[tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -83,10 +85,15 @@ class MiniFlashTreeResult:
 
 
 def _build_source_catalog(current: np.ndarray, num_experts: int) -> tuple[tuple[int, ...], ...]:
-    return tuple(
-        tuple(rank for rank in range(current.shape[0]) if expert_id in current[rank])
-        for expert_id in range(num_experts)
-    )
+    sources: list[list[int]] = [[] for _ in range(num_experts)]
+    for rank_idx, rank_experts in enumerate(current):
+        for expert_id in rank_experts:
+            sources[int(expert_id)].append(rank_idx)
+    return tuple(tuple(ranks) for ranks in sources)
+
+
+def _deadline_expired(deadline: float | None) -> bool:
+    return deadline is not None and time.perf_counter() >= deadline
 
 
 def _reserve_resident_replicas(
@@ -95,20 +102,47 @@ def _reserve_resident_replicas(
     risk_load: np.ndarray,
     topology: StairTopology,
 ) -> _PlacementWorkspace:
-    """Create a workspace whose assignment costs favor resident copies."""
+    """Lock one stable resident copy and expose only redundant slots."""
     num_ranks, slots_per_rank = current.shape
     num_experts = target_counts.size
-    assignments = np.full_like(current, -1)
+    assignments = current.copy()
+    replaceable_slots: list[list[int]] = [[] for _ in range(num_ranks)]
+    primary_positions: set[tuple[int, int]] = set()
+    seen: set[int] = set()
+    for slot_idx in range(slots_per_rank):
+        for rank_idx in range(num_ranks):
+            expert_id = int(current[rank_idx, slot_idx])
+            if expert_id in seen:
+                replaceable_slots[rank_idx].append(slot_idx)
+            else:
+                seen.add(expert_id)
+                primary_positions.add((rank_idx, slot_idx))
+    if len(seen) != num_experts:
+        raise ValueError("Every logical expert must have at least one physical replica.")
+
+    replaceable_positions = tuple(
+        (rank_idx, slot_idx) for rank_idx, slots in enumerate(replaceable_slots) for slot_idx in slots
+    )
+    if len(replaceable_positions) != int(target_counts.sum()) - num_experts:
+        raise ValueError("STAIR target counts do not match the available redundant slots.")
+    for rank_idx, slot_idx in replaceable_positions:
+        assignments[rank_idx, slot_idx] = -1
+
+    target_load = risk_load / target_counts
     rank_loads = np.zeros(num_ranks, dtype=np.float64)
     node_loads: npt.NDArray[np.float64] = np.zeros(topology.num_nodes, dtype=np.float64)
-    empty_slots = [list(range(slots_per_rank)) for _ in range(num_ranks)]
+    for rank_idx, slot_idx in primary_positions:
+        expert_id = int(assignments[rank_idx, slot_idx])
+        rank_loads[rank_idx] += target_load[expert_id]
+        node_loads[topology.rank_to_node[rank_idx]] += target_load[expert_id]
     return _PlacementWorkspace(
         assignments=assignments,
-        empty_slots=empty_slots,
-        remaining_counts=target_counts.copy(),
+        replaceable_slots=replaceable_slots,
+        replaceable_positions=replaceable_positions,
         rank_loads=rank_loads,
         node_loads=node_loads,
         source_catalog=_build_source_catalog(current, num_experts),
+        pair_counts=Counter(),
     )
 
 
@@ -129,52 +163,76 @@ def _assign_replica_ranks(
     target_counts: np.ndarray,
     risk_load: np.ndarray,
     topology: StairTopology,
+    deadline: float | None = None,
 ) -> npt.NDArray[np.int64] | None:
-    """Assign missing replicas to low-load ranks with topology-local sources."""
+    """Place only redundant replicas with topology and pair budgets."""
     target_load = risk_load / target_counts
     ranks_per_node = np.bincount(topology.rank_to_node, minlength=topology.num_nodes)
-    while np.any(workspace.remaining_counts > 0):
-        candidates_by_expert = {
-            expert_id: [
-                rank
-                for rank, slots in enumerate(workspace.empty_slots)
-                if slots and expert_id not in workspace.assignments[rank]
-            ]
-            for expert_id in np.flatnonzero(workspace.remaining_counts > 0)
-        }
-        if any(
-            len(candidates) < workspace.remaining_counts[expert_id]
-            for expert_id, candidates in candidates_by_expert.items()
-        ):
+    replicas_to_place = [expert_id for expert_id, count in enumerate(target_counts) for _ in range(int(count) - 1)]
+    replicas_to_place.sort(key=lambda expert_id: (-target_load[expert_id], expert_id))
+    assigned_counts: npt.NDArray[np.int64] = np.ones(target_counts.size, dtype=np.int64)
+
+    for requested_expert in replicas_to_place:
+        if _deadline_expired(deadline):
             return None
-        expert_id = min(
-            candidates_by_expert,
-            key=lambda candidate_expert: (
-                len(candidates_by_expert[candidate_expert]) - workspace.remaining_counts[candidate_expert],
-                -target_load[candidate_expert],
-                candidate_expert,
+        fallback_experts = sorted(
+            (expert_id for expert_id in range(target_counts.size) if expert_id != requested_expert),
+            key=lambda expert_id: (
+                assigned_counts[expert_id] >= target_counts[expert_id],
+                -risk_load[expert_id] / (assigned_counts[expert_id] + 1),
+                expert_id,
             ),
         )
-        candidates = candidates_by_expert[expert_id]
-
-        def candidate_key(
-            rank: int,
-            current_expert_id: int = expert_id,
-        ) -> tuple[float, float, float, int]:
-            node_id = topology.rank_to_node[rank]
-            transfer_tier = _transfer_tier(workspace.source_catalog[current_expert_id], rank, topology)
-            transfer_cost = (
-                constants.INTRA_NODE_COST_MULTIPLIER if transfer_tier <= 1 else constants.CROSS_NODE_COST_MULTIPLIER
-            )
-            normalized_node_load = workspace.node_loads[node_id] / ranks_per_node[node_id]
-            return transfer_cost, normalized_node_load, workspace.rank_loads[rank], rank
-
-        rank = min(candidates, key=candidate_key)
-        slot = workspace.empty_slots[rank].pop(0)
+        chosen: tuple[int, int, int] | None = None
+        for expert_id in (requested_expert, *fallback_experts):
+            candidates: list[tuple[tuple[float, float, float, int, int], int, int]] = []
+            for rank, slots in enumerate(workspace.replaceable_slots):
+                if not slots or expert_id in workspace.assignments[rank]:
+                    continue
+                source_options = []
+                for source_rank in workspace.source_catalog[expert_id]:
+                    pair_count = workspace.pair_counts[(source_rank, rank)]
+                    if source_rank != rank and pair_count >= constants.MAX_TRANSFERS_PER_RANK_PAIR:
+                        continue
+                    source_options.append(
+                        (
+                            _transfer_tier((source_rank,), rank, topology),
+                            pair_count,
+                            source_rank,
+                        )
+                    )
+                if not source_options:
+                    continue
+                transfer_tier, pair_count, source_rank = min(source_options)
+                node_id = topology.rank_to_node[rank]
+                normalized_node_load = workspace.node_loads[node_id] / ranks_per_node[node_id]
+                key = (
+                    float(transfer_tier),
+                    normalized_node_load,
+                    workspace.rank_loads[rank],
+                    pair_count,
+                    rank,
+                )
+                candidates.append((key, rank, source_rank))
+            if candidates:
+                _, rank, source_rank = min(candidates, key=lambda item: item[0])
+                chosen = expert_id, rank, source_rank
+                break
+        if chosen is None:
+            return None
+        expert_id, rank, source_rank = chosen
+        slot = workspace.replaceable_slots[rank].pop(0)
         workspace.assignments[rank, slot] = expert_id
-        workspace.rank_loads[rank] += target_load[expert_id]
-        workspace.node_loads[topology.rank_to_node[rank]] += target_load[expert_id]
-        workspace.remaining_counts[expert_id] -= 1
+        assigned_counts[expert_id] += 1
+        per_replica_load = risk_load / assigned_counts
+        workspace.rank_loads.fill(0.0)
+        workspace.node_loads.fill(0.0)
+        for assigned_rank, rank_experts in enumerate(workspace.assignments):
+            valid_experts = rank_experts[rank_experts >= 0]
+            workspace.rank_loads[assigned_rank] = per_replica_load[valid_experts].sum()
+            workspace.node_loads[topology.rank_to_node[assigned_rank]] += workspace.rank_loads[assigned_rank]
+        if source_rank != rank:
+            workspace.pair_counts[(source_rank, rank)] += 1
     return workspace.assignments
 
 
@@ -182,49 +240,74 @@ def _improve_by_swaps(
     candidate: np.ndarray,
     risk_load: np.ndarray,
     topology: StairTopology,
+    protected_positions: tuple[tuple[int, int], ...] | None = None,
+    deadline: float | None = None,
 ) -> np.ndarray:
-    """Bounded local search that prices cross-node swaps conservatively."""
+    """Relocate redundant capacity with a bounded hot/cold rank search."""
     improved = candidate.copy()
+    protected = set(protected_positions or ())
+    if not protected:
+        return improved
     counts = replica_counts(improved, risk_load.size)
     per_replica_load = risk_load / counts
     rank_load = np.sum(per_replica_load[improved], axis=1)
     minimum_gain = risk_load.sum() / improved.shape[0] * constants.SWAP_IMPROVEMENT_RATIO
-    for _ in range(constants.MAX_SWAP_ATTEMPTS):
+    rank_experts = [set(int(expert) for expert in rank) for rank in improved]
+    attempt_limit = min(constants.MAX_SWAP_ATTEMPTS, len(protected) * 2)
+    for _ in range(attempt_limit):
+        if _deadline_expired(deadline):
+            return candidate.copy()
         best: tuple[float, int, int, int, int] | None = None
-        hot_ranks = np.argsort(rank_load, kind="stable")[::-1]
-        for hot_rank_value in hot_ranks:
-            hot_rank = int(hot_rank_value)
-            for cold_rank_value in np.argsort(rank_load, kind="stable"):
-                cold_rank = int(cold_rank_value)
-                if cold_rank == hot_rank or rank_load[cold_rank] >= rank_load[hot_rank]:
+        hot_rank = int(np.argmax(rank_load))
+        for cold_rank_value in np.argsort(rank_load, kind="stable"):
+            cold_rank = int(cold_rank_value)
+            if cold_rank == hot_rank or rank_load[cold_rank] >= rank_load[hot_rank]:
+                continue
+            cost_multiplier = (
+                constants.INTRA_NODE_COST_MULTIPLIER
+                if topology.same_node(hot_rank, cold_rank)
+                else constants.CROSS_NODE_COST_MULTIPLIER
+            )
+            hot_slots = [
+                int(slot)
+                for slot in np.argsort(per_replica_load[improved[hot_rank]], kind="stable")[::-1]
+                if (hot_rank, int(slot)) not in protected
+            ][: constants.MAX_SWAP_SLOT_CANDIDATES]
+            cold_slots = [
+                int(slot)
+                for slot in np.argsort(per_replica_load[improved[cold_rank]], kind="stable")
+                if (cold_rank, int(slot)) not in protected
+            ][: constants.MAX_SWAP_SLOT_CANDIDATES]
+            for hot_slot in hot_slots:
+                hot_expert_value = improved[hot_rank, hot_slot]
+                hot_expert = int(hot_expert_value)
+                if hot_expert in rank_experts[cold_rank]:
                     continue
-                cost_multiplier = (
-                    constants.INTRA_NODE_COST_MULTIPLIER
-                    if topology.same_node(hot_rank, cold_rank)
-                    else constants.CROSS_NODE_COST_MULTIPLIER
-                )
-                for hot_slot, hot_expert in enumerate(improved[hot_rank]):
-                    if hot_expert in improved[cold_rank]:
+                for cold_slot in cold_slots:
+                    cold_expert_value = improved[cold_rank, cold_slot]
+                    cold_expert = int(cold_expert_value)
+                    if cold_expert in rank_experts[hot_rank]:
                         continue
-                    for cold_slot, cold_expert in enumerate(improved[cold_rank]):
-                        if cold_expert in improved[hot_rank]:
-                            continue
-                        hot_after = rank_load[hot_rank] - per_replica_load[hot_expert] + per_replica_load[cold_expert]
-                        cold_after = rank_load[cold_rank] - per_replica_load[cold_expert] + per_replica_load[hot_expert]
-                        gain = rank_load[hot_rank] - max(hot_after, cold_after)
-                        if gain <= minimum_gain * cost_multiplier:
-                            continue
-                        value = (gain / cost_multiplier, -hot_rank, -cold_rank, -hot_slot, -cold_slot)
-                        if best is None or value > best:
-                            best = value
+                    hot_after = rank_load[hot_rank] - per_replica_load[hot_expert] + per_replica_load[cold_expert]
+                    cold_after = rank_load[cold_rank] - per_replica_load[cold_expert] + per_replica_load[hot_expert]
+                    gain = rank_load[hot_rank] - max(hot_after, cold_after)
+                    if gain <= minimum_gain * cost_multiplier:
+                        continue
+                    value = (gain / cost_multiplier, -hot_rank, -cold_rank, -hot_slot, -cold_slot)
+                    if best is None or value > best:
+                        best = value
         if best is None:
             break
         _, neg_hot_rank, neg_cold_rank, neg_hot_slot, neg_cold_slot = best
         hot_rank, cold_rank = -neg_hot_rank, -neg_cold_rank
         hot_slot, cold_slot = -neg_hot_slot, -neg_cold_slot
-        hot_expert = improved[hot_rank, hot_slot]
-        cold_expert = improved[cold_rank, cold_slot]
+        hot_expert = int(improved[hot_rank, hot_slot])
+        cold_expert = int(improved[cold_rank, cold_slot])
         improved[hot_rank, hot_slot], improved[cold_rank, cold_slot] = cold_expert, hot_expert
+        rank_experts[hot_rank].remove(hot_expert)
+        rank_experts[hot_rank].add(cold_expert)
+        rank_experts[cold_rank].remove(cold_expert)
+        rank_experts[cold_rank].add(hot_expert)
         rank_load[hot_rank] += per_replica_load[cold_expert] - per_replica_load[hot_expert]
         rank_load[cold_rank] += per_replica_load[hot_expert] - per_replica_load[cold_expert]
     return improved
@@ -380,12 +463,30 @@ def build_candidate_from_replica_counts(
         or np.any(target_counts > num_ranks)
     ):
         raise ValueError("STAIR search replica counts violate placement bounds.")
-    workspace = _reserve_resident_replicas(current, target_counts, risk_load, topology)
-    assigned = _assign_replica_ranks(workspace, target_counts, risk_load, topology)
-    if assigned is None:
+    if _deadline_expired(deadline):
         return current.copy()
-    desired = _improve_by_swaps(assigned, risk_load, topology)
+    workspace = _reserve_resident_replicas(current, target_counts, risk_load, topology)
+    assigned = _assign_replica_ranks(
+        workspace,
+        target_counts,
+        risk_load,
+        topology,
+        deadline,
+    )
+    if assigned is None or _deadline_expired(deadline):
+        return current.copy()
+    desired = _improve_by_swaps(
+        assigned,
+        risk_load,
+        topology,
+        workspace.replaceable_positions,
+        deadline,
+    )
+    if _deadline_expired(deadline):
+        return current.copy()
     matched = _match_equivalent_ranks(current, desired, topology, deadline)
+    if _deadline_expired(deadline):
+        return current.copy()
     candidate = align_local_slots(current, matched)
     validate_layer_placement(candidate, num_experts, num_ranks)
     current_score = compute_balance_metrics(risk_load[None, :], current).mean_imbalance
@@ -498,14 +599,21 @@ def build_greedy_candidate(
     slots_per_rank = current_placement.shape[1] // num_ranks
     current_by_rank = current_placement.reshape(num_layers, num_ranks, slots_per_rank)
     candidate = current_by_rank.copy()
-    for layer_idx in range(num_layers):
-        if deadline is not None and time.perf_counter() >= deadline:
-            break
-        current_score = compute_balance_metrics(
+    current_scores = [
+        compute_balance_metrics(
             risk_load[layer_idx : layer_idx + 1],
             current_by_rank[layer_idx],
         ).mean_imbalance
-        if current_score < constants.IMBALANCE_THRESHOLD:
+        for layer_idx in range(num_layers)
+    ]
+    layer_order = sorted(
+        range(num_layers),
+        key=lambda layer_idx: (-current_scores[layer_idx], layer_idx),
+    )
+    for layer_idx in layer_order:
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
+        if current_scores[layer_idx] < constants.IMBALANCE_THRESHOLD:
             continue
         candidate[layer_idx] = build_greedy_layer_candidate(
             risk_load[layer_idx],

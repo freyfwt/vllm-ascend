@@ -37,3 +37,7 @@ def test_ring_tracks_model_local_execution_phase():
     ring.record(torch.zeros(1, 1), torch.zeros(1, 1, dtype=torch.long), 1, executed=False, has_prefill=True)
     ring.record(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.long), 2, executed=True, has_prefill=True)
     assert ring.chronological_metadata() == ((False, False), (True, True))
+
+    sums, lengths = ring.compressed_selected_sums([1], 4)
+    assert lengths == (1,)
+    torch.testing.assert_close(sums.flatten(), torch.ones(1, dtype=torch.int64))

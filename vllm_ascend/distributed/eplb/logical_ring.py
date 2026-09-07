@@ -92,6 +92,21 @@ class LogicalLoadRing:
         sums = torch.stack([values[start:end].sum(dim=0, dtype=torch.int64) for start, end in zip(boundaries[:-1], boundaries[1:])])
         return sums, lengths
 
+    def compressed_selected_sums(
+        self,
+        indices: list[int],
+        sample_size: int,
+    ) -> tuple[torch.Tensor, tuple[int, ...]]:
+        if not indices:
+            raise ValueError("STAIR cannot compress an empty selected window")
+        index = torch.tensor(indices, dtype=torch.long, device=self.values.device)
+        values = self.chronological().index_select(0, index)
+        bins = min(sample_size, len(indices))
+        boundaries = [item * len(indices) // bins for item in range(bins + 1)]
+        lengths = tuple(end - start for start, end in zip(boundaries[:-1], boundaries[1:]))
+        sums = torch.stack([values[start:end].sum(dim=0, dtype=torch.int64) for start, end in zip(boundaries[:-1], boundaries[1:])])
+        return sums, lengths
+
     def key_digest(self) -> str:
         payload = b"".join(key.to_bytes(8, "little", signed=True) for key in self.chronological_keys())
         return hashlib.sha256(payload).hexdigest()

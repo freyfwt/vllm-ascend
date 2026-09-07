@@ -253,6 +253,44 @@ class TestNPUPlatform(TestBase):
         with self.assertRaisesRegex(ValueError, "legacy fields are not supported: dynamic_eplb"):
             _validate_eplb_config(vllm_config)
 
+    def test_validate_eplb_config_accepts_stair(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.eplb_config = MagicMock(
+            use_async=True,
+            communicator="torch_gloo",
+            policy="default",
+            num_redundant_experts=1,
+        )
+        vllm_config.additional_config = {"eplb_config": {"algorithm": "stair"}}
+
+        with patch.dict("os.environ", {}, clear=True):
+            _validate_eplb_config(vllm_config)
+
+    def test_validate_eplb_config_rejects_stair_without_async(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.parallel_config.enable_eplb = True
+        vllm_config.parallel_config.eplb_config = MagicMock(
+            use_async=False,
+            communicator="torch_gloo",
+            policy="default",
+            num_redundant_experts=1,
+        )
+        vllm_config.additional_config = {"eplb_config": {"algorithm": "stair"}}
+
+        with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(ValueError, "use_async"):
+            _validate_eplb_config(vllm_config)
+
+    def test_validate_eplb_config_rejects_unused_stair_config(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+        vllm_config.additional_config = {"eplb_config": {"stair_config": {}}}
+
+        with self.assertRaisesRegex(ValueError, "requires algorithm='stair'"):
+            _validate_eplb_config(vllm_config)
+
     def test_validate_eplb_config_rejects_v1_load_collection_phase(self):
         vllm_config = self.mock_vllm_config()
         vllm_config.use_v2_model_runner = False

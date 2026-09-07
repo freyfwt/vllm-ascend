@@ -857,11 +857,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
 
     use_v2_model_runner = bool(getattr(vllm_config, "use_v2_model_runner", False))
     if use_v2_model_runner:
-        legacy_eplb_fields = sorted(set(eplb_config) - {"load_collection_phase"})
+        supported_fields = {"algorithm", "load_collection_phase", "stair_config"}
+        legacy_eplb_fields = sorted(set(eplb_config) - supported_fields)
         if legacy_eplb_fields:
             raise ValueError(
-                "Model Runner V2 only accepts 'load_collection_phase' in "
-                "additional_config.eplb_config; legacy fields are not supported: "
+                "Model Runner V2 legacy fields are not supported: "
                 f"{', '.join(legacy_eplb_fields)}."
             )
         if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv(
@@ -872,6 +872,11 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                 "Unset them and use --enable-eplb with Model Runner V2."
             )
         load_collection_phase = eplb_config.get("load_collection_phase", "all")
+        algorithm = eplb_config.get("algorithm", "default")
+        if "stair_config" in eplb_config and algorithm != "stair":
+            raise ValueError("additional_config.eplb_config.stair_config requires algorithm='stair'.")
+        if algorithm == "stair" and not vllm_config.parallel_config.enable_eplb:
+            raise ValueError("STAIR requires --enable-eplb.")
         if load_collection_phase != "all" and not vllm_config.parallel_config.enable_eplb:
             raise ValueError("additional_config.eplb_config.load_collection_phase requires --enable-eplb.")
         if vllm_config.parallel_config.enable_eplb:
@@ -882,6 +887,13 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                     f"(CPU staging), but got {upstream_eplb_config.communicator!r}. "
                     "Set eplb_config.communicator to 'torch_gloo'."
                 )
+            if algorithm == "stair":
+                if upstream_eplb_config.policy != "default":
+                    raise ValueError("STAIR requires upstream eplb_config.policy='default'.")
+                if not upstream_eplb_config.use_async:
+                    raise ValueError("STAIR requires eplb_config.use_async=true.")
+                if upstream_eplb_config.num_redundant_experts <= 0:
+                    raise ValueError("STAIR requires eplb_config.num_redundant_experts>0.")
             if not upstream_eplb_config.use_async:
                 logger.warning(
                     "Synchronous EPLB is not supported on Ascend; "
@@ -892,10 +904,10 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
                 upstream_eplb_config.communicator = "torch_gloo"
             if vllm_config.parallel_config.enable_elastic_ep:
                 raise ValueError("Async EPLB is not supported with elastic EP on Ascend.")
-    elif "load_collection_phase" in eplb_config:
+    elif {"algorithm", "load_collection_phase", "stair_config"} & eplb_config.keys():
         raise ValueError(
-            "additional_config.eplb_config.load_collection_phase is only supported by "
-            "Model Runner V2; use eplb_heat_collection_stage with Model Runner V1."
+            "additional_config.eplb_config STAIR and load_collection_phase options are "
+            "only supported by Model Runner V2."
         )
     elif vllm_config.parallel_config.enable_eplb:
         raise ValueError("Upstream EPLB is only supported by Model Runner V2 on Ascend.")

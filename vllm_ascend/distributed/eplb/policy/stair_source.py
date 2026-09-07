@@ -26,14 +26,7 @@ def _minimum_cost(
     """Solve the pair-capacitated bipartite flow using stable augmenting paths."""
     if not demands:
         return 0
-    pairs = sorted(
-        {
-            (src, dst)
-            for dst, expert in demands
-            for src in owners[expert]
-            if capacity.get((src, dst), 0) > 0
-        }
-    )
+    pairs = sorted({(src, dst) for dst, expert in demands for src in owners[expert] if capacity.get((src, dst), 0) > 0})
     pair_node = {pair: len(demands) + 1 + index for index, pair in enumerate(pairs)}
     sink = len(demands) + len(pairs) + 1
     graph: list[list[list[int]]] = [[] for _ in range(sink + 1)]

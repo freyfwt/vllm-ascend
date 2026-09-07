@@ -18,6 +18,7 @@ _HEADER = struct.Struct("<8sHHII")
 _SPEC = struct.Struct("<iQQ5Q5I")
 _CONFIG = struct.Struct("<Id?d?ddIdddIIIId")
 
+
 class WireOp(IntEnum):
     INITIALIZE = 1
     ACK = 2
@@ -26,12 +27,14 @@ class WireOp(IntEnum):
     SHUTDOWN = 5
     ERROR = 6
 
+
 @dataclass(frozen=True)
 class PlannerRegistration:
     model_id: str
     shared: SharedSnapshotSpec
     topology: RankTopology
     config: StairConfig
+
 
 def crc32c(payload: bytes) -> int:
     value = 0xFFFFFFFF

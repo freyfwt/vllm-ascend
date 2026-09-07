@@ -90,10 +90,7 @@ class LogicalLoadRing:
         boundaries = [index * self.valid_size // bins for index in range(bins + 1)]
         lengths = tuple(end - start for start, end in zip(boundaries[:-1], boundaries[1:]))
         sums = torch.stack(
-            [
-                values[start:end].sum(dim=0, dtype=torch.int64)
-                for start, end in zip(boundaries[:-1], boundaries[1:])
-            ]
+            [values[start:end].sum(dim=0, dtype=torch.int64) for start, end in zip(boundaries[:-1], boundaries[1:])]
         )
         return sums, lengths
 
@@ -110,10 +107,7 @@ class LogicalLoadRing:
         boundaries = [item * len(indices) // bins for item in range(bins + 1)]
         lengths = tuple(end - start for start, end in zip(boundaries[:-1], boundaries[1:]))
         sums = torch.stack(
-            [
-                values[start:end].sum(dim=0, dtype=torch.int64)
-                for start, end in zip(boundaries[:-1], boundaries[1:])
-            ]
+            [values[start:end].sum(dim=0, dtype=torch.int64) for start, end in zip(boundaries[:-1], boundaries[1:])]
         )
         return sums, lengths
 

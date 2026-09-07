@@ -27,8 +27,7 @@ def passes_hysteresis(current_score: float, anchor: float | None, config: StairC
     current_balance = 1.0 / current_score
     anchor_balance = 1.0 / anchor
     return (
-        current_balance / anchor_balance <= config.hysteresis_relative
-        or current_balance <= config.hysteresis_absolute
+        current_balance / anchor_balance <= config.hysteresis_relative or current_balance <= config.hysteresis_absolute
     )
 
 

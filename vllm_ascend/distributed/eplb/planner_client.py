@@ -47,9 +47,7 @@ class PlannerClient:
         self._active: PlanRequest | None = None
         self._active_since = 0.0
         try:
-            self._process, self._connection = spawn_planner(
-                tuple(shared.spec.fd for shared in self._shared.values())
-            )
+            self._process, self._connection = spawn_planner(tuple(shared.spec.fd for shared in self._shared.values()))
         except BaseException:
             self._close_shared()
             raise
@@ -182,16 +180,12 @@ class PlannerClient:
         try:
             if self._process.poll() is None:
                 if self._active is not None:
-                    operation, _ = self._receive(
-                        self._models[self._active.model_id].config.planner_heartbeat_timeout_s
-                    )
+                    operation, _ = self._receive(self._models[self._active.model_id].config.planner_heartbeat_timeout_s)
                     if operation != WireOp.RESULT:
                         raise PlannerProcessError("STAIR planner drain failed")
                     self._active = None
                 send_frame(self._connection, WireOp.SHUTDOWN)
-                shutdown_timeout = max(
-                    model.config.planner_heartbeat_timeout_s for model in self._models.values()
-                )
+                shutdown_timeout = max(model.config.planner_heartbeat_timeout_s for model in self._models.values())
                 operation, payload = self._receive(shutdown_timeout)
                 if operation != WireOp.ACK or payload != b"shutdown":
                     raise PlannerProcessError("STAIR planner shutdown acknowledgement mismatch")

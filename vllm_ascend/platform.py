@@ -860,10 +860,7 @@ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
         supported_fields = {"algorithm", "load_collection_phase", "stair_config"}
         legacy_eplb_fields = sorted(set(eplb_config) - supported_fields)
         if legacy_eplb_fields:
-            raise ValueError(
-                "Model Runner V2 legacy fields are not supported: "
-                f"{', '.join(legacy_eplb_fields)}."
-            )
+            raise ValueError(f"Model Runner V2 legacy fields are not supported: {', '.join(legacy_eplb_fields)}.")
         if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv(
             "EXPERT_MAP_RECORD", "false"
         ).lower() in ("true", "1"):

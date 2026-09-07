@@ -138,8 +138,9 @@ class AscendEplbState(_eplb_state.EplbState):
             )
 
     def note_stair_execution(self, model_config: Any, has_prefill: bool) -> None:
-        if self.stair is not None:
-            self.stair.note_execution(model_config.compute_hash(), has_prefill)
+        stair = getattr(self, "stair", None)
+        if stair is not None:
+            stair.note_execution(model_config.compute_hash(), has_prefill)
 
     def prepare_forward(self, model_config: Any, num_unpadded_tokens: int, ubatch_slices=None) -> None:
         super().prepare_forward(model_config, num_unpadded_tokens, ubatch_slices)
@@ -167,31 +168,32 @@ class AscendEplbState(_eplb_state.EplbState):
         is_profile: bool = False,
         log_stats: bool = False,
     ) -> None:
-        if self.stair is None:
+        stair = getattr(self, "stair", None)
+        if stair is None:
             super().step(is_dummy=is_dummy, is_profile=is_profile, log_stats=log_stats)
             return
         if is_profile:
-            self.stair.discard_step()
+            stair.discard_step()
             super().step(is_dummy=is_dummy, is_profile=True, log_stats=log_stats)
             return
         if is_dummy:
-            self.stair.discard_step()
+            stair.discard_step()
         else:
-            self.stair.record_step()
+            stair.record_step()
 
-        self.stair.poll_and_broadcast()
-        self.stair.start_next_layer()
-        self.stair.check_worker_health()
-        active = self.stair.active_model_state
+        stair.poll_and_broadcast()
+        stair.start_next_layer()
+        stair.check_worker_health()
+        active = stair.active_model_state
         if active is not None and self._all_ranks_result_ready(active):
             ep_rank = get_ep_group().device_group.rank()
             _eplb_state._move_to_workspace(model_state=active, ep_rank=ep_rank)
-            self.stair.finish_active_layer()
+            stair.finish_active_layer()
 
         self.expert_rearrangement_step += 1
         if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
             self.expert_rearrangement_step = 0
-            self.stair.snapshot()
+            stair.snapshot()
         if self.should_record_tensor is not None:
             self.should_record_tensor.fill_(True)
 

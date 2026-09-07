@@ -82,7 +82,7 @@ class AscendEPLBController(EPLBController):
         if state is None or not self.parallel_config.enable_eplb:
             return
         state.prepare_forward(model_config, num_unpadded_tokens, ubatch_slices)
-        if state.stair is not None:
+        if self.algorithm == "stair":
             state.note_stair_execution(model_config, self._batch_has_prefill)
             if state.should_record_tensor is not None:
                 state.should_record_tensor.fill_(True)

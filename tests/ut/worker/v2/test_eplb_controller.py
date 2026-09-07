@@ -181,6 +181,7 @@ class TestAscendEPLBController(unittest.TestCase):
 
     def test_prepare_forward_records_stair_execution_before_phase_filter(self):
         controller = self._make_controller()
+        controller.algorithm = "stair"
         controller.set_batch_phase(True)
         state = MagicMock()
         state.stair = object()

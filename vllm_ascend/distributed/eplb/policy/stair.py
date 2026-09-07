@@ -22,6 +22,7 @@ def plan_rebalance(
     model_id: str,
     planning_round: int,
     snapshot_sequence: int,
+    sample_sequence: int,
     stats_schema_epoch: int,
 ) -> RebalancePlan:
     """Plan every layer that passes the load, balance, and hysteresis gates."""
@@ -57,6 +58,7 @@ def plan_rebalance(
         model_id,
         planning_round,
         snapshot_sequence,
+        sample_sequence,
         stats_schema_epoch,
         config_digest(config),
         topology.digest(),

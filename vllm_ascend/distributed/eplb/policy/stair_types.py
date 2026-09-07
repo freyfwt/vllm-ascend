@@ -74,6 +74,7 @@ class RebalancePlan:
     model_id: str
     planning_round: int
     snapshot_sequence: int
+    sample_sequence: int
     stats_schema_epoch: int
     config_digest: str
     topology_digest: str
@@ -85,6 +86,7 @@ class RebalancePlan:
             self.model_id,
             str(self.planning_round),
             str(self.snapshot_sequence),
+            str(self.sample_sequence),
             str(self.stats_schema_epoch),
             self.config_digest,
             self.topology_digest,

@@ -30,7 +30,7 @@ def test_plan_digest_is_discrete_and_deterministic():
         BalanceScore(1.2, 1.3, 1.4),
         BalanceScore(1.0, 1.0, 1.0),
     )
-    plan = RebalancePlan("model", 2, 3, 4, "config", "topology", (layer,))
+    plan = RebalancePlan("model", 2, 3, 4, 5, "config", "topology", (layer,))
     changed_telemetry = LayerPlan(
         1,
         placement.copy(),
@@ -41,7 +41,7 @@ def test_plan_digest_is_discrete_and_deterministic():
         BalanceScore(9, 9, 9),
         BalanceScore(8, 8, 8),
     )
-    assert plan.digest() == RebalancePlan("model", 2, 3, 4, "config", "topology", (changed_telemetry,)).digest()
+    assert plan.digest() == RebalancePlan("model", 2, 3, 4, 5, "config", "topology", (changed_telemetry,)).digest()
 
 
 def test_topology_requires_rank_bijection():

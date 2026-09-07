@@ -24,6 +24,7 @@ def _plan(load, *, anchors=(None,), **overrides):
         model_id="model",
         planning_round=2,
         snapshot_sequence=3,
+        sample_sequence=6,
         stats_schema_epoch=4,
     )
 
@@ -65,6 +66,7 @@ def test_hysteresis_uses_last_committed_predicted_score():
         model_id="model",
         planning_round=1,
         snapshot_sequence=1,
+        sample_sequence=1,
         stats_schema_epoch=1,
     )
     assert not plan.layers

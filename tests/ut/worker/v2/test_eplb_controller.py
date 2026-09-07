@@ -66,6 +66,12 @@ class TestAscendEPLBController(unittest.TestCase):
         controller.set_batch_phase(batch_has_prefill=False)
         self.assertFalse(controller._load_collection_phase_matched)
 
+    def test_close_releases_stair_state(self):
+        controller = self._make_controller()
+        controller.state = MagicMock()
+        controller.close()
+        controller.state.close_stair.assert_called_once_with()
+
     def test_step_early_return_conditions(self):
         for condition in (
             "disabled",

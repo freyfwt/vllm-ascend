@@ -218,6 +218,12 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_mask(vllm_config, self.device)
         set_potential_max_tokens(vllm_config)
 
+    def shutdown(self) -> None:
+        self.eplb.close()
+        parent_shutdown = getattr(super(), "shutdown", None)
+        if parent_shutdown is not None:
+            parent_shutdown()
+
     @property
     def pcp_manager_cls(self) -> type[AscendPCPManager]:
         return AscendPCPManager

@@ -5,6 +5,7 @@
 
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +60,7 @@ class StairTransferWorker:
         self._ep_rank = ep_rank
         self._queue: queue.Queue[TransferWork | None] = queue.Queue()
         self.failure: BaseException | None = None
+        self._current: TransferWork | None = None
         self._thread = threading.Thread(target=self._run, name="stair-transfer", daemon=True)
         self._thread.start()
 
@@ -72,15 +74,24 @@ class StairTransferWorker:
             torch.accelerator.set_device_index(self._device_index)
             stream = torch.cuda.Stream(device=self._device_index)
             while (work := self._queue.get()) is not None:
+                self._current = work
                 result = transfer_one_layer(work, ep_rank=self._ep_rank, stream=stream)
                 work.model_state.pending_result = result
                 result.consumed_event.wait(stream=stream)
                 if work.model_state.pending_result is not None:
                     raise RuntimeError("STAIR result was acknowledged without being consumed")
+                self._current = None
         except BaseException as error:  # pragma: no cover - hardware/runtime failure
             self.failure = error
             logger.exception("STAIR transfer worker failed: %s", error)
 
     def close(self) -> None:
         self._queue.put(None)
-        self._thread.join()
+        while self._thread.is_alive():
+            work = self._current
+            result = None if work is None else work.model_state.pending_result
+            if result is not None:
+                work.model_state.pending_result = None
+                result.consumed_event.record()
+            self._thread.join(timeout=0.01)
+            time.sleep(0.001)

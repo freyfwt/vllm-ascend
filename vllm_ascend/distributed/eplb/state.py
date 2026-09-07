@@ -147,6 +147,10 @@ class AscendEplbState(_eplb_state.EplbState):
             raise ValueError("STAIR does not support elastic or profile transfer loops")
         self.stair.start()
 
+    def close_stair(self) -> None:
+        if self.stair is not None:
+            self.stair.close()
+
     def step(
         self,
         is_dummy: bool = False,

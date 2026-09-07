@@ -335,5 +335,12 @@ class StairCoordinator:
     def close(self) -> None:
         if self.worker is not None:
             self.worker.close()
+        if self._active_layer is not None:
+            _, runtime, _ = self._active_layer
+            runtime.model_state.rebalanced = False
+            if hasattr(runtime.model_state, "_stair_pending_layer"):
+                del runtime.model_state._stair_pending_layer
+            self._active_layer = None
+        self._execution_queue.clear()
         if self.planner is not None:
             self.planner.close()

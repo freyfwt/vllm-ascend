@@ -1,11 +1,15 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 
 from vllm_ascend.distributed.eplb.policy.stair_types import BalanceScore, LayerPlan, RankTopology
-from vllm_ascend.distributed.eplb.stair_worker import TransferWork, transfer_one_layer
+from vllm_ascend.distributed.eplb.stair_worker import (
+    StairTransferWorker,
+    TransferWork,
+    transfer_one_layer,
+)
 
 
 class FakeCommunicator:
@@ -53,3 +57,18 @@ def test_transfer_worker_builds_upstream_commit_result():
         )
     assert result.layer_idx == 0
     torch.testing.assert_close(result.new_physical_to_logical_map, torch.tensor([0, 1]))
+
+
+def test_worker_close_acknowledges_a_staged_result():
+    worker = StairTransferWorker.__new__(StairTransferWorker)
+    worker._queue = MagicMock()
+    worker._thread = MagicMock()
+    worker._thread.is_alive.side_effect = [True, False]
+    result = SimpleNamespace(consumed_event=MagicMock())
+    state = SimpleNamespace(pending_result=result)
+    worker._current = SimpleNamespace(model_state=state)
+
+    worker.close()
+
+    assert state.pending_result is None
+    result.consumed_event.record.assert_called_once_with()

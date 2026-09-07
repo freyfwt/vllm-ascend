@@ -68,6 +68,10 @@ class AscendEPLBController(EPLBController):
             batch_has_prefill,
         )
 
+    def close(self) -> None:
+        if self.state is not None:
+            self.state.close_stair()
+
     def prepare_forward(
         self,
         model_config: Any,

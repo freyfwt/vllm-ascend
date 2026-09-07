@@ -3,17 +3,21 @@
 
 """EP-group planning and execution coordination for STAIR."""
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from vllm.distributed import get_ep_group, get_eplb_group
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb.plan_validation import validate_plan
 from vllm_ascend.distributed.eplb.planner_client import PlannerClient, PlannerModel
 from vllm_ascend.distributed.eplb.planner_shared_memory import SharedSnapshotShape
+from vllm_ascend.distributed.eplb.planner_wire import decode_plan, encode_plan
 from vllm_ascend.distributed.eplb.policy.stair_types import RankTopology, RebalancePlan
 from vllm_ascend.distributed.eplb.stair_runtime import StairModelRuntime, canonical_model_id
 from vllm_ascend.distributed.eplb.stair_snapshot import sync_snapshot
@@ -51,6 +55,9 @@ class StairCoordinator:
         self.stats_schema_epoch = 0
         self._pending: dict[str, Any] = {}
         self._submitted: Any | None = None
+        self._execution_queue: list[tuple[RebalancePlan, StairModelRuntime, Any]] = []
+        self._active_layer: tuple[RebalancePlan, StairModelRuntime, Any] | None = None
+        self.disabled = False
 
     def register(self, model_key: str, model_config: Any, model_state: Any, parallel_config: Any) -> None:
         role = "main" if not self.models else "draft"
@@ -188,3 +195,96 @@ class StairCoordinator:
         self._submitted = None
         self._try_submit()
         return plan
+
+    def poll_and_broadcast(self) -> None:
+        """Share at most one completed plan without pickle object collectives."""
+        if self.topology is None or self.disabled:
+            return
+        ep_group = get_ep_group()
+        cpu_group = ep_group.cpu_group
+        rank = ep_group.device_group.rank()
+        payload = b""
+        status = 0
+        if rank == 0:
+            try:
+                plan = self.poll_local_plan()
+                payload = b"" if plan is None else encode_plan(plan)
+                status = len(payload)
+            except BaseException as error:
+                logger.exception("Disabling STAIR after planner failure: %s", error)
+                status = -1
+        length = torch.tensor((status,), dtype=torch.int64)
+        source = dist.get_global_rank(cpu_group, 0)
+        dist.broadcast(length, src=source, group=cpu_group)
+        if int(length[0]) < 0:
+            self.disabled = True
+            return
+        if int(length[0]) == 0:
+            return
+        data = torch.tensor(list(payload), dtype=torch.uint8) if rank == 0 else torch.empty(int(length[0]), dtype=torch.uint8)
+        dist.broadcast(data, src=source, group=cpu_group)
+        any_runtime = next(iter(self.models.values()))
+        shape = (any_runtime.num_ranks, any_runtime.model_state.model.num_physical_experts // any_runtime.num_ranks)
+        plan = decode_plan(bytes(data.tolist()), shape)
+        runtime = self.models_by_id.get(plan.model_id)
+        if runtime is None:
+            self.disabled = True
+            return
+        self._execution_queue.extend((plan, runtime, layer) for layer in plan.layers)
+
+    def _prepare_layer(self, plan: RebalancePlan, runtime: StairModelRuntime, layer: Any) -> bool:
+        assert self.topology is not None
+        valid = True
+        try:
+            validate_plan(
+                dataclasses.replace(plan, layers=(layer,)),
+                runtime.placements(),
+                runtime.placement_epochs,
+                self.topology,
+                self.config,
+                model_id=runtime.model_id,
+                current_planning_round=self.planning_round,
+                snapshot_sequence=plan.snapshot_sequence,
+                sample_sequence=plan.sample_sequence,
+                stats_schema_epoch=self.stats_schema_epoch,
+            )
+        except ValueError:
+            valid = False
+        flag = torch.tensor((int(valid),), dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=get_ep_group().cpu_group)
+        return bool(flag[0])
+
+    def start_next_layer(self) -> None:
+        if self.disabled or self._active_layer is not None:
+            return
+        if self.worker is None or self.topology is None:
+            raise RuntimeError("STAIR coordinator has not started")
+        while self._execution_queue:
+            plan, runtime, layer = self._execution_queue.pop(0)
+            if not self._prepare_layer(plan, runtime, layer):
+                continue
+            runtime.model_state._stair_pending_layer = layer
+            runtime.model_state.rebalanced = True
+            self._active_layer = (plan, runtime, layer)
+            from vllm_ascend.distributed.eplb.stair_worker import TransferWork
+
+            self.worker.submit(TransferWork(runtime.model_state, layer, self.topology))
+            return
+
+    def finish_active_layer(self) -> None:
+        if self._active_layer is None:
+            raise RuntimeError("STAIR has no active layer to finish")
+        _, runtime, _ = self._active_layer
+        runtime.model_state.rebalanced = False
+        self._active_layer = None
+        self.start_next_layer()
+
+    @property
+    def active_model_state(self) -> Any | None:
+        return None if self._active_layer is None else self._active_layer[1].model_state
+
+    def close(self) -> None:
+        if self.worker is not None:
+            self.worker.close()
+        if self.planner is not None:
+            self.planner.close()

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import torch
 import numpy as np
+from unittest.mock import patch
 
 from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb.stair_coordinator import PendingSnapshot, StairCoordinator
@@ -49,3 +50,24 @@ def test_pending_snapshots_use_stable_cross_model_arbitration():
     coordinator._try_submit()
     assert coordinator.planner.calls[0][0][0] == "a"
     assert coordinator._submitted.runtime.model_id == "a"
+
+
+def test_planner_failure_disables_before_transfer(monkeypatch):
+    coordinator = StairCoordinator(StairConfig(), "all", torch.device("cpu"), 4)
+    coordinator.topology = SimpleNamespace()
+    coordinator.models = {"model": SimpleNamespace()}
+    coordinator.poll_local_plan = lambda: (_ for _ in ()).throw(RuntimeError("failed"))
+    group = SimpleNamespace(
+        cpu_group=object(),
+        device_group=SimpleNamespace(rank=lambda: 0),
+    )
+    monkeypatch.setattr("vllm_ascend.distributed.eplb.stair_coordinator.get_ep_group", lambda: group)
+    monkeypatch.setattr("vllm_ascend.distributed.eplb.stair_coordinator.dist.get_global_rank", lambda *_: 0)
+
+    def broadcast(value, **_kwargs):
+        assert value[0] == -1
+
+    monkeypatch.setattr("vllm_ascend.distributed.eplb.stair_coordinator.dist.broadcast", broadcast)
+    with patch("vllm_ascend.distributed.eplb.stair_coordinator.logger.exception"):
+        coordinator.poll_and_broadcast()
+    assert coordinator.disabled

@@ -70,3 +70,28 @@ def test_hysteresis_uses_last_committed_predicted_score():
         stats_schema_epoch=1,
     )
     assert not plan.layers
+
+
+def test_planner_accepts_precompressed_weighted_bins():
+    plan = _plan([[100, 30, 10, 1], [80, 40, 10, 1]])
+    old = np.array([[[0, 1], [2, 3], [0, 2]]])
+    weighted = plan_rebalance(
+        np.array([[[100, 30, 10, 1]], [[80, 40, 10, 1]]]),
+        old,
+        np.array([5]),
+        (None,),
+        RankTopology((0, 0, 1), (0, 1, 2)),
+        StairConfig(
+            imbalance_threshold=1.0,
+            hysteresis_enabled=False,
+            min_relative_score_improvement=0.0,
+            p95_regression_tolerance=1.0,
+        ),
+        sample_weights=np.array([1, 1]),
+        model_id="model",
+        planning_round=2,
+        snapshot_sequence=3,
+        sample_sequence=6,
+        stats_schema_epoch=4,
+    )
+    assert weighted.digest() == plan.digest()

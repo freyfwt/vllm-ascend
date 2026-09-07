@@ -19,6 +19,7 @@ def plan_rebalance(
     topology: RankTopology,
     config: StairConfig,
     *,
+    sample_weights: np.ndarray | None = None,
     model_id: str,
     planning_round: int,
     snapshot_sequence: int,
@@ -30,7 +31,13 @@ def plan_rebalance(
     old = np.asarray(placements, dtype=np.int64)
     if raw.ndim != 3 or old.ndim != 3 or raw.shape[1] != old.shape[0]:
         raise ValueError("STAIR expects [steps,layers,experts] load and [layers,ranks,slots] placements")
-    compressed, weights = compress_samples(raw, config.sample_size)
+    if sample_weights is None:
+        compressed, weights = compress_samples(raw, config.sample_size)
+    else:
+        compressed = np.asarray(raw, dtype=np.float64)
+        weights = np.asarray(sample_weights, dtype=np.int64)
+        if weights.shape != (raw.shape[0],) or np.any(weights <= 0):
+            raise ValueError("STAIR sample weights must match compressed bins and be positive")
     eligible: list[tuple[float, float, int]] = []
     for layer_idx in range(old.shape[0]):
         validate_placement(old[layer_idx], raw.shape[2])

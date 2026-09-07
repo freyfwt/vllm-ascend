@@ -40,6 +40,7 @@ from vllm_ascend.ascend_config import (
     SchedulerConfig,
     ShortRequestFirstConfig,
     SparseKVOffloadConfig,
+    StairConfig,
     clear_ascend_config,
     get_ascend_config,
     init_ascend_config,
@@ -201,6 +202,28 @@ class TestAscendConfig(TestBase):
         )
         with self.assertRaisesRegex(ValueError, "load_collection_phase must be one of"):
             EplbConfig(load_collection_phase="prompt")
+
+    def test_stair_config_defaults_and_overrides(self):
+        config = EplbConfig(algorithm="stair")
+        self.assertEqual(config.resolved_stair_config.sample_size, 64)
+        self.assertEqual(config.resolved_stair_config.max_expert_transfers_per_rank_pair, 1)
+
+        config = EplbConfig(
+            algorithm="stair",
+            stair_config={"sample_size": 8, "planner_cpu_set": [2, 3]},  # type: ignore[arg-type]
+        )
+        self.assertEqual(config.resolved_stair_config.sample_size, 8)
+        self.assertEqual(config.resolved_stair_config.planner_cpu_set, [2, 3])
+
+    def test_stair_config_rejects_unknown_and_out_of_range_values(self):
+        with self.assertRaises(ValueError):
+            StairConfig(sample_size=0)
+        with self.assertRaises(ValueError):
+            StairConfig(experimental_flash_tree_width=33)
+        with self.assertRaises(ValueError):
+            StairConfig(planner_cpu_set=[1, 1])
+        with self.assertRaises(ValueError):
+            StairConfig(unknown_option=True)  # type: ignore[call-arg]
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

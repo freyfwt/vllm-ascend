@@ -102,6 +102,74 @@ class AscendFusionConfig:
     fusion_ops_gmmswigluquant: bool = True
 
 
+@config(frozen=True)
+class StairConfig:
+    """Advanced tuning for the MRv2 STAIR EPLB algorithm."""
+
+    sample_size: int = 64
+    z_score: float = 0.67448975
+    use_covariance: bool = False
+    imbalance_threshold: float = 1.01
+    hysteresis_enabled: bool = True
+    hysteresis_relative: float = 0.90
+    hysteresis_absolute: float = 0.85
+    max_expert_transfers_per_rank_pair: int = 1
+    min_relative_score_improvement: float = 0.01
+    min_absolute_score_improvement: float = 0.0
+    p95_regression_tolerance: float = 0.0
+    max_plan_age_intervals: int = 1
+    planner_cpu_set: str | list[int] = "auto"
+    planner_affinity_strict: bool = False
+    planner_restart_limit: int = 1
+    planner_heartbeat_timeout_s: float = 30.0
+    max_staged_bytes_per_rank: str | int = "auto"
+    experimental_flash_tree_depth: int = 4
+    experimental_flash_tree_width: int = 8
+    experimental_max_candidates_per_layer: int = 64
+    experimental_lpt_max_backtracks: int = 8
+    experimental_score_tie_tolerance: float = 1e-9
+
+    @model_validator(mode="after")
+    def _validate(self):
+        ranges = {
+            "sample_size": (1, 4096),
+            "z_score": (0, 5),
+            "hysteresis_relative": (0, 1),
+            "hysteresis_absolute": (0, 1),
+            "max_expert_transfers_per_rank_pair": (1, 4096),
+            "min_relative_score_improvement": (0, 1),
+            "max_plan_age_intervals": (1, 16),
+            "planner_restart_limit": (0, 3),
+            "planner_heartbeat_timeout_s": (1, 300),
+            "experimental_flash_tree_depth": (1, 8),
+            "experimental_flash_tree_width": (0, 32),
+            "experimental_max_candidates_per_layer": (1, 512),
+            "experimental_lpt_max_backtracks": (0, 64),
+            "experimental_score_tie_tolerance": (0, 1e-4),
+        }
+        for name, (lower, upper) in ranges.items():
+            value = getattr(self, name)
+            if not lower <= value <= upper:
+                raise ValueError(f"stair_config.{name} must be in [{lower}, {upper}], got {value}")
+        if self.hysteresis_relative == 0 or self.hysteresis_absolute == 0:
+            raise ValueError("STAIR hysteresis thresholds must be greater than zero")
+        if self.min_relative_score_improvement == 1:
+            raise ValueError("stair_config.min_relative_score_improvement must be less than one")
+        for name in ("min_absolute_score_improvement", "p95_regression_tolerance"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"stair_config.{name} must be non-negative")
+        if self.planner_cpu_set != "auto":
+            if not isinstance(self.planner_cpu_set, list) or not self.planner_cpu_set:
+                raise ValueError("stair_config.planner_cpu_set must be 'auto' or a non-empty CPU list")
+            if len(set(self.planner_cpu_set)) != len(self.planner_cpu_set) or min(self.planner_cpu_set) < 0:
+                raise ValueError("stair_config.planner_cpu_set must contain unique non-negative CPUs")
+        if self.max_staged_bytes_per_rank != "auto" and (
+            not isinstance(self.max_staged_bytes_per_rank, int) or self.max_staged_bytes_per_rank <= 0
+        ):
+            raise ValueError("stair_config.max_staged_bytes_per_rank must be 'auto' or a positive integer")
+        return self
+
+
 @config
 class EplbConfig:
     """Configuration Object for ``additional_config["eplb_config"]``.
@@ -125,6 +193,12 @@ class EplbConfig:
     # upstream EPLB expert-load window; any prefill request marks the batch
     # as prefill.
     load_collection_phase: str = "all"
+    algorithm: Literal["default", "stair"] = "default"
+    stair_config: StairConfig | None = None
+
+    @property
+    def resolved_stair_config(self) -> StairConfig:
+        return self.stair_config or StairConfig()
 
     @model_validator(mode="after")
     def _validate_config(self):

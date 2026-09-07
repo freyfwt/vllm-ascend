@@ -11,8 +11,8 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.v1.worker.gpu.eplb_utils import EPLBController
 
-from vllm_ascend.distributed.eplb.state import AscendEplbState
 from vllm_ascend.ascend_config import StairConfig
+from vllm_ascend.distributed.eplb.state import AscendEplbState
 
 
 def is_eplb_load_collection_phase_matched(
@@ -30,6 +30,15 @@ def _unwrap_moe(model: nn.Module) -> nn.Module:
     if not is_mixture_of_experts(model) and isinstance(model, SupportsMultiModal):
         return model.get_language_model()
     return model
+
+
+def note_speculator_stair_execution(speculator: Any, *, is_dummy: bool, is_profile: bool) -> None:
+    if is_dummy or is_profile:
+        return
+    state = getattr(speculator, "eplb_state", None)
+    note_execution = getattr(state, "note_stair_execution", None)
+    if callable(note_execution):
+        note_execution(speculator.draft_model_config, False)
 
 
 class AscendEPLBController(EPLBController):

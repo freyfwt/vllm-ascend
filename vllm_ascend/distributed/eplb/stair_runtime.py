@@ -77,12 +77,12 @@ class StairModelRuntime:
         self.executed = True
         self.has_prefill |= has_prefill
 
-    def record_step(self, outer_step_key: int, *, default_executed: bool = False) -> None:
+    def record_step(self, outer_step_key: int) -> None:
         self.ring.record(
             self.model_state.expert_load_pass,
             self.model_state.physical_to_logical_map,
             outer_step_key,
-            executed=self.executed or default_executed,
+            executed=self.executed,
             has_prefill=self.has_prefill,
         )
         self.model_state.expert_load_pass.zero_()

@@ -99,9 +99,8 @@ class StairCoordinator:
 
     def record_step(self) -> None:
         self.outer_step_key += 1
-        default_executed = self.phase == "all" and len(self.models) > 1
         for runtime in self.models.values():
-            runtime.record_step(self.outer_step_key, default_executed=default_executed)
+            runtime.record_step(self.outer_step_key)
 
     def start(self) -> None:
         ep_group, eplb_group = get_ep_group(), get_eplb_group()

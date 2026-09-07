@@ -3,18 +3,36 @@
 
 """EP-group planning and execution coordination for STAIR."""
 
+from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.distributed import get_ep_group, get_eplb_group
 
 from vllm_ascend.ascend_config import StairConfig
+from vllm_ascend.distributed.eplb.plan_validation import validate_plan
 from vllm_ascend.distributed.eplb.planner_client import PlannerClient, PlannerModel
 from vllm_ascend.distributed.eplb.planner_shared_memory import SharedSnapshotShape
-from vllm_ascend.distributed.eplb.policy.stair_types import RankTopology
+from vllm_ascend.distributed.eplb.policy.stair_types import RankTopology, RebalancePlan
 from vllm_ascend.distributed.eplb.stair_runtime import StairModelRuntime, canonical_model_id
+from vllm_ascend.distributed.eplb.stair_snapshot import sync_snapshot
 from vllm_ascend.distributed.eplb.stair_worker import StairTransferWorker
 from vllm_ascend.distributed.eplb.topology import discover_topology
+
+
+@dataclass(frozen=True)
+class PendingSnapshot:
+    runtime: StairModelRuntime
+    bin_sums: np.ndarray
+    bin_lengths: np.ndarray
+    placements: np.ndarray
+    placement_epochs: np.ndarray
+    accepted_scores: np.ndarray
+    planning_round: int
+    snapshot_sequence: int
+    sample_sequence: int
+    key_digest: str
 
 
 class StairCoordinator:
@@ -85,3 +103,88 @@ class StairCoordinator:
             self.planner = PlannerClient(models)
         device_index = torch.accelerator.current_device_index()
         self.worker = StairTransferWorker(device_index, rank)
+
+    def snapshot(self) -> None:
+        if self.topology is None:
+            raise RuntimeError("STAIR coordinator has not started")
+        self.planning_round += 1
+        ep_group = get_ep_group()
+        rank = ep_group.device_group.rank()
+        for runtime in sorted(self.models.values(), key=lambda value: value.model_id):
+            synchronized = sync_snapshot(
+                runtime.ring,
+                phase=self.phase,
+                sample_size=self.config.sample_size,
+                cpu_group=ep_group.cpu_group,
+                device_group=ep_group.device_group,
+                group_rank=rank,
+            )
+            if synchronized is None:
+                continue
+            runtime.snapshot_sequence += 1
+            runtime.sample_sequence += synchronized.sample_count
+            if rank == 0:
+                assert synchronized.bin_sums is not None
+                self._pending[runtime.model_id] = PendingSnapshot(
+                    runtime,
+                    synchronized.bin_sums.numpy(),
+                    np.asarray(synchronized.bin_lengths, dtype=np.int64),
+                    runtime.placements().astype(np.int32),
+                    runtime.placement_epochs.copy(),
+                    runtime.accepted_scores.copy(),
+                    self.planning_round,
+                    runtime.snapshot_sequence,
+                    runtime.sample_sequence,
+                    synchronized.key_digest,
+                )
+        self._try_submit()
+
+    def _try_submit(self) -> None:
+        if self.planner is None or self._submitted is not None or not self._pending:
+            return
+        pending = min(
+            self._pending.values(),
+            key=lambda value: (value.planning_round, value.runtime.model_id, value.snapshot_sequence),
+        )
+        submitted = self.planner.submit(
+            pending.runtime.model_id,
+            pending.bin_sums,
+            pending.bin_lengths,
+            pending.placements,
+            pending.placement_epochs,
+            pending.accepted_scores,
+            planning_round=pending.planning_round,
+            snapshot_sequence=pending.snapshot_sequence,
+            sample_sequence=pending.sample_sequence,
+            stats_schema_epoch=self.stats_schema_epoch,
+            key_digest=pending.key_digest,
+        )
+        if submitted:
+            self._submitted = pending
+            del self._pending[pending.runtime.model_id]
+
+    def poll_local_plan(self) -> RebalancePlan | None:
+        if self.planner is None:
+            return None
+        plan = self.planner.poll()
+        if plan is None:
+            return None
+        pending = self._submitted
+        if pending is None or self.topology is None:
+            raise RuntimeError("STAIR planner returned an untracked result")
+        runtime = pending.runtime
+        validate_plan(
+            plan,
+            runtime.placements(),
+            runtime.placement_epochs,
+            self.topology,
+            self.config,
+            model_id=runtime.model_id,
+            current_planning_round=self.planning_round,
+            snapshot_sequence=pending.snapshot_sequence,
+            sample_sequence=pending.sample_sequence,
+            stats_schema_epoch=self.stats_schema_epoch,
+        )
+        self._submitted = None
+        self._try_submit()
+        return plan

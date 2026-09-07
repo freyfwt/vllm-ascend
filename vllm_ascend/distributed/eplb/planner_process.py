@@ -14,18 +14,18 @@ from multiprocessing.connection import Connection
 for _variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ[_variable] = "1"
 
-import numpy as np
+import numpy as np  # noqa: E402
 
-from vllm_ascend.distributed.eplb.planner_protocol import (
+from vllm_ascend.distributed.eplb.planner_protocol import (  # noqa: E402
     PlannerRegistration,
     WireOp,
     decode_registration,
     receive_frame,
     send_frame,
 )
-from vllm_ascend.distributed.eplb.planner_shared_memory import SharedSnapshotBuffer
-from vllm_ascend.distributed.eplb.planner_wire import decode_request, encode_plan
-from vllm_ascend.distributed.eplb.policy.stair import plan_rebalance
+from vllm_ascend.distributed.eplb.planner_shared_memory import SharedSnapshotBuffer  # noqa: E402
+from vllm_ascend.distributed.eplb.planner_wire import decode_request, encode_plan  # noqa: E402
+from vllm_ascend.distributed.eplb.policy.stair import plan_rebalance  # noqa: E402
 
 
 class PlannerServer:

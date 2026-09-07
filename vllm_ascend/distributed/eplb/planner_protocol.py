@@ -12,7 +12,6 @@ from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb.planner_shared_memory import SharedSnapshotShape, SharedSnapshotSpec
 from vllm_ascend.distributed.eplb.policy.stair_types import RankTopology
 
-
 PROTOCOL_VERSION = 1
 _MAGIC = b"STAIRPLN"
 _HEADER = struct.Struct("<8sHHII")
@@ -124,7 +123,11 @@ def encode_registration(registration: PlannerRegistration) -> bytes:
         shape.num_ranks,
         shape.slots_per_rank,
     )
-    topology = struct.pack(f"<{shape.num_ranks * 2}i", *registration.topology.node_by_ep_rank, *registration.topology.eplb_rank_by_ep_rank)
+    topology = struct.pack(
+        f"<{shape.num_ranks * 2}i",
+        *registration.topology.node_by_ep_rank,
+        *registration.topology.eplb_rank_by_ep_rank,
+    )
     return struct.pack("<H", len(model_id)) + model_id + fixed + topology + _encode_config(registration.config)
 
 

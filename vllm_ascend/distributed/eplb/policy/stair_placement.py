@@ -45,7 +45,11 @@ def _post_insert_risk(
 def _copies(mean: np.ndarray, moments: np.ndarray, replicas: np.ndarray, z_score: float) -> list[int]:
     diagonal = np.diag(moments) if moments.ndim == 2 else moments
     risk = mean + z_score * np.sqrt(np.maximum(diagonal, 0.0))
-    copies = [(float(risk[expert] / replicas[expert]), expert, ordinal) for expert in range(len(mean)) for ordinal in range(replicas[expert])]
+    copies = [
+        (float(risk[expert] / replicas[expert]), expert, ordinal)
+        for expert in range(len(mean))
+        for ordinal in range(replicas[expert])
+    ]
     copies.sort(key=lambda item: (-item[0], item[1], item[2]))
     return [expert for _, expert, _ in copies]
 
@@ -64,7 +68,11 @@ def unconstrained_lpt(
     slots_per_rank = total_slots // num_ranks
     ranks = [set() for _ in range(num_ranks)]
     for expert in _copies(mean, moments, replicas, z_score):
-        candidates = [rank for rank in range(num_ranks) if len(ranks[rank]) < slots_per_rank and expert not in ranks[rank]]
+        candidates = [
+            rank
+            for rank in range(num_ranks)
+            if len(ranks[rank]) < slots_per_rank and expert not in ranks[rank]
+        ]
         if not candidates:
             raise ValueError("STAIR replica vector has no duplicate-free LPT placement")
         rank = min(
@@ -99,7 +107,11 @@ def constrained_lpt(
         if index == len(ordered_copies):
             return assign_sources(old, ranks, topology, pair_cap)
         expert = ordered_copies[index]
-        candidates = [rank for rank in range(old.shape[0]) if len(ranks[rank]) < old.shape[1] and expert not in ranks[rank]]
+        candidates = [
+            rank
+            for rank in range(old.shape[0])
+            if len(ranks[rank]) < old.shape[1] and expert not in ranks[rank]
+        ]
         candidates.sort(
             key=lambda rank: (_post_insert_risk(ranks[rank], expert, mean, moments, replicas, z_score), rank)
         )

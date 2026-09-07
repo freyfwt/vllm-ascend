@@ -89,7 +89,12 @@ class LogicalLoadRing:
         bins = min(sample_size, self.valid_size)
         boundaries = [index * self.valid_size // bins for index in range(bins + 1)]
         lengths = tuple(end - start for start, end in zip(boundaries[:-1], boundaries[1:]))
-        sums = torch.stack([values[start:end].sum(dim=0, dtype=torch.int64) for start, end in zip(boundaries[:-1], boundaries[1:])])
+        sums = torch.stack(
+            [
+                values[start:end].sum(dim=0, dtype=torch.int64)
+                for start, end in zip(boundaries[:-1], boundaries[1:])
+            ]
+        )
         return sums, lengths
 
     def compressed_selected_sums(
@@ -104,7 +109,12 @@ class LogicalLoadRing:
         bins = min(sample_size, len(indices))
         boundaries = [item * len(indices) // bins for item in range(bins + 1)]
         lengths = tuple(end - start for start, end in zip(boundaries[:-1], boundaries[1:]))
-        sums = torch.stack([values[start:end].sum(dim=0, dtype=torch.int64) for start, end in zip(boundaries[:-1], boundaries[1:])])
+        sums = torch.stack(
+            [
+                values[start:end].sum(dim=0, dtype=torch.int64)
+                for start, end in zip(boundaries[:-1], boundaries[1:])
+            ]
+        )
         return sums, lengths
 
     def key_digest(self) -> str:

@@ -8,7 +8,6 @@ import numpy.typing as npt
 
 from vllm_ascend.distributed.eplb.policy.stair_types import BalanceScore
 
-
 FloatArray = npt.NDArray[np.float64]
 IntArray = npt.NDArray[np.int64]
 

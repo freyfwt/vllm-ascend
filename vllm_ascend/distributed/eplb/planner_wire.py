@@ -10,7 +10,6 @@ import numpy as np
 
 from vllm_ascend.distributed.eplb.policy.stair_types import BalanceScore, LayerPlan, RebalancePlan
 
-
 _REQUEST = struct.Struct("<BI5Q32s32s32s")
 _PLAN = struct.Struct("<4Q32s32sI")
 _LAYER = struct.Struct("<iq6d")

@@ -9,7 +9,6 @@ import numpy as np
 
 from vllm_ascend.distributed.eplb.policy.stair_types import RankTopology
 
-
 Demand = tuple[int, int]  # (destination rank, logical expert)
 
 

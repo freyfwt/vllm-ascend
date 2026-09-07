@@ -189,10 +189,13 @@ class PlannerClient:
                         raise PlannerProcessError("STAIR planner drain failed")
                     self._active = None
                 send_frame(self._connection, WireOp.SHUTDOWN)
-                operation, payload = self._receive(max(model.config.planner_heartbeat_timeout_s for model in self._models.values()))
+                shutdown_timeout = max(
+                    model.config.planner_heartbeat_timeout_s for model in self._models.values()
+                )
+                operation, payload = self._receive(shutdown_timeout)
                 if operation != WireOp.ACK or payload != b"shutdown":
                     raise PlannerProcessError("STAIR planner shutdown acknowledgement mismatch")
-                self._process.wait()
+            self._process.wait()
         except BaseException:
             self._process.kill()
             self._process.wait()

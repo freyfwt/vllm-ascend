@@ -38,6 +38,7 @@ class StairModelRuntime:
     accepted_scores: np.ndarray
     snapshot_sequence: int = 0
     sample_sequence: int = 0
+    last_sampled_outer_step: int = -1
     executed: bool = False
     has_prefill: bool = False
 
@@ -94,6 +95,11 @@ class StairModelRuntime:
 
     def accepted_score_tuple(self) -> tuple[float | None, ...]:
         return tuple(None if np.isnan(value) else float(value) for value in self.accepted_scores)
+
+    def accept_snapshot(self, selected_keys: tuple[int, ...]) -> None:
+        self.snapshot_sequence += 1
+        self.sample_sequence += sum(key > self.last_sampled_outer_step for key in selected_keys)
+        self.last_sampled_outer_step = max(selected_keys, default=self.last_sampled_outer_step)
 
     def commit(self, layer: LayerPlan) -> None:
         self.placement_epochs[layer.layer_idx] += 1

@@ -17,7 +17,7 @@ class SynchronizedSnapshot:
     bin_sums: torch.Tensor | None
     bin_lengths: tuple[int, ...]
     key_digest: str
-    sample_count: int
+    selected_keys: tuple[int, ...]
 
 
 def phase_mask(group_metadata: torch.Tensor, phase: str) -> torch.Tensor:
@@ -73,4 +73,4 @@ def sync_snapshot(
     selected_keys = keys[selected]
     digest = hashlib.sha256(selected_keys.numpy().astype("<i8", copy=False).tobytes()).hexdigest()
     cpu_sums = bin_sums.cpu() if group_rank == 0 else None
-    return SynchronizedSnapshot(cpu_sums, lengths, digest, len(selected_indices))
+    return SynchronizedSnapshot(cpu_sums, lengths, digest, tuple(selected_keys.tolist()))

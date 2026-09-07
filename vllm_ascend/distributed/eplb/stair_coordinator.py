@@ -137,8 +137,7 @@ class StairCoordinator:
             )
             if synchronized is None:
                 continue
-            runtime.snapshot_sequence += 1
-            runtime.sample_sequence += synchronized.sample_count
+            runtime.accept_snapshot(synchronized.selected_keys)
             if rank == 0:
                 assert synchronized.bin_sums is not None
                 self._pending[runtime.model_id] = PendingSnapshot(

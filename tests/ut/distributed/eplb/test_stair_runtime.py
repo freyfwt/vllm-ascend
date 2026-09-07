@@ -42,3 +42,12 @@ def test_model_runtime_updates_anchor_only_on_commit():
     runtime.commit(layer)
     assert runtime.placement_epochs.tolist() == [1]
     assert runtime.accepted_score_tuple() == (1.0,)
+
+
+def test_model_runtime_counts_overlapping_samples_once():
+    runtime = _runtime()
+    runtime.accept_snapshot((3, 4))
+    runtime.accept_snapshot((4, 5))
+    assert runtime.snapshot_sequence == 2
+    assert runtime.sample_sequence == 3
+    assert runtime.last_sampled_outer_step == 5

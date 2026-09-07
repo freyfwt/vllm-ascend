@@ -201,3 +201,16 @@ class PlannerClient:
             self._closed = True
             self._connection.close()
             self._close_shared()
+
+    def abort(self) -> None:
+        """Release a failed child without waiting for graceful drain."""
+        if self._closed:
+            return
+        try:
+            if self._process.poll() is None:
+                self._process.kill()
+            self._process.wait()
+        finally:
+            self._closed = True
+            self._connection.close()
+            self._close_shared()

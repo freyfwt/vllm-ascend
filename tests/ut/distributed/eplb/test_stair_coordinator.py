@@ -53,7 +53,7 @@ def test_pending_snapshots_use_stable_cross_model_arbitration():
 
 
 def test_planner_failure_disables_before_transfer(monkeypatch):
-    coordinator = StairCoordinator(StairConfig(), "all", torch.device("cpu"), 4)
+    coordinator = StairCoordinator(StairConfig(planner_restart_limit=0), "all", torch.device("cpu"), 4)
     coordinator.topology = SimpleNamespace()
     coordinator.models = {"model": SimpleNamespace()}
     coordinator.poll_local_plan = lambda: (_ for _ in ()).throw(RuntimeError("failed"))
@@ -71,3 +71,17 @@ def test_planner_failure_disables_before_transfer(monkeypatch):
     with patch("vllm_ascend.distributed.eplb.stair_coordinator.logger.exception"):
         coordinator.poll_and_broadcast()
     assert coordinator.disabled
+
+
+def test_planner_failure_restarts_before_disabling(monkeypatch):
+    coordinator = StairCoordinator(StairConfig(), "all", torch.device("cpu"), 4)
+    coordinator.topology = SimpleNamespace()
+    coordinator.models = {"model": SimpleNamespace()}
+    coordinator.poll_local_plan = lambda: (_ for _ in ()).throw(RuntimeError("failed"))
+    coordinator._restart_planner = lambda: True
+    group = SimpleNamespace(cpu_group=object(), device_group=SimpleNamespace(rank=lambda: 0))
+    monkeypatch.setattr("vllm_ascend.distributed.eplb.stair_coordinator.get_ep_group", lambda: group)
+    monkeypatch.setattr("vllm_ascend.distributed.eplb.stair_coordinator.dist.get_global_rank", lambda *_: 0)
+    monkeypatch.setattr("vllm_ascend.distributed.eplb.stair_coordinator.dist.broadcast", lambda *_args, **_kwargs: None)
+    coordinator.poll_and_broadcast()
+    assert not coordinator.disabled

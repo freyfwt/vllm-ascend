@@ -57,6 +57,7 @@ class StairCoordinator:
         self._submitted: Any | None = None
         self._execution_queue: list[tuple[RebalancePlan, StairModelRuntime, Any]] = []
         self._active_layer: tuple[RebalancePlan, StairModelRuntime, Any] | None = None
+        self._planner_restarts = 0
         self.disabled = False
 
     def register(self, model_key: str, model_config: Any, model_state: Any, parallel_config: Any) -> None:
@@ -101,24 +102,48 @@ class StairCoordinator:
         self.topology = discover_topology(ep_group, eplb_group)
         rank = ep_group.device_group.rank()
         if rank == 0:
-            models = tuple(
-                PlannerModel(
-                    runtime.model_id,
-                    SharedSnapshotShape(
-                        self.config.sample_size,
-                        runtime.ring.values.shape[1],
-                        runtime.ring.values.shape[2],
-                        runtime.num_ranks,
-                        runtime.model_state.model.num_physical_experts // runtime.num_ranks,
-                    ),
-                    self.topology,
-                    self.config,
-                )
-                for runtime in self.models.values()
-            )
-            self.planner = PlannerClient(models)
+            self.planner = PlannerClient(self._planner_models())
         device_index = torch.accelerator.current_device_index()
         self.worker = StairTransferWorker(device_index, rank)
+
+    def _planner_models(self) -> tuple[PlannerModel, ...]:
+        assert self.topology is not None
+        return tuple(
+            PlannerModel(
+                runtime.model_id,
+                SharedSnapshotShape(
+                    self.config.sample_size,
+                    runtime.ring.values.shape[1],
+                    runtime.ring.values.shape[2],
+                    runtime.num_ranks,
+                    runtime.model_state.model.num_physical_experts // runtime.num_ranks,
+                ),
+                self.topology,
+                self.config,
+            )
+            for runtime in self.models.values()
+        )
+
+    def _restart_planner(self) -> bool:
+        if self._planner_restarts >= self.config.planner_restart_limit:
+            return False
+        try:
+            if self.planner is not None:
+                self.planner.abort()
+            if self._submitted is not None:
+                model_id = self._submitted.runtime.model_id
+                current = self._pending.get(model_id)
+                if current is None or current.snapshot_sequence < self._submitted.snapshot_sequence:
+                    self._pending[model_id] = self._submitted
+            self._submitted = None
+            self.planner = PlannerClient(self._planner_models())
+            self._planner_restarts += 1
+            self._try_submit()
+            return True
+        except BaseException:
+            logger.exception("STAIR planner restart failed")
+            self.planner = None
+            return False
 
     def snapshot(self) -> None:
         if self.topology is None:
@@ -188,18 +213,24 @@ class StairCoordinator:
         if pending is None or self.topology is None:
             raise RuntimeError("STAIR planner returned an untracked result")
         runtime = pending.runtime
-        validate_plan(
-            plan,
-            runtime.placements(),
-            runtime.placement_epochs,
-            self.topology,
-            self.config,
-            model_id=runtime.model_id,
-            current_planning_round=self.planning_round,
-            snapshot_sequence=pending.snapshot_sequence,
-            sample_sequence=pending.sample_sequence,
-            stats_schema_epoch=self.stats_schema_epoch,
-        )
+        try:
+            validate_plan(
+                plan,
+                runtime.placements(),
+                runtime.placement_epochs,
+                self.topology,
+                self.config,
+                model_id=runtime.model_id,
+                current_planning_round=self.planning_round,
+                snapshot_sequence=pending.snapshot_sequence,
+                sample_sequence=pending.sample_sequence,
+                stats_schema_epoch=self.stats_schema_epoch,
+            )
+        except ValueError as error:
+            logger.warning("Discarding stale or invalid STAIR plan: %s", error)
+            self._submitted = None
+            self._try_submit()
+            return None
         self._submitted = None
         self._try_submit()
         return plan
@@ -219,8 +250,11 @@ class StairCoordinator:
                 payload = b"" if plan is None else encode_plan(plan)
                 status = len(payload)
             except BaseException as error:
-                logger.exception("Disabling STAIR after planner failure: %s", error)
-                status = -1
+                if self._restart_planner():
+                    logger.warning("Restarted STAIR planner after failure: %s", error)
+                else:
+                    logger.exception("Disabling STAIR after planner failure: %s", error)
+                    status = -1
         length = torch.tensor((status,), dtype=torch.int64)
         source = dist.get_global_rank(cpu_group, 0)
         dist.broadcast(length, src=source, group=cpu_group)

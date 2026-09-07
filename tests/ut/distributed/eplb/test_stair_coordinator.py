@@ -57,6 +57,7 @@ def test_planner_failure_disables_before_transfer(monkeypatch):
     coordinator = StairCoordinator(StairConfig(planner_restart_limit=0), "all", torch.device("cpu"), 4)
     coordinator.topology = SimpleNamespace()
     coordinator.models = {"model": SimpleNamespace()}
+    coordinator._awaiting_plan = True
     coordinator.poll_local_plan = lambda: (_ for _ in ()).throw(RuntimeError("failed"))
     group = SimpleNamespace(
         cpu_group=object(),
@@ -78,6 +79,7 @@ def test_planner_failure_restarts_before_disabling(monkeypatch):
     coordinator = StairCoordinator(StairConfig(), "all", torch.device("cpu"), 4)
     coordinator.topology = SimpleNamespace()
     coordinator.models = {"model": SimpleNamespace()}
+    coordinator._awaiting_plan = True
     coordinator.poll_local_plan = lambda: (_ for _ in ()).throw(RuntimeError("failed"))
     coordinator._restart_planner = lambda: True
     group = SimpleNamespace(cpu_group=object(), device_group=SimpleNamespace(rank=lambda: 0))
@@ -86,6 +88,16 @@ def test_planner_failure_restarts_before_disabling(monkeypatch):
     monkeypatch.setattr("vllm_ascend.distributed.eplb.stair_coordinator.dist.broadcast", lambda *_args, **_kwargs: None)
     coordinator.poll_and_broadcast()
     assert not coordinator.disabled
+
+
+def test_idle_coordinator_avoids_control_collectives(monkeypatch):
+    coordinator = StairCoordinator(StairConfig(), "all", torch.device("cpu"), 4)
+    coordinator.topology = SimpleNamespace()
+    broadcast = MagicMock()
+    monkeypatch.setattr("vllm_ascend.distributed.eplb.stair_coordinator.dist.broadcast", broadcast)
+    coordinator.poll_and_broadcast()
+    coordinator.check_worker_health()
+    broadcast.assert_not_called()
 
 
 def test_startup_identity_rejects_rank_mismatch(monkeypatch):

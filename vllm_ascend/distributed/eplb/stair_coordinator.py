@@ -61,6 +61,7 @@ class StairCoordinator:
         self._execution_queue: list[tuple[RebalancePlan, StairModelRuntime, Any]] = []
         self._active_layer: tuple[RebalancePlan, StairModelRuntime, Any] | None = None
         self._planner_restarts = 0
+        self._awaiting_plan = False
         self.disabled = False
 
     def register(self, model_key: str, model_config: Any, model_state: Any, parallel_config: Any) -> None:
@@ -166,6 +167,8 @@ class StairCoordinator:
     def snapshot(self) -> None:
         if self.topology is None:
             raise RuntimeError("STAIR coordinator has not started")
+        if self.disabled or self._awaiting_plan:
+            return
         self.planning_round += 1
         ep_group = get_ep_group()
         rank = ep_group.device_group.rank()
@@ -180,6 +183,7 @@ class StairCoordinator:
             )
             if synchronized is None:
                 continue
+            self._awaiting_plan = True
             runtime.accept_snapshot(synchronized.selected_keys)
             if rank == 0:
                 assert synchronized.bin_sums is not None
@@ -257,7 +261,7 @@ class StairCoordinator:
 
     def poll_and_broadcast(self) -> None:
         """Share at most one completed plan without pickle object collectives."""
-        if self.topology is None or self.disabled:
+        if self.topology is None or self.disabled or not self._awaiting_plan:
             return
         ep_group = get_ep_group()
         cpu_group = ep_group.cpu_group
@@ -275,18 +279,20 @@ class StairCoordinator:
                 else:
                     logger.exception("Disabling STAIR after planner failure: %s", error)
                     status = -1
-        length = torch.tensor((status,), dtype=torch.int64)
+        outstanding = int(self._submitted is not None or bool(self._pending)) if rank == 0 else 0
+        control = torch.tensor((status, outstanding), dtype=torch.int64)
         source = dist.get_global_rank(cpu_group, 0)
-        dist.broadcast(length, src=source, group=cpu_group)
-        if int(length[0]) < 0:
+        dist.broadcast(control, src=source, group=cpu_group)
+        self._awaiting_plan = bool(control[1])
+        if int(control[0]) < 0:
             self.disabled = True
             return
-        if int(length[0]) == 0:
+        if int(control[0]) == 0:
             return
         data = (
             torch.tensor(list(payload), dtype=torch.uint8)
             if rank == 0
-            else torch.empty(int(length[0]), dtype=torch.uint8)
+            else torch.empty(int(control[0]), dtype=torch.uint8)
         )
         dist.broadcast(data, src=source, group=cpu_group)
         any_runtime = next(iter(self.models.values()))
@@ -350,6 +356,8 @@ class StairCoordinator:
         return None if self._active_layer is None else self._active_layer[1].model_state
 
     def check_worker_health(self) -> None:
+        if self._active_layer is None:
+            return
         healthy = self.worker is not None and self.worker.failure is None
         flag = torch.tensor((int(healthy),), dtype=torch.int32)
         dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=get_ep_group().cpu_group)

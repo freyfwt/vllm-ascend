@@ -32,15 +32,6 @@ def _unwrap_moe(model: nn.Module) -> nn.Module:
     return model
 
 
-def note_speculator_stair_execution(speculator: Any, *, is_dummy: bool, is_profile: bool) -> None:
-    if is_dummy or is_profile:
-        return
-    state = getattr(speculator, "eplb_state", None)
-    note_execution = getattr(state, "note_stair_execution", None)
-    if callable(note_execution):
-        note_execution(speculator.draft_model_config, False)
-
-
 class AscendEPLBController(EPLBController):
     """Construct Ascend state and apply phase-filtered load collection."""
 

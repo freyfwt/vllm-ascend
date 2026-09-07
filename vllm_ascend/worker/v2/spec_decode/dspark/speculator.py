@@ -36,7 +36,6 @@ from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_wrapper,
     build_draft_attn_metadata_factory,
 )
-from vllm_ascend.worker.v2.eplb import note_speculator_stair_execution
 
 
 class AscendDSparkSpeculator(DSparkSpeculator):
@@ -170,7 +169,6 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         self.input_batch = input_batch
-        note_speculator_stair_execution(self, is_dummy=dummy_run, is_profile=is_profile)
         assert self.input_batch is not None
         with (
             build_attn_metadata_wrapper(),

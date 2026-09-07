@@ -141,6 +141,10 @@ class AscendEplbState(_eplb_state.EplbState):
         if self.stair is not None:
             self.stair.note_execution(model_config.compute_hash(), has_prefill)
 
+    def prepare_forward(self, model_config: Any, num_unpadded_tokens: int, ubatch_slices=None) -> None:
+        super().prepare_forward(model_config, num_unpadded_tokens, ubatch_slices)
+        self.note_stair_execution(model_config, False)
+
     def start_async_loop(
         self,
         rank_mapping: dict[int, int] | None = None,

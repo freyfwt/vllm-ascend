@@ -55,6 +55,17 @@ def test_stair_dummy_step_discards_execution_metadata():
     state.stair.record_step.assert_not_called()
 
 
+def test_prepare_forward_marks_stair_model_execution(monkeypatch):
+    prepare = MagicMock()
+    monkeypatch.setattr(upstream_eplb_state.EplbState, "prepare_forward", prepare)
+    state = AscendEplbState.__new__(AscendEplbState)
+    state.stair = MagicMock()
+    model_config = SimpleNamespace(compute_hash=lambda: "draft")
+    state.prepare_forward(model_config, 3)
+    prepare.assert_called_once_with(model_config, 3, None)
+    state.stair.note_execution.assert_called_once_with("draft", False)
+
+
 def test_layer_state_builds_routing_table_and_preserves_captured_tensor(
     monkeypatch,
 ):

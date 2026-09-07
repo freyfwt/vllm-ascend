@@ -12,7 +12,6 @@ from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm_ascend.worker.v2.eplb import (
     AscendEPLBController,
     _unwrap_moe,
-    note_speculator_stair_execution,
 )
 
 
@@ -75,16 +74,6 @@ class TestAscendEPLBController(unittest.TestCase):
         controller.state = MagicMock()
         controller.close()
         controller.state.close_stair.assert_called_once_with()
-
-    def test_speculator_records_only_real_execution(self):
-        speculator = SimpleNamespace(eplb_state=MagicMock(), draft_model_config=object())
-        note_speculator_stair_execution(speculator, is_dummy=True, is_profile=False)
-        speculator.eplb_state.note_stair_execution.assert_not_called()
-        note_speculator_stair_execution(speculator, is_dummy=False, is_profile=False)
-        speculator.eplb_state.note_stair_execution.assert_called_once_with(
-            speculator.draft_model_config,
-            False,
-        )
 
     def test_step_early_return_conditions(self):
         for condition in (

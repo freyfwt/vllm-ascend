@@ -1,8 +1,9 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-import torch
 import numpy as np
-from unittest.mock import patch
+import pytest
+import torch
 
 from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb.stair_coordinator import PendingSnapshot, StairCoordinator
@@ -85,3 +86,19 @@ def test_planner_failure_restarts_before_disabling(monkeypatch):
     monkeypatch.setattr("vllm_ascend.distributed.eplb.stair_coordinator.dist.broadcast", lambda *_args, **_kwargs: None)
     coordinator.poll_and_broadcast()
     assert not coordinator.disabled
+
+
+def test_startup_identity_rejects_rank_mismatch(monkeypatch):
+    coordinator = StairCoordinator(StairConfig(), "all", torch.device("cpu"), 4)
+    coordinator.topology = SimpleNamespace(digest=lambda: "topology")
+    coordinator.models = {}
+    group = MagicMock()
+    group.size.return_value = 2
+
+    def all_gather(outputs, local, **_kwargs):
+        outputs[0].copy_(local)
+        outputs[1].zero_()
+
+    monkeypatch.setattr("vllm_ascend.distributed.eplb.stair_coordinator.dist.all_gather", all_gather)
+    with pytest.raises(RuntimeError, match="differs across EP ranks"):
+        coordinator._validate_startup_identity(group)

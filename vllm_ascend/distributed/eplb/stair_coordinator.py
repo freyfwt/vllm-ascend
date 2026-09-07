@@ -4,6 +4,7 @@
 """EP-group planning and execution coordination for STAIR."""
 
 import dataclasses
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,7 @@ from vllm_ascend.distributed.eplb.plan_validation import validate_plan
 from vllm_ascend.distributed.eplb.planner_client import PlannerClient, PlannerModel
 from vllm_ascend.distributed.eplb.planner_shared_memory import SharedSnapshotShape
 from vllm_ascend.distributed.eplb.planner_wire import decode_plan, encode_plan
+from vllm_ascend.distributed.eplb.policy.stair_candidate import config_digest
 from vllm_ascend.distributed.eplb.policy.stair_types import RankTopology, RebalancePlan
 from vllm_ascend.distributed.eplb.stair_preflight import validate_stair_model
 from vllm_ascend.distributed.eplb.stair_runtime import StairModelRuntime, canonical_model_id
@@ -102,11 +104,24 @@ class StairCoordinator:
     def start(self) -> None:
         ep_group, eplb_group = get_ep_group(), get_eplb_group()
         self.topology = discover_topology(ep_group, eplb_group)
+        self._validate_startup_identity(ep_group.cpu_group)
         rank = ep_group.device_group.rank()
         if rank == 0:
             self.planner = PlannerClient(self._planner_models())
         device_index = torch.accelerator.current_device_index()
         self.worker = StairTransferWorker(device_index, rank)
+
+    def _validate_startup_identity(self, cpu_group: Any) -> None:
+        assert self.topology is not None
+        parts = [config_digest(self.config), self.topology.digest()]
+        for runtime in sorted(self.models.values(), key=lambda value: value.model_id):
+            parts.extend((runtime.model_id, str(tuple(runtime.ring.values.shape)), str(runtime.num_ranks)))
+        digest = hashlib.sha256("\0".join(parts).encode()).digest()
+        local = torch.tensor(list(digest), dtype=torch.uint8)
+        gathered = [torch.empty_like(local) for _ in range(cpu_group.size())]
+        dist.all_gather(gathered, local, group=cpu_group)
+        if any(not torch.equal(peer, local) for peer in gathered):
+            raise RuntimeError("STAIR config, topology, or model registration differs across EP ranks")
 
     def _planner_models(self) -> tuple[PlannerModel, ...]:
         assert self.topology is not None

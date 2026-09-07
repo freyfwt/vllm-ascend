@@ -69,6 +69,8 @@ class StairCoordinator:
             raise ValueError("Draft-model STAIR requires load_collection_phase='all'")
         ranks = get_ep_group().device_group.size()
         validate_stair_model(model_state, self.config, ranks)
+        for layer in model_state.model.moe_layers:
+            layer.eplb_state._stair_shape_locked = True
         model_id = canonical_model_id(model_config, role, parallel_config)
         runtime = StairModelRuntime.create(
             model_id,

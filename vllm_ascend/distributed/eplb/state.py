@@ -12,9 +12,9 @@ from torch.distributed import all_reduce
 from vllm.distributed import get_ep_group
 from vllm.distributed.eplb import eplb_state as _eplb_state
 
-from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
 from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb.stair_coordinator import StairCoordinator
+from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
 
 ASYNC_EPLB_CYCLE_COMMITTED_LOG = "Ascend async EPLB cycle committed"
 
@@ -67,6 +67,12 @@ class AscendEplbLayerState(_eplb_state.EplbLayerState):
             logical_replica_count,
             get_ep_group().rank_in_group,
         )
+        if (
+            self.expert_replica_routing_table is not None
+            and self.expert_replica_routing_table.shape != new_routing_table.shape
+            and getattr(self, "_stair_shape_locked", False)
+        ):
+            raise RuntimeError("STAIR routing shape changed after graph capture")
         if (
             self.expert_replica_routing_table is not None
             and self.expert_replica_routing_table.shape == new_routing_table.shape

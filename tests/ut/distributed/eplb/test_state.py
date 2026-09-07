@@ -75,6 +75,22 @@ def test_layer_state_builds_routing_table_and_preserves_captured_tensor(
     torch.testing.assert_close(captured_routing_table, new_routing_table)
 
 
+def test_stair_layer_state_rejects_routing_shape_change(monkeypatch):
+    layer_state = AscendEplbLayerState()
+    layer_state.logical_to_physical_map = torch.zeros(2, 2)
+    layer_state.logical_replica_count = torch.ones(2)
+    layer_state.expert_replica_routing_table = torch.zeros(2, 2)
+    layer_state._stair_shape_locked = True
+    monkeypatch.setattr(eplb_state, "get_ep_group", lambda: SimpleNamespace(rank_in_group=0))
+    monkeypatch.setattr(
+        eplb_state._eplb_ops,
+        "build_expert_replica_routing_table",
+        lambda *_args: torch.zeros(3, 2),
+    )
+    with pytest.raises(RuntimeError, match="after graph capture"):
+        layer_state.refresh_expert_replica_routing_table()
+
+
 def test_sync_rearrange_refreshes_all_model_routing_tables(monkeypatch):
     sentinel = object()
     model_states = {"model": object()}

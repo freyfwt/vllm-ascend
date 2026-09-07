@@ -10,6 +10,7 @@ import torch
 
 from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb.transfer_adapter import validate_transfer_capability
+from vllm_ascend.ops.fused_moe.eplb import EXPERT_REPLICA_ROUTING_TABLE_NUM_ROWS
 
 
 def _tensor_schema(tensors: Sequence[torch.Tensor], slots: int) -> tuple:
@@ -44,6 +45,18 @@ def validate_stair_model(model_state: Any, config: StairConfig, num_ranks: int) 
     for layer_idx, tensors in enumerate(layers[1:], start=1):
         if _tensor_schema(tensors, slots) != reference:
             raise ValueError(f"STAIR expert tensor schema changed at layer {layer_idx}")
+
+    expected_routing_shape = (EXPERT_REPLICA_ROUTING_TABLE_NUM_ROWS, logical)
+    moe_layers = list(model.moe_layers)
+    if len(moe_layers) != model.num_moe_layers:
+        raise ValueError("STAIR routing layers do not match the model layer count")
+    for layer_idx, layer in enumerate(moe_layers):
+        layer_state = getattr(layer, "eplb_state", None)
+        routing = getattr(layer_state, "expert_replica_routing_table", None)
+        if routing is None or tuple(routing.shape) != expected_routing_shape:
+            raise ValueError(f"STAIR routing shape is not graph-stable at layer {layer_idx}")
+        if not callable(getattr(layer_state, "refresh_expert_replica_routing_table", None)):
+            raise ValueError(f"STAIR routing refresh capability is missing at layer {layer_idx}")
 
     metadata_bytes = slots * (3 * 1 + 8 + 4)
     staged_bytes = sum(tensor.numel() * tensor.element_size() for tensor in model_state.expert_buffer)

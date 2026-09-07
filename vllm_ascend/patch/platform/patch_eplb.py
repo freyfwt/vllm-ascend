@@ -110,6 +110,9 @@ def _wrap_move_to_workspace(original_move):
             result = original_move(*bound.args, **bound.kwargs)
             if layer_idx is not None:
                 refresh_model_routing_tables(model_state, layer_idx)
+                commit_hook = getattr(model_state, "_stair_commit_hook", None)
+                if commit_hook is not None:
+                    commit_hook(layer_idx)
                 if bound.arguments["ep_rank"] == 0 and layer_idx == model_state.model.num_moe_layers - 1:
                     logger.info(
                         "%s: model=%s",

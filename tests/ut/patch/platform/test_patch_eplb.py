@@ -146,6 +146,7 @@ def test_async_workspace_wrapper_refreshes_committed_layer(monkeypatch):
         rebalanced=True,
         model=SimpleNamespace(num_moe_layers=4),
         model_name="model",
+        _stair_commit_hook=lambda _layer: call_order.append("commit"),
     )
     refresh = MagicMock(side_effect=lambda *_args: call_order.append("refresh"))
     monkeypatch.setattr(patch_eplb, "refresh_model_routing_tables", refresh)
@@ -170,4 +171,4 @@ def test_async_workspace_wrapper_refreshes_committed_layer(monkeypatch):
         patch_eplb.ASYNC_EPLB_CYCLE_COMMITTED_LOG,
         "model",
     )
-    assert call_order == ["move", "refresh", "ack"]
+    assert call_order == ["move", "refresh", "commit", "ack"]

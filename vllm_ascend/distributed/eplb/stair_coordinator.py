@@ -76,6 +76,15 @@ class StairCoordinator:
         self.models_by_id[model_id] = runtime
         model_state._stair_runtime = runtime
 
+        def commit_hook(layer_idx: int) -> None:
+            layer = getattr(model_state, "_stair_pending_layer", None)
+            if layer is None or layer.layer_idx != layer_idx:
+                raise RuntimeError("STAIR committed a layer outside its active transaction")
+            runtime.commit(layer)
+            del model_state._stair_pending_layer
+
+        model_state._stair_commit_hook = commit_hook
+
     def note_execution(self, model_key: str, has_prefill: bool) -> None:
         runtime = self.models.get(model_key)
         if runtime is not None:

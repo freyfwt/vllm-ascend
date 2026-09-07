@@ -26,7 +26,10 @@ def passes_hysteresis(current_score: float, anchor: float | None, config: StairC
         return True
     current_balance = 1.0 / current_score
     anchor_balance = 1.0 / anchor
-    return current_balance / anchor_balance <= config.hysteresis_relative or current_balance <= config.hysteresis_absolute
+    return (
+        current_balance / anchor_balance <= config.hysteresis_relative
+        or current_balance <= config.hysteresis_absolute
+    )
 
 
 def _candidate_key(result: PlacementResult) -> tuple:
@@ -54,7 +57,10 @@ def plan_layer(
     risk = risk_weights(mean, moments, config.z_score)
 
     def screening(replicas: np.ndarray) -> float:
-        placement = unconstrained_lpt(mean, moments, replicas, old_placement.shape[0], config.z_score)
+        try:
+            placement = unconstrained_lpt(mean, moments, replicas, old_placement.shape[0], config.z_score)
+        except ValueError:
+            return float("inf")
         return placement_score(samples, weights, placement).mean
 
     replica_vectors = replica_candidates(

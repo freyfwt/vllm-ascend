@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import math
 import os
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -153,10 +154,12 @@ class StairConfig:
                 raise ValueError(f"stair_config.{name} must be in [{lower}, {upper}], got {value}")
         if self.hysteresis_relative == 0 or self.hysteresis_absolute == 0:
             raise ValueError("STAIR hysteresis thresholds must be greater than zero")
+        if not math.isfinite(self.imbalance_threshold) or self.imbalance_threshold < 1:
+            raise ValueError("stair_config.imbalance_threshold must be finite and at least one")
         if self.min_relative_score_improvement == 1:
             raise ValueError("stair_config.min_relative_score_improvement must be less than one")
         for name in ("min_absolute_score_improvement", "p95_regression_tolerance"):
-            if getattr(self, name) < 0:
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"stair_config.{name} must be non-negative")
         if self.planner_cpu_set != "auto":
             if not isinstance(self.planner_cpu_set, list) or not self.planner_cpu_set:

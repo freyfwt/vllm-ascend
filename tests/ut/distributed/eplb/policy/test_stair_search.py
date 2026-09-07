@@ -7,6 +7,8 @@ def test_capped_min_max_is_stable_and_respects_rank_cap():
     result = capped_min_max(np.array([9.0, 4.0, 1.0]), np.ones(3), 3, 2)
     np.testing.assert_array_equal(result, [2, 2, 2])
     assert capped_min_max(np.ones(2), np.array([2, 2]), 1, 2) is None
+    with np.testing.assert_raises(ValueError):
+        capped_min_max(np.ones(2), np.array([0, 1]), 1, 2)
 
 
 def test_replica_search_returns_only_complete_bounded_vectors():

@@ -222,6 +222,8 @@ class TestAscendConfig(TestBase):
             StairConfig(experimental_flash_tree_width=33)
         with self.assertRaises(ValueError):
             StairConfig(planner_cpu_set=[1, 1])
+        with self.assertRaisesRegex(ValueError, "imbalance_threshold"):
+            StairConfig(imbalance_threshold=0.99)
         with self.assertRaises(ValueError):
             StairConfig(unknown_option=True)  # type: ignore[call-arg]
 

@@ -8,7 +8,6 @@ from collections.abc import Callable, Iterable
 import numpy as np
 import numpy.typing as npt
 
-
 ReplicaVector = npt.NDArray[np.int64]
 
 
@@ -23,7 +22,13 @@ def capped_min_max(
     weights = np.asarray(risk, dtype=np.float64)
     result = np.asarray(replicas, dtype=np.int64).copy()
     allowed = tuple(range(weights.size)) if experts is None else tuple(experts)
-    if weights.shape != result.shape or not np.all(np.isfinite(weights)) or slots < 0:
+    if (
+        weights.shape != result.shape
+        or not np.all(np.isfinite(weights))
+        or np.any(result < 1)
+        or np.any(result > num_ranks)
+        or slots < 0
+    ):
         raise ValueError("Invalid STAIR replica allocation input")
     for _ in range(slots):
         candidates = [expert for expert in allowed if result[expert] < num_ranks]

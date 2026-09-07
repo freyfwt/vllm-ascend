@@ -4,6 +4,9 @@
 """Rank-zero lifecycle for the persistent STAIR planner process."""
 
 from dataclasses import dataclass
+from time import monotonic
+
+import numpy as np
 
 from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb.planner_protocol import (
@@ -15,7 +18,9 @@ from vllm_ascend.distributed.eplb.planner_protocol import (
 )
 from vllm_ascend.distributed.eplb.planner_shared_memory import SharedSnapshotBuffer, SharedSnapshotShape
 from vllm_ascend.distributed.eplb.planner_subprocess import apply_affinity, spawn_planner
-from vllm_ascend.distributed.eplb.policy.stair_types import RankTopology
+from vllm_ascend.distributed.eplb.planner_wire import PlanRequest, decode_plan, encode_request
+from vllm_ascend.distributed.eplb.policy.stair_candidate import config_digest
+from vllm_ascend.distributed.eplb.policy.stair_types import RankTopology, RebalancePlan
 
 
 class PlannerProcessError(RuntimeError):
@@ -39,6 +44,8 @@ class PlannerClient:
         self._models = {model.model_id: model for model in models}
         self._shared = {model.model_id: SharedSnapshotBuffer.create(model.shape) for model in models}
         self._closed = False
+        self._active: PlanRequest | None = None
+        self._active_since = 0.0
         try:
             self._process, self._connection = spawn_planner(
                 tuple(shared.spec.fd for shared in self._shared.values())
@@ -83,11 +90,104 @@ class PlannerClient:
         for shared in self._shared.values():
             shared.close()
 
+    def submit(
+        self,
+        model_id: str,
+        bin_sums: np.ndarray,
+        bin_lengths: np.ndarray,
+        placements: np.ndarray,
+        placement_epochs: np.ndarray,
+        accepted_scores: np.ndarray,
+        *,
+        planning_round: int,
+        snapshot_sequence: int,
+        sample_sequence: int,
+        stats_schema_epoch: int,
+        key_digest: str,
+    ) -> bool:
+        """Publish one snapshot, or leave it with the caller while busy."""
+        if self._closed:
+            raise PlannerProcessError("STAIR planner client is closed")
+        if self._active is not None:
+            return False
+        model = self._models.get(model_id)
+        if model is None:
+            raise PlannerProcessError(f"Unknown STAIR planner model {model_id}")
+        slot, sequence, digest = self._shared[model_id].write(
+            bin_sums, bin_lengths, placements, placement_epochs, accepted_scores
+        )
+        request = PlanRequest(
+            model_id,
+            slot,
+            len(bin_lengths),
+            sequence,
+            planning_round,
+            snapshot_sequence,
+            sample_sequence,
+            stats_schema_epoch,
+            digest,
+            key_digest,
+            config_digest(model.config),
+        )
+        send_frame(self._connection, WireOp.PLAN, encode_request(request))
+        self._active = request
+        self._active_since = monotonic()
+        return True
+
+    def poll(self) -> RebalancePlan | None:
+        """Return a completed plan without waiting for healthy planning work."""
+        request = self._active
+        if request is None:
+            return None
+        model = self._models[request.model_id]
+        if self._process.poll() is not None:
+            raise PlannerProcessError(f"STAIR planner exited with status {self._process.returncode}")
+        if not self._connection.poll():
+            if monotonic() - self._active_since > model.config.planner_heartbeat_timeout_s:
+                self._process.kill()
+                raise PlannerProcessError("STAIR planner health timeout")
+            return None
+        operation, payload = receive_frame(self._connection)
+        if operation == WireOp.ERROR:
+            raise PlannerProcessError(payload.decode(errors="replace"))
+        if operation != WireOp.RESULT:
+            raise PlannerProcessError("STAIR planner returned an unexpected operation")
+        plan = decode_plan(payload, (model.shape.num_ranks, model.shape.slots_per_rank))
+        expected = (
+            request.model_id,
+            request.planning_round,
+            request.snapshot_sequence,
+            request.sample_sequence,
+            request.stats_schema_epoch,
+            request.config_digest,
+            model.topology.digest(),
+        )
+        actual = (
+            plan.model_id,
+            plan.planning_round,
+            plan.snapshot_sequence,
+            plan.sample_sequence,
+            plan.stats_schema_epoch,
+            plan.config_digest,
+            plan.topology_digest,
+        )
+        if actual != expected:
+            raise PlannerProcessError("STAIR planner result identity mismatch")
+        self._active = None
+        return plan
+
     def close(self) -> None:
         if self._closed:
             return
         try:
             if self._process.poll() is None:
+                if self._active is not None:
+                    operation, _ = self._receive(
+                        self._models[self._active.model_id].config.planner_heartbeat_timeout_s
+                    )
+                    if operation != WireOp.RESULT:
+                        raise PlannerProcessError("STAIR planner drain failed")
+                    self._active = None
                 send_frame(self._connection, WireOp.SHUTDOWN)
                 operation, payload = self._receive(max(model.config.planner_heartbeat_timeout_s for model in self._models.values()))
                 if operation != WireOp.ACK or payload != b"shutdown":

@@ -12,6 +12,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.v1.worker.gpu.eplb_utils import EPLBController
 
 from vllm_ascend.distributed.eplb.state import AscendEplbState
+from vllm_ascend.ascend_config import StairConfig
 
 
 def is_eplb_load_collection_phase_matched(
@@ -39,18 +40,29 @@ class AscendEPLBController(EPLBController):
         parallel_config: Any,
         device: torch.device,
         load_collection_phase: str = "all",
+        algorithm: str = "default",
+        stair_config: StairConfig | None = None,
     ) -> None:
         super().__init__(parallel_config, device)
         self.load_collection_phase = load_collection_phase
+        self.algorithm = algorithm
+        self.stair_config = stair_config
+        self._batch_has_prefill = False
         self._load_collection_phase_matched = True
 
     def prepare_load(self) -> None:
         self.state = None
         self._has_registered_models = False
         if self.parallel_config.enable_eplb:
-            self.state = AscendEplbState(self.parallel_config, self.device)
+            kwargs = (
+                {"stair_config": self.stair_config, "load_collection_phase": self.load_collection_phase}
+                if self.algorithm == "stair"
+                else {}
+            )
+            self.state = AscendEplbState(self.parallel_config, self.device, **kwargs)
 
     def set_batch_phase(self, batch_has_prefill: bool) -> None:
+        self._batch_has_prefill = batch_has_prefill
         self._load_collection_phase_matched = is_eplb_load_collection_phase_matched(
             self.load_collection_phase,
             batch_has_prefill,
@@ -66,6 +78,11 @@ class AscendEPLBController(EPLBController):
         if state is None or not self.parallel_config.enable_eplb:
             return
         state.prepare_forward(model_config, num_unpadded_tokens, ubatch_slices)
+        if state.stair is not None:
+            state.note_stair_execution(model_config, self._batch_has_prefill)
+            if state.should_record_tensor is not None:
+                state.should_record_tensor.fill_(True)
+            return
         if state.should_record_tensor is not None:
             should_record = (
                 state._should_record_current_step(log_stats=self.parallel_config.eplb_config.log_balancedness)
@@ -93,5 +110,10 @@ class AscendEPLBController(EPLBController):
         )
         if old_num_physical_experts is not None:
             from_mapping_kwargs["num_valid_physical_experts"] = old_num_physical_experts
+        if self.algorithm == "stair":
+            from_mapping_kwargs.update(
+                stair_config=self.stair_config,
+                load_collection_phase=self.load_collection_phase,
+            )
         self.state = AscendEplbState.from_mapping(**from_mapping_kwargs)
         self._has_registered_models = True

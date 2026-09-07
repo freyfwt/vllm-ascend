@@ -113,6 +113,7 @@ class TestAscendEPLBController(unittest.TestCase):
         controller.load_collection_phase = "prefill"
         controller.set_batch_phase(batch_has_prefill=True)
         state = MagicMock()
+        state.stair = None
         state.should_record_tensor = torch.zeros((), dtype=torch.bool)
         state._should_record_current_step.return_value = True
         state._has_fresh_recorded_load = False
@@ -138,6 +139,7 @@ class TestAscendEPLBController(unittest.TestCase):
         controller.load_collection_phase = "prefill"
         controller.set_batch_phase(batch_has_prefill=False)
         state = MagicMock()
+        state.stair = None
         state.should_record_tensor = torch.ones((), dtype=torch.bool)
         state._should_record_current_step.return_value = True
         state._has_fresh_recorded_load = False
@@ -154,6 +156,7 @@ class TestAscendEPLBController(unittest.TestCase):
     def test_prepare_forward_disables_closed_window(self):
         controller = self._make_controller()
         state = MagicMock()
+        state.stair = None
         state.should_record_tensor = torch.ones((), dtype=torch.bool)
         state._should_record_current_step.return_value = False
         state._has_fresh_recorded_load = False
@@ -166,6 +169,20 @@ class TestAscendEPLBController(unittest.TestCase):
         )
         self.assertFalse(state.should_record_tensor.item())
         self.assertFalse(state._has_fresh_recorded_load)
+
+    def test_prepare_forward_records_stair_execution_before_phase_filter(self):
+        controller = self._make_controller()
+        controller.set_batch_phase(True)
+        state = MagicMock()
+        state.stair = object()
+        state.should_record_tensor = torch.zeros((), dtype=torch.bool)
+        controller.state = state
+        model_config = SimpleNamespace()
+
+        controller.prepare_forward(model_config, 4)
+
+        state.note_stair_execution.assert_called_once_with(model_config, True)
+        self.assertTrue(state.should_record_tensor.item())
 
     def test_setup_from_mapping_constructs_state_and_registers_model(self):
         controller = self._make_controller()

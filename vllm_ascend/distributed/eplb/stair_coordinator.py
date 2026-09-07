@@ -19,6 +19,7 @@ from vllm_ascend.distributed.eplb.planner_client import PlannerClient, PlannerMo
 from vllm_ascend.distributed.eplb.planner_shared_memory import SharedSnapshotShape
 from vllm_ascend.distributed.eplb.planner_wire import decode_plan, encode_plan
 from vllm_ascend.distributed.eplb.policy.stair_types import RankTopology, RebalancePlan
+from vllm_ascend.distributed.eplb.stair_preflight import validate_stair_model
 from vllm_ascend.distributed.eplb.stair_runtime import StairModelRuntime, canonical_model_id
 from vllm_ascend.distributed.eplb.stair_snapshot import sync_snapshot
 from vllm_ascend.distributed.eplb.stair_worker import StairTransferWorker
@@ -65,6 +66,7 @@ class StairCoordinator:
         if role == "draft" and self.phase != "all":
             raise ValueError("Draft-model STAIR requires load_collection_phase='all'")
         ranks = get_ep_group().device_group.size()
+        validate_stair_model(model_state, self.config, ranks)
         model_id = canonical_model_id(model_config, role, parallel_config)
         runtime = StairModelRuntime.create(
             model_id,
@@ -263,7 +265,11 @@ class StairCoordinator:
             return
         if int(length[0]) == 0:
             return
-        data = torch.tensor(list(payload), dtype=torch.uint8) if rank == 0 else torch.empty(int(length[0]), dtype=torch.uint8)
+        data = (
+            torch.tensor(list(payload), dtype=torch.uint8)
+            if rank == 0
+            else torch.empty(int(length[0]), dtype=torch.uint8)
+        )
         dist.broadcast(data, src=source, group=cpu_group)
         any_runtime = next(iter(self.models.values()))
         shape = (any_runtime.num_ranks, any_runtime.model_state.model.num_physical_experts // any_runtime.num_ranks)

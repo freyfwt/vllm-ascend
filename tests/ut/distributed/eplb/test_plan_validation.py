@@ -5,8 +5,8 @@ import pytest
 
 from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb.plan_validation import validate_plan
-from vllm_ascend.distributed.eplb.policy.stair import config_digest, plan_rebalance
-from vllm_ascend.distributed.eplb.policy.stair_types import LayerPlan, RankTopology
+from vllm_ascend.distributed.eplb.policy.stair import plan_rebalance
+from vllm_ascend.distributed.eplb.policy.stair_types import BalanceScore, LayerPlan, RankTopology
 
 
 def _values():
@@ -87,3 +87,26 @@ def test_parent_validation_rejects_forged_source():
     )
     with pytest.raises(ValueError, match="source"):
         _validate(dataclasses.replace(plan, layers=(forged,)), placements, topology, config)
+
+
+def test_parent_validation_recomputes_reported_scores():
+    plan, placements, topology, config = _values()
+    layer = plan.layers[0]
+    forged = dataclasses.replace(
+        layer,
+        current_score=BalanceScore(
+            layer.current_score.mean + 0.1,
+            layer.current_score.p95,
+            layer.current_score.maximum,
+        ),
+    )
+    load = np.array([[[100, 30, 10, 1]], [[80, 40, 10, 1]]])
+    with pytest.raises(ValueError, match="submitted snapshot"):
+        _validate(
+            dataclasses.replace(plan, layers=(forged,)),
+            placements,
+            topology,
+            config,
+            logical_load=load,
+            sample_weights=np.ones(2, dtype=np.int64),
+        )

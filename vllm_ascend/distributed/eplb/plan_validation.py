@@ -9,6 +9,7 @@ import numpy as np
 
 from vllm_ascend.ascend_config import StairConfig
 from vllm_ascend.distributed.eplb.policy.stair_candidate import config_digest
+from vllm_ascend.distributed.eplb.policy.stair_stats import placement_score
 from vllm_ascend.distributed.eplb.policy.stair_types import RankTopology, RebalancePlan, validate_placement
 
 
@@ -24,6 +25,8 @@ def validate_plan(
     snapshot_sequence: int,
     sample_sequence: int,
     stats_schema_epoch: int,
+    logical_load: np.ndarray | None = None,
+    sample_weights: np.ndarray | None = None,
 ) -> None:
     """Reject a plan before any transfer when one invariant has changed."""
     expected_identity = (
@@ -102,6 +105,23 @@ def validate_plan(
         )
         if not np.all(np.isfinite(scores)):
             raise ValueError("STAIR plan score contains NaN or infinity")
+        if logical_load is not None and sample_weights is not None:
+            samples = np.asarray(logical_load, dtype=np.float64)[:, layer_idx]
+            current_score = placement_score(samples, sample_weights, layer.old_placement)
+            candidate_score = placement_score(samples, sample_weights, layer.new_placement)
+            reported = np.asarray(scores)
+            recomputed = np.asarray(
+                (
+                    current_score.mean,
+                    current_score.p95,
+                    current_score.maximum,
+                    candidate_score.mean,
+                    candidate_score.p95,
+                    candidate_score.maximum,
+                )
+            )
+            if not np.allclose(reported, recomputed, rtol=1e-12, atol=1e-12):
+                raise ValueError("STAIR planner score does not match the submitted snapshot")
         relative_gain = (layer.current_score.mean - layer.candidate_score.mean) / layer.current_score.mean
         if (
             relative_gain < config.min_relative_score_improvement

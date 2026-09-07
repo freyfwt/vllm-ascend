@@ -244,6 +244,8 @@ class StairCoordinator:
                 snapshot_sequence=pending.snapshot_sequence,
                 sample_sequence=pending.sample_sequence,
                 stats_schema_epoch=self.stats_schema_epoch,
+                logical_load=pending.bin_sums / pending.bin_lengths[:, None, None],
+                sample_weights=pending.bin_lengths,
             )
         except ValueError as error:
             logger.warning("Discarding stale or invalid STAIR plan: %s", error)

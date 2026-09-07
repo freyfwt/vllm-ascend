@@ -82,9 +82,10 @@ EPLB is not recommended in the following scenarios because the load-balancing be
 ### Model Runner V2: Asynchronous EPLB
 
 Select MRv2 explicitly when the model or environment does not select it by
-default. Enable expert parallelism and upstream EPLB. Ascend uses the upstream
-default policy, selects the Gloo communicator automatically, and supports
-asynchronous movement only.
+default. Enable expert parallelism and upstream EPLB. Ascend selects the Gloo
+communicator automatically and supports asynchronous movement only. The
+upstream default policy remains the default algorithm; STAIR is an optional
+Ascend-private algorithm.
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=1
@@ -122,7 +123,7 @@ They must not be placed in `--additional-config` for MRv2.
 
 #### MRv2 Load Collection Phase
 
-`load_collection_phase` is the only MRv2 EPLB field under
+`load_collection_phase` is an MRv2 EPLB field under
 `additional_config.eplb_config`. It controls which batch phases contribute to
 the upstream load window; it does not disable routing or MoE computation for
 non-matching batches.
@@ -149,6 +150,53 @@ vllm serve Qwen/Qwen3-30B-A3B \
   --eplb-config.use_async true \
   --additional-config '{"eplb_config":{"load_collection_phase":"prefill"}}'
 ```
+
+#### MRv2 STAIR Algorithm
+
+STAIR combines time-series load statistics and FlashTree-style replica search with risk-aware LPT placement, an explicit per-layer source assignment, and a configurable directed rank-pair migration cap. It optimizes mean rank-load imbalance and uses p95 as an admission guard. Planning runs in one persistent CPU subprocess on EP rank 0; every rank validates and executes the resulting layers one at a time.
+
+Enable it while keeping the upstream policy set to `default`:
+
+```bash
+vllm serve Qwen/Qwen3-30B-A3B \
+  --enable-expert-parallel \
+  --enable-eplb \
+  --eplb-config.use_async true \
+  --eplb-config.policy default \
+  --eplb-config.num_redundant_experts 16 \
+  --additional-config '{"eplb_config":{"algorithm":"stair"}}'
+```
+
+The defaults are intended for normal use. `stair_config` exposes advanced tuning without allowing correctness checks or transaction ordering to be disabled:
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `sample_size` | `64` | Maximum number of weighted time bins. |
+| `z_score` | `0.67448975` | Standard-deviation weight in expert and rank risk. |
+| `use_covariance` | `false` | Include cross-expert covariance; requires quadratic planner memory. |
+| `imbalance_threshold` | `1.01` | Skip layers at or below this mean imbalance. |
+| `hysteresis_enabled` | `true` | Gate replanning against the last committed predicted score. |
+| `hysteresis_relative` | `0.90` | Relative balance-ratio gate. |
+| `hysteresis_absolute` | `0.85` | Absolute balance-ratio gate. |
+| `max_expert_transfers_per_rank_pair` | `1` | Maximum expert moves per directed rank pair and layer. |
+| `min_relative_score_improvement` | `0.01` | Minimum relative mean-score improvement. |
+| `min_absolute_score_improvement` | `0.0` | Optional absolute mean-score improvement. |
+| `p95_regression_tolerance` | `0.0` | Allowed relative p95 regression. |
+| `max_plan_age_intervals` | `1` | Maximum planning-round age before PREPARE. |
+| `planner_cpu_set` | `"auto"` | Optional CPU affinity list for the planner. |
+| `planner_affinity_strict` | `false` | Fail startup when requested affinity cannot be applied. |
+| `planner_restart_limit` | `1` | Planner restarts allowed before STAIR is disabled. |
+| `planner_heartbeat_timeout_s` | `30.0` | Planner health timeout. |
+| `max_staged_bytes_per_rank` | `"auto"` | Per-rank full-layer staging limit. |
+| `experimental_flash_tree_depth` | `4` | Replica-search grouping depth. |
+| `experimental_flash_tree_width` | `8` | Neighboring group budgets explored on each side. |
+| `experimental_max_candidates_per_layer` | `64` | Beam and final candidate cap. |
+| `experimental_lpt_max_backtracks` | `8` | Deterministic constrained-LPT backtrack cap. |
+| `experimental_score_tie_tolerance` | `1e-9` | Score tolerance before migration cost breaks a tie. |
+
+STAIR requires evenly divided physical experts, at least one redundant expert, no repeated logical expert within a rank, a graph-stable routing table, and a supported fixed expert tensor schema. Startup rejects an invalid placement, tensor layout, staging limit, communicator, process-group mapping, or rank-local configuration mismatch. Draft-model STAIR currently requires `load_collection_phase="all"`.
+
+Planner failure before transfer is restartable up to the configured limit and then disables STAIR consistently. Once a layer passes PREPARE and starts P2P staging, transfer, installation, mapping commit, and routing refresh form one fail-stop transaction; the service does not silently fall back to a different source assignment.
 
 !!! IMPORTANT
 

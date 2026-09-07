@@ -1,11 +1,11 @@
 # Model Runner V2 EPLB Architecture
 
 Model Runner V2 on Ascend uses the upstream vLLM Expert Parallelism Load
-Balancer (EPLB) control plane and adds a small Ascend-specific integration
-plane. Upstream code owns load windows, policy execution, placement state, and
-the rearrangement transaction. vLLM Ascend owns device routing, executed-load
-recording, quantized expert-weight views, and the asynchronous Gloo-staged
-movement adapter.
+Balancer (EPLB) control plane and adds Ascend-specific routing and movement.
+The default algorithm keeps upstream ownership of load windows, policy
+execution, and rearrangement. The optional STAIR algorithm owns a private
+time-series planner and explicit-source transaction while reusing the same
+committed placement state, quantized weight views, and Gloo communicator.
 
 This page describes the current asynchronous architecture. For the decisions
 behind this ownership model, see
@@ -26,8 +26,9 @@ EPLB has a control plane and a data plane:
   through the upstream rearrangement transaction using a Gloo-staged worker;
   the model-runner thread commits completed layers between forwards.
 
-The Ascend integration adapts the boundaries between these planes; it does not
-implement a second controller or placement lifecycle.
+The Ascend integration preserves one committed placement lifecycle. STAIR
+replaces planning and staging, but commits through the same main-thread mapping
+and routing refresh boundary.
 
 ```mermaid
 flowchart LR
@@ -37,7 +38,10 @@ flowchart LR
     C -->|"physical expert IDs"| E["Quantized fused MoE"]
     E -->|"executed expert counts"| F["Load recorder"]
     F --> A
+    F --> I["STAIR logical time-series ring"]
+    I --> J["Rank-0 CPU planner"]
     A -->|"default-policy placement"| G["Quantization-owned weight views"]
+    J -->|"explicit source plan"| G
     G <-->|"Gloo-staged transfer"| H["Peer EP ranks"]
     G -->|"main-thread commit"| B
 ```
@@ -53,6 +57,8 @@ flowchart LR
 | Fused MoE EPLB helpers | Device lookup and post-compute physical load recording |
 | Quantization method | View of the expert tensors and metadata actually consumed by its kernel |
 | `AscendGlooEplbCommunicator` | Upstream asynchronous communicator contract implemented with CPU staging over Gloo |
+| STAIR coordinator and planner | Phase-aligned logical history, deterministic six-stage planning, typed plan broadcast, and one group-wide layer queue |
+| STAIR transfer adapter | Exact execution of planner-selected source rank and slot without source re-derivation |
 | Platform patch | Capability adaptation and the narrow construction/commit hooks not exposed by upstream |
 
 The platform patch is an entry adapter. Runtime routing, state management, and
@@ -87,6 +93,15 @@ Phase selection filters only the load submitted by a rank. Every rank still
 advances the upstream EPLB state machine and participates in its collectives in
 the same order, even when local batches belong to different phases.
 
+When STAIR is selected, each model immediately aggregates physical counts with
+the mapping active for that step into a device-resident logical ring. At a
+planning boundary, ranks align outer-step keys and model phase metadata,
+compress selected steps into weighted integer bins, and reduce them once. EP
+rank 0 submits the snapshot to a persistent CPU-only planner. The planner
+filters balanced layers, searches replica counts, performs constrained LPT
+placement, solves exact source capacity matching, preserves local slots, and
+admits only plans that improve mean imbalance without exceeding the p95 guard.
+
 The lookup is a fixed-shape device tensor whose object identity remains stable.
 When placement changes, `AscendEplbLayerState` builds the new values and copies
 them into the existing tensor. Long-lived router instances and compiled call
@@ -101,6 +116,13 @@ Gloo one layer at a time. The model-runner thread installs each published
 layer, commits its placement, and refreshes the device lookup before
 acknowledging the staging buffer. Routing never observes a lookup for an
 uncommitted placement.
+
+STAIR follows the same commit boundary but carries immutable old/new placement,
+source rank, source slot, placement epoch, configuration digest, topology
+digest, and score identity. The parent recomputes legality and scores before
+PREPARE. The transfer adapter posts only the specified sends and receives. A
+layer commits in the order install, mapping update, in-place routing refresh,
+placement epoch and hysteresis-anchor update, then workspace acknowledgement.
 
 Expert storage is quantization-specific. Some kernels consume independent
 per-expert tensors, while others consume packed tensors or associated scale and
@@ -150,6 +172,12 @@ Changes to this integration must preserve these invariants:
 8. EPLB-disabled execution and the Model Runner V1 EPLB path remain isolated.
 9. The routing hot path avoids host loops, device-to-host synchronization, and
    mutable Python mapping work.
+10. STAIR never repeats a logical expert within one rank and never exceeds its
+    directed rank-pair migration cap.
+11. A STAIR plan is valid only for its model, sample, schema, topology,
+    configuration, planning age, and per-layer placement epoch.
+12. Planner failure is recoverable only before PREPARE; transfer or commit
+    failure after PREPARE is fail-stop.
 
 ## Extension and debugging anchors
 

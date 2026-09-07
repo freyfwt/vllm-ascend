@@ -112,9 +112,9 @@ The details of each configuration option are as follows:
 
 The accepted fields depend on the model runner:
 
-- **Model Runner V2** accepts only `load_collection_phase` here. Configure
-  upstream EPLB through `--enable-eplb` and `--eplb-config`. Ascend uses the
-  upstream default policy and asynchronous Gloo movement.
+- **Model Runner V2** accepts `algorithm`, `load_collection_phase`, and
+  `stair_config` here. Configure shared EPLB settings through `--enable-eplb`
+  and `--eplb-config`. Ascend uses asynchronous Gloo movement.
 - **Model Runner V1** accepts the legacy fields below except
   `load_collection_phase`.
   MRv1 does not accept upstream `--enable-eplb` on Ascend.
@@ -132,7 +132,9 @@ configuration.
 | `num_redundant_experts`          | int | `0`    | MRv1 only in this table. Configure the MRv2 value through upstream `--eplb-config`. |
 | `eplb_policy_type`               | int | `2`    | MRv1 only. EPLB policy: `0`=Random, `1`=DefaultEplb, `2`=SwiftBalanceEplb, `3`=FlashLB. |
 | `eplb_heat_collection_stage`     | str | `"all"`| MRv1 only. Select `"all"`, `"prefill"`, or `"decode"` heat collection. |
+| `algorithm`                      | str | `"default"` | MRv2 only. Select the upstream `"default"` policy or Ascend-private `"stair"`. |
 | `load_collection_phase`          | str | `"all"`| MRv2 only. Select `"all"`, `"prefill"`, or `"decode"` load submission. Any batch containing a prefill request is classified entirely as prefill. |
+| `stair_config`                   | dict | `None` | MRv2 only. Optional advanced STAIR tuning. It is rejected unless `algorithm="stair"`. |
 
 **scheduler_config**
 

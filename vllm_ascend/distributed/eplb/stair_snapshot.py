@@ -4,11 +4,20 @@
 """Build aligned, phase-filtered STAIR snapshots at planning boundaries."""
 
 import hashlib
+from dataclasses import dataclass
 
 import torch
 from torch.distributed import ProcessGroup, all_gather, all_reduce
 
 from vllm_ascend.distributed.eplb.logical_ring import LogicalLoadRing
+
+
+@dataclass(frozen=True)
+class SynchronizedSnapshot:
+    bin_sums: torch.Tensor | None
+    bin_lengths: tuple[int, ...]
+    key_digest: str
+    sample_count: int
 
 
 def phase_mask(group_metadata: torch.Tensor, phase: str) -> torch.Tensor:
@@ -36,7 +45,7 @@ def sync_snapshot(
     cpu_group: ProcessGroup,
     device_group: ProcessGroup,
     group_rank: int,
-) -> tuple[torch.Tensor, tuple[int, ...], str] | None:
+) -> SynchronizedSnapshot | None:
     """Return one rank-zero CPU snapshot after aligned device-side reduction."""
     world_size = cpu_group.size()
     progress = torch.tensor((ring.valid_size, ring.sample_sequence), dtype=torch.int64)
@@ -63,6 +72,5 @@ def sync_snapshot(
     all_reduce(bin_sums, group=device_group)
     selected_keys = keys[selected]
     digest = hashlib.sha256(selected_keys.numpy().astype("<i8", copy=False).tobytes()).hexdigest()
-    if group_rank != 0:
-        return None
-    return bin_sums.cpu(), lengths, digest
+    cpu_sums = bin_sums.cpu() if group_rank == 0 else None
+    return SynchronizedSnapshot(cpu_sums, lengths, digest, len(selected_indices))

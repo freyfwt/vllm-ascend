@@ -26,6 +26,15 @@ def test_model_runtime_records_execution_and_resets_hot_state():
     assert not runtime.executed
 
 
+def test_model_runtime_discards_dummy_execution_metadata():
+    runtime = _runtime()
+    runtime.note_execution(True)
+    runtime.discard_step()
+    assert not runtime.executed
+    assert not runtime.has_prefill
+    assert runtime.model_state.expert_load_pass.sum() == 0
+
+
 def test_model_runtime_updates_anchor_only_on_commit():
     runtime = _runtime()
     placement = runtime.placements()[0]

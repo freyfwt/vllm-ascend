@@ -43,6 +43,18 @@ def test_stair_step_records_polls_and_snapshots_without_upstream_policy():
     assert state.should_record_tensor.item()
 
 
+def test_stair_dummy_step_discards_execution_metadata():
+    state = AscendEplbState.__new__(AscendEplbState)
+    state.stair = MagicMock()
+    state.stair.active_model_state = None
+    state.expert_rearrangement_step = 0
+    state.expert_rearrangement_step_interval = 2
+    state.should_record_tensor = None
+    state.step(is_dummy=True)
+    state.stair.discard_step.assert_called_once_with()
+    state.stair.record_step.assert_not_called()
+
+
 def test_layer_state_builds_routing_table_and_preserves_captured_tensor(
     monkeypatch,
 ):

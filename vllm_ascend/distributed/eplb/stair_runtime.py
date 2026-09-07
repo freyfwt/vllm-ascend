@@ -89,6 +89,11 @@ class StairModelRuntime:
         self.executed = False
         self.has_prefill = False
 
+    def discard_step(self) -> None:
+        self.model_state.expert_load_pass.zero_()
+        self.executed = False
+        self.has_prefill = False
+
     def placements(self) -> np.ndarray:
         mapping = self.model_state.physical_to_logical_map.detach().to(device="cpu", dtype=torch.long).numpy()
         return mapping.reshape(mapping.shape[0], self.num_ranks, -1)

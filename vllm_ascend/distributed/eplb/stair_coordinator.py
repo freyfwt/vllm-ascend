@@ -103,6 +103,10 @@ class StairCoordinator:
         for runtime in self.models.values():
             runtime.record_step(self.outer_step_key)
 
+    def discard_step(self) -> None:
+        for runtime in self.models.values():
+            runtime.discard_step()
+
     def start(self) -> None:
         ep_group, eplb_group = get_ep_group(), get_eplb_group()
         self.topology = discover_topology(ep_group, eplb_group)

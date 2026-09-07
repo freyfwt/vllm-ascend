@@ -167,11 +167,11 @@ class AscendEplbState(_eplb_state.EplbState):
             super().step(is_dummy=is_dummy, is_profile=is_profile, log_stats=log_stats)
             return
         if is_profile:
+            self.stair.discard_step()
             super().step(is_dummy=is_dummy, is_profile=True, log_stats=log_stats)
             return
         if is_dummy:
-            for model_state in self.model_states.values():
-                model_state.expert_load_pass.zero_()
+            self.stair.discard_step()
         else:
             self.stair.record_step()
 

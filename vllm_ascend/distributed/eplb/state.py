@@ -147,6 +147,40 @@ class AscendEplbState(_eplb_state.EplbState):
             raise ValueError("STAIR does not support elastic or profile transfer loops")
         self.stair.start()
 
+    def step(
+        self,
+        is_dummy: bool = False,
+        is_profile: bool = False,
+        log_stats: bool = False,
+    ) -> None:
+        if self.stair is None:
+            super().step(is_dummy=is_dummy, is_profile=is_profile, log_stats=log_stats)
+            return
+        if is_profile:
+            super().step(is_dummy=is_dummy, is_profile=True, log_stats=log_stats)
+            return
+        if is_dummy:
+            for model_state in self.model_states.values():
+                model_state.expert_load_pass.zero_()
+        else:
+            self.stair.record_step()
+
+        self.stair.poll_and_broadcast()
+        self.stair.start_next_layer()
+        self.stair.check_worker_health()
+        active = self.stair.active_model_state
+        if active is not None and self._all_ranks_result_ready(active):
+            ep_rank = get_ep_group().device_group.rank()
+            _eplb_state._move_to_workspace(model_state=active, ep_rank=ep_rank)
+            self.stair.finish_active_layer()
+
+        self.expert_rearrangement_step += 1
+        if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
+            self.expert_rearrangement_step = 0
+            self.stair.snapshot()
+        if self.should_record_tensor is not None:
+            self.should_record_tensor.fill_(True)
+
     def _has_global_fresh_recorded_load(self) -> bool:
         """Synchronize whether any EP rank recorded load since rearranging."""
         ep_group = get_ep_group()

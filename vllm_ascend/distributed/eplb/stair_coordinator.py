@@ -292,6 +292,13 @@ class StairCoordinator:
     def active_model_state(self) -> Any | None:
         return None if self._active_layer is None else self._active_layer[1].model_state
 
+    def check_worker_health(self) -> None:
+        healthy = self.worker is not None and self.worker.failure is None
+        flag = torch.tensor((int(healthy),), dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=get_ep_group().cpu_group)
+        if not bool(flag[0]):
+            raise RuntimeError("STAIR transfer failed after PREPARE; terminating consistently")
+
     def close(self) -> None:
         if self.worker is not None:
             self.worker.close()

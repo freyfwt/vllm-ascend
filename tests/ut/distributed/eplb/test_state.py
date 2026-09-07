@@ -24,6 +24,25 @@ def test_default_async_loop_delegates_to_upstream(monkeypatch):
     start.assert_called_once_with(rank_mapping=None, is_profile=False)
 
 
+def test_stair_step_records_polls_and_snapshots_without_upstream_policy():
+    state = AscendEplbState.__new__(AscendEplbState)
+    state.stair = MagicMock()
+    state.stair.active_model_state = None
+    state.model_states = {}
+    state.expert_rearrangement_step = 1
+    state.expert_rearrangement_step_interval = 2
+    state.should_record_tensor = torch.zeros((), dtype=torch.bool)
+
+    state.step()
+
+    state.stair.record_step.assert_called_once_with()
+    state.stair.poll_and_broadcast.assert_called_once_with()
+    state.stair.start_next_layer.assert_called_once_with()
+    state.stair.check_worker_health.assert_called_once_with()
+    state.stair.snapshot.assert_called_once_with()
+    assert state.should_record_tensor.item()
+
+
 def test_layer_state_builds_routing_table_and_preserves_captured_tensor(
     monkeypatch,
 ):

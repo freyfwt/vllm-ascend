@@ -30,3 +30,10 @@ def test_ring_clear_preserves_allocation():
     ring.clear()
     assert ring.values is storage
     assert ring.valid_size == 0
+
+
+def test_ring_tracks_model_local_execution_phase():
+    ring = LogicalLoadRing(2, 1, 1, torch.device("cpu"))
+    ring.record(torch.zeros(1, 1), torch.zeros(1, 1, dtype=torch.long), 1, executed=False, has_prefill=True)
+    ring.record(torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.long), 2, executed=True, has_prefill=True)
+    assert ring.chronological_metadata() == ((False, False), (True, True))

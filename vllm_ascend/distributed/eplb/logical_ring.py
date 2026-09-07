@@ -30,6 +30,8 @@ class LogicalLoadRing:
             device=device,
         )
         self.outer_step_keys: list[int | None] = [None] * capacity
+        self.executed = [False] * capacity
+        self.has_prefill = [False] * capacity
         self.write_cursor = 0
         self.valid_size = 0
         self.sample_sequence = 0
@@ -39,6 +41,9 @@ class LogicalLoadRing:
         physical_load: torch.Tensor,
         physical_to_logical: torch.Tensor,
         outer_step_key: int,
+        *,
+        executed: bool = True,
+        has_prefill: bool = False,
     ) -> None:
         if physical_load.shape != physical_to_logical.shape or physical_load.ndim != 2:
             raise ValueError("STAIR load and mapping must share [layers, physical experts]")
@@ -48,6 +53,8 @@ class LogicalLoadRing:
         target.zero_()
         target.scatter_add_(1, physical_to_logical.long(), physical_load.to(torch.int64))
         self.outer_step_keys[self.write_cursor] = outer_step_key
+        self.executed[self.write_cursor] = executed
+        self.has_prefill[self.write_cursor] = executed and has_prefill
         self.write_cursor = (self.write_cursor + 1) % self.capacity
         self.valid_size = min(self.valid_size + 1, self.capacity)
         self.sample_sequence += 1
@@ -68,6 +75,13 @@ class LogicalLoadRing:
         assert all(key is not None for key in keys)
         return tuple(key for key in keys if key is not None)
 
+    def chronological_metadata(self) -> tuple[tuple[bool, bool], ...]:
+        start = (self.write_cursor - self.valid_size) % self.capacity
+        return tuple(
+            (self.executed[(start + index) % self.capacity], self.has_prefill[(start + index) % self.capacity])
+            for index in range(self.valid_size)
+        )
+
     def compressed_sums(self, sample_size: int) -> tuple[torch.Tensor, tuple[int, ...]]:
         if self.valid_size == 0 or sample_size <= 0:
             raise ValueError("STAIR compression requires recorded samples and positive sample_size")
@@ -86,3 +100,5 @@ class LogicalLoadRing:
         self.write_cursor = 0
         self.valid_size = 0
         self.outer_step_keys[:] = [None] * self.capacity
+        self.executed[:] = [False] * self.capacity
+        self.has_prefill[:] = [False] * self.capacity

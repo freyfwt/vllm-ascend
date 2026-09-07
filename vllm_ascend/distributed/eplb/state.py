@@ -13,6 +13,8 @@ from vllm.distributed import get_ep_group
 from vllm.distributed.eplb import eplb_state as _eplb_state
 
 from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
+from vllm_ascend.ascend_config import StairConfig
+from vllm_ascend.distributed.eplb.stair_coordinator import StairCoordinator
 
 ASYNC_EPLB_CYCLE_COMMITTED_LOG = "Ascend async EPLB cycle committed"
 
@@ -95,11 +97,55 @@ class AscendEplbState(_eplb_state.EplbState):
 
     cuda_device_index: int | None
 
-    def __init__(self, parallel_config, device: torch.device) -> None:
+    def __init__(
+        self,
+        parallel_config,
+        device: torch.device,
+        stair_config: StairConfig | None = None,
+        load_collection_phase: str = "all",
+    ) -> None:
         super().__init__(parallel_config, device)
         self._has_fresh_recorded_load = False
+        self.stair: StairCoordinator | None = None
+        if stair_config is not None:
+            self._configure_stair(stair_config, load_collection_phase)
         if self.cuda_device_index is None:
             self.cuda_device_index = torch.accelerator.current_device_index()
+
+    def _configure_stair(self, config: StairConfig, phase: str) -> None:
+        self.stair = StairCoordinator(
+            config,
+            phase,
+            self.device,
+            self.parallel_config.eplb_config.window_size,
+        )
+
+    def add_model(self, model, model_config) -> None:
+        super().add_model(model, model_config)
+        if self.stair is not None:
+            model_key = model_config.compute_hash()
+            self.stair.register(
+                model_key,
+                model_config,
+                self.model_states[model_key],
+                self.parallel_config,
+            )
+
+    def note_stair_execution(self, model_config: Any, has_prefill: bool) -> None:
+        if self.stair is not None:
+            self.stair.note_execution(model_config.compute_hash(), has_prefill)
+
+    def start_async_loop(
+        self,
+        rank_mapping: dict[int, int] | None = None,
+        is_profile: bool = False,
+    ) -> None:
+        if self.stair is None:
+            super().start_async_loop(rank_mapping=rank_mapping, is_profile=is_profile)
+            return
+        if rank_mapping is not None or is_profile:
+            raise ValueError("STAIR does not support elastic or profile transfer loops")
+        self.stair.start()
 
     def _has_global_fresh_recorded_load(self) -> bool:
         """Synchronize whether any EP rank recorded load since rearranging."""
@@ -161,6 +207,8 @@ class AscendEplbState(_eplb_state.EplbState):
         parallel_config,
         expanded_physical_to_logical: torch.Tensor,
         num_valid_physical_experts: int | None = None,
+        stair_config: StairConfig | None = None,
+        load_collection_phase: str = "all",
     ) -> "AscendEplbState":
         from_mapping_kwargs: dict[str, Any] = {
             "model": model,
@@ -174,6 +222,15 @@ class AscendEplbState(_eplb_state.EplbState):
                 raise TypeError("num_valid_physical_experts is required by the selected vLLM release mapping contract")
             from_mapping_kwargs["num_valid_physical_experts"] = num_valid_physical_experts
         state = super().from_mapping(**from_mapping_kwargs)
+        if stair_config is not None:
+            state._configure_stair(stair_config, load_collection_phase)
+            model_key = model_config.compute_hash()
+            state.stair.register(
+                model_key,
+                model_config,
+                state.model_states[model_key],
+                parallel_config,
+            )
         for model_state in state.model_states.values():
             refresh_model_routing_tables(model_state)
         return state

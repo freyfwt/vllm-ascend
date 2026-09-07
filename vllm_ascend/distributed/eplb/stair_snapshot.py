@@ -51,13 +51,18 @@ def sync_snapshot(
     progress = torch.tensor((ring.valid_size, ring.sample_sequence), dtype=torch.int64)
     progress_by_rank = [torch.empty_like(progress) for _ in range(world_size)]
     all_gather(progress_by_rank, progress, group=cpu_group)
-    if any(not torch.equal(item, progress) for item in progress_by_rank) or ring.valid_size == 0:
+    if any(not torch.equal(item, progress) for item in progress_by_rank):
+        ring.clear()
+        ring.sample_sequence = max(int(item[1]) for item in progress_by_rank)
+        return None
+    if ring.valid_size == 0:
         return None
 
     keys = torch.tensor(ring.chronological_keys(), dtype=torch.int64)
     keys_by_rank = [torch.empty_like(keys) for _ in range(world_size)]
     all_gather(keys_by_rank, keys, group=cpu_group)
     if any(not torch.equal(item, keys) for item in keys_by_rank):
+        ring.clear()
         return None
 
     local_metadata = torch.tensor(ring.chronological_metadata(), dtype=torch.int32)

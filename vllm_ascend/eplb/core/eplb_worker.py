@@ -71,6 +71,52 @@ class EplbWorker:
         _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
         if self.rank_id == 0:
+            window_load = load_info.sum(0) if self.multi_stage else load_info
+            # Keep the measured replica split: merging logical experts and
+            # dividing by replica count would hide physical-rank imbalance.
+            rank_load = window_load.numpy().sum(-1)
+            observed_mean, observed_max, observed_imbalance_list = self._compute_rank_imbalance(
+                rank_load, return_list=True
+            )
+            active_layers = np.flatnonzero(rank_load.sum(-1) > 0)
+            worst_layer = (
+                int(active_layers[np.argmax(np.asarray(observed_imbalance_list)[active_layers])])
+                if active_layers.size
+                else -1
+            )
+            worst_rank = int(rank_load[worst_layer].argmax()) if worst_layer >= 0 else -1
+            logger.info(
+                "[eplb/worker] Observed rank load imbalance (collection window): "
+                "layer_mean=%.3f layer_max=%.3f worst_local_layer=%d worst_rank=%d active_layers=%d/%d",
+                observed_mean,
+                observed_max,
+                worst_layer,
+                worst_rank,
+                active_layers.size,
+                len(observed_imbalance_list),
+            )
+            if self.multi_stage:
+                sample_rank_load = load_info.numpy().sum(-1)
+                sample_mean, sample_max, sample_imbalance = self._compute_rank_imbalance(
+                    sample_rank_load, return_list=True
+                )
+                worst_sample, worst_sample_layer = (
+                    np.unravel_index(np.nanargmax(sample_imbalance), sample_rank_load.shape[:-1])
+                    if np.isfinite(sample_mean)
+                    else (-1, -1)
+                )
+                worst_sample_rank = (
+                    int(sample_rank_load[worst_sample, worst_sample_layer].argmax()) if worst_sample >= 0 else -1
+                )
+                logger.info(
+                    "[eplb/worker] Observed rank load imbalance (per collection sample): "
+                    "sample_mean=%.3f sample_max=%.3f worst_sample=%d worst_local_layer=%d worst_rank=%d",
+                    sample_mean,
+                    sample_max,
+                    worst_sample,
+                    worst_sample_layer,
+                    worst_sample_rank,
+                )
             if self.multi_stage:
                 hotness = self._calculate_hotness(old_placement, load_info.sum(0))
             else:
@@ -298,6 +344,23 @@ class EplbWorker:
             layer_ids.append(layer_id)
 
         return list(zip(send_all, recv_all, maps, log2phy_all, layer_ids))
+
+    @staticmethod
+    def _compute_rank_imbalance(rank_loads: np.ndarray, return_list: bool = False):
+        """Summarize rank PAR along the last axis; empty entries produce NaN."""
+        mean_loads = rank_loads.mean(-1)
+        imbalance = np.divide(
+            rank_loads.max(-1),
+            mean_loads,
+            out=np.full_like(mean_loads, np.nan, dtype=float),
+            where=mean_loads > 0,
+        )
+        active = imbalance[mean_loads > 0]
+        mean_val = float(active.mean()) if active.size else float("nan")
+        max_val = float(active.max()) if active.size else float("nan")
+        if return_list:
+            return mean_val, max_val, imbalance.tolist()
+        return mean_val, max_val
 
     @staticmethod
     def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray, return_list: bool = False):

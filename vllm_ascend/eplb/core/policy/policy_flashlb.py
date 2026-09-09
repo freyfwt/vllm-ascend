@@ -291,7 +291,7 @@ def lpt_deployment(
 
 
 @njit(fastmath=True, cache=True)
-def compute_score(val_data: np.ndarray, simulated_replicas: np.ndarray, simulated_deployment: np.ndarray) -> np.float32:
+def compute_score(val_data: np.ndarray, simulated_replicas: np.ndarray, simulated_deployment: np.ndarray) -> float:
     """
     Calculate load balance score: (max_device_load * num_devices) / total_load
     Lower score means better load balance
@@ -302,11 +302,12 @@ def compute_score(val_data: np.ndarray, simulated_replicas: np.ndarray, simulate
         simulated_deployment: Expert deployment matrix (D, K) - D devices, K slots
 
     Returns:
-        mean_score: Average load balance score over time steps
+        mean_score: Average score over nonempty time steps, or 1.0 for empty data
     """
     T, N = val_data.shape
     D, K = simulated_deployment.shape
-    scores = np.empty((T,), dtype=np.float32)
+    total_score = 0.0
+    num_samples = 0
     for t in range(T):
         max_load = 0.0  # Explicit float type to avoid int/float mix
         tot_load = 0.0
@@ -317,10 +318,13 @@ def compute_score(val_data: np.ndarray, simulated_replicas: np.ndarray, simulate
                 s += val_data[t, idx] / simulated_replicas[idx]
             tot_load += s
             max_load = max(max_load, s)
-        # Add small epsilon to avoid division by zero
-        scores[t] = (max_load * D + 1e-2) / (tot_load + 1e-2)
+        # Empty samples contain no evidence of balance. Use the same exact
+        # per-sample ratio as the observed physical loads below.
+        if tot_load > 0:
+            total_score += max_load * D / tot_load
+            num_samples += 1
 
-    return np.mean(scores)
+    return total_score / num_samples if num_samples else 1.0
 
 
 class FlashTree:
@@ -539,7 +543,7 @@ class FlashLB(EplbPolicy):
         self.sample_size = config.sample_size
 
         # Runtime state storage with type annotations
-        self.average_to_peak_history: dict[int, float] = {}  # Layer-wise load balance history
+        self.average_to_peak_history: dict[int, float] = {}  # Last observed inverse mean PAR per layer
         self.hotness_window: dict[int, dict[str, Any]] = {}  # Layer-wise hotness stats and buffer
         self.current_deployment: dict[int, np.ndarray] = {}  # Current expert deployment per layer
         self.current_deployed_replicas: dict[int, np.ndarray] = {}  # Current replica count per expert per layer
@@ -730,13 +734,14 @@ class FlashLB(EplbPolicy):
             self.hotness_window[layer]["start"] = start
             self.hotness_window[layer]["length"] = length
 
-    def need_update(self, layer_id: int = 0) -> bool:
+    def need_update(self, layer_id: int, average_to_peak_ratio: float) -> bool:
         """
         Check if layer needs load balance update
         Trigger update if load balance ratio drops below threshold
 
         Args:
             layer_id: Layer index to check
+            average_to_peak_ratio: Inverse mean per-sample PAR from physical loads
 
         Returns:
             bool: True if update is needed, False otherwise
@@ -745,12 +750,6 @@ class FlashLB(EplbPolicy):
         if past_average_to_peak_ratio == 0.0:
             # Force update for first iteration
             return True
-
-        # Calculate current load balance ratio (average/peak load)
-        hotness = self.hotness_window[layer_id]["buffer"]
-        average_to_peak_ratio = 1 / compute_score(
-            hotness, self.current_deployed_replicas[layer_id], self.current_deployment[layer_id]
-        )
 
         # Check update conditions
         return (
@@ -883,6 +882,20 @@ class FlashLB(EplbPolicy):
         num_devices = current_deployment.shape[1]
         num_replicas = len(current_deployment[0].reshape(-1))
 
+        # Preserve both the observed replica split and sample dimension. PAR
+        # of a summed window can hide ranks that take turns being overloaded.
+        rank_loads = expert_workload.sum(-1)
+        total_loads = rank_loads.sum(-1)
+        valid_samples = total_loads > 0
+        sample_par = np.divide(
+            rank_loads.max(-1) * num_devices,
+            total_loads,
+            out=np.zeros_like(total_loads, dtype=float),
+            where=valid_samples,
+        )
+        sample_counts = valid_samples.sum(0)
+        observed_par = np.divide(sample_par.sum(0), sample_counts, out=np.ones(num_layers), where=sample_counts > 0)
+
         # Update expert hotness statistics
         self.register_hotness(current_deployment, expert_workload, num_layers, num_expert)
 
@@ -897,13 +910,17 @@ class FlashLB(EplbPolicy):
         new_par = np.zeros((num_layers,), dtype=np.float32)
         new_deployment = np.zeros((num_layers, num_devices, num_replicas // num_devices), dtype=np.int32)
         new_deployed_replicas = np.zeros((num_layers, num_expert), dtype=np.int32)
-        new_average_to_peak_ratio = np.zeros((num_layers,), dtype=np.float32)
+        new_average_to_peak_ratio = np.zeros((num_layers,), dtype=float)
         delta_average_to_peak_ratio = np.zeros((num_layers,), dtype=np.float32)
         pars = np.zeros((num_layers,), dtype=np.float32)
 
         # Optimize each layer
         for layer in range(num_layers):
-            if not self.need_update(layer):
+            current_average_to_peak_ratio = 1 / observed_par[layer]
+            should_update = sample_counts[layer] > 0 and self.need_update(layer, current_average_to_peak_ratio)
+            if sample_counts[layer] > 0:
+                self.average_to_peak_history[layer] = current_average_to_peak_ratio
+            if not should_update:
                 # Keep current deployment if no update needed
                 new_deployment[layer] = self.current_deployment[layer]
                 new_deployed_replicas[layer] = self.current_deployed_replicas[layer]
@@ -929,21 +946,24 @@ class FlashLB(EplbPolicy):
             flash_tree = FlashTree(data, num_replicas, num_devices, self.z_score, self.depth, self.width)
             best_deployment, best_replicas, best_score = flash_tree.optimize_balanceness()
 
-            # Update layer state
-            new_deployed_replicas[layer] = best_replicas
-            new_average_to_peak_ratio[layer] = 1 / best_score
-
-            current_deployment = self.current_deployment.get(layer, None)
+            layer_deployment = self.current_deployment[layer]
             if -1 in best_deployment:
-                new_deployment[layer] = current_deployment
+                new_deployment[layer] = layer_deployment
+                continue
             else:
                 # Minimize redeployment by permuting new deployment
                 new_deployment[layer] = FlashLB.minimize_redeploy_with_inner_permutation(
-                    current_deployment, best_deployment
+                    layer_deployment, best_deployment
                 )
-            current_average_to_peak_ratio = 1 / compute_score(
-                buf, self.current_deployed_replicas.get(layer), current_deployment
-            )
+            if np.array_equal(new_deployment[layer], layer_deployment):
+                continue
+            # Search may compress samples and adds one to logical hotness.
+            # Compare the candidate against observations on the original
+            # samples, without that smoothing or temporal aggregation. Replica
+            # splitting for a future placement is still an equal-split estimate.
+            best_score = compute_score(buf[idx] - 1, best_replicas, new_deployment[layer])
+            new_deployed_replicas[layer] = best_replicas
+            new_average_to_peak_ratio[layer] = 1 / best_score
             delta_average_to_peak_ratio[layer] = new_average_to_peak_ratio[layer] - current_average_to_peak_ratio
             pars[layer] = best_score
 
@@ -955,14 +975,16 @@ class FlashLB(EplbPolicy):
             priority_idx = priority_idx[: self.update_layers_upper_bound]
 
         # Update global state with optimal deployments
+        selected_deployment = current_deployment.copy()
         for layer in priority_idx:
+            selected_deployment[layer] = new_deployment[layer]
             self.current_deployment[layer] = new_deployment[layer]
             self.current_deployed_replicas[layer] = new_deployed_replicas[layer]
-            self.average_to_peak_history[layer] = new_average_to_peak_ratio[layer]
 
         # Return update flag and results
         change = len(priority_idx) > 0
-        return change, priority_idx, new_deployment
+        # EplbWorker applies the returned table, independently of priority_idx.
+        return change, priority_idx, selected_deployment
 
 
 def generate_layered_experts(

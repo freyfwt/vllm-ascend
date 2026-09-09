@@ -70,11 +70,26 @@ class EplbWorker:
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
         _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
 
+        if not torch.is_tensor(new_placement):
+            new_placement = torch.tensor(new_placement)
+        self.check_expert_placement(old_placement, new_placement)
+
         if self.rank_id == 0:
-            if self.multi_stage:
-                hotness = self._calculate_hotness(old_placement, load_info.sum(0))
-            else:
-                hotness = self._calculate_hotness(old_placement, load_info)
+            window_load = load_info.sum(0) if self.multi_stage else load_info
+            # Keep the measured replica split: merging logical experts and
+            # dividing by replica count would hide physical-rank imbalance.
+            rank_load = window_load.numpy().sum(-1)
+            observed_mean, observed_max, observed_imbalance_list = self._compute_rank_imbalance(
+                rank_load, return_list=True
+            )
+            active_layers = np.flatnonzero(rank_load.sum(-1) > 0)
+            worst_layer = (
+                int(active_layers[np.argmax(np.asarray(observed_imbalance_list)[active_layers])])
+                if active_layers.size
+                else -1
+            )
+            worst_rank = int(rank_load[worst_layer].argmax()) if worst_layer >= 0 else -1
+            hotness = self._calculate_hotness(old_placement, window_load)
             # ms-service-metric begin: expose EPLB hotness details for metrics collection.
             current_mean, current_max, current_imbalance_list = self._compute_imbalance(
                 old_placement, hotness, return_list=True
@@ -89,19 +104,54 @@ class EplbWorker:
                 "update_max": update_max,
                 "current_imbalance_list": current_imbalance_list,
                 "update_imbalance_list": update_imbalance_list,
+                "observed_mean": observed_mean,
+                "observed_max": observed_max,
+                "observed_imbalance_list": observed_imbalance_list,
             }
             # ms-service-metric end.
             logger.info(
-                "[eplb/worker] Expert hotness imbalance, current: mean=%.3f max=%.3f, updated: mean=%.3f max=%.3f",
+                "[eplb/worker] Observed rank load imbalance (collection window): "
+                "layer_mean=%.3f layer_max=%.3f worst_local_layer=%d worst_rank=%d active_layers=%d/%d",
+                observed_mean,
+                observed_max,
+                worst_layer,
+                worst_rank,
+                active_layers.size,
+                len(observed_imbalance_list),
+            )
+            if self.multi_stage:
+                sample_rank_load = load_info.numpy().sum(-1)
+                sample_mean, sample_max, sample_imbalance = self._compute_rank_imbalance(
+                    sample_rank_load, return_list=True
+                )
+                worst_sample, worst_sample_layer = (
+                    np.unravel_index(np.nanargmax(sample_imbalance), sample_rank_load.shape[:-1])
+                    if np.isfinite(sample_mean)
+                    else (-1, -1)
+                )
+                worst_sample_rank = (
+                    int(sample_rank_load[worst_sample, worst_sample_layer].argmax()) if worst_sample >= 0 else -1
+                )
+                self.latest_expert_hotness["observed_sample_mean"] = sample_mean
+                self.latest_expert_hotness["observed_sample_max"] = sample_max
+                logger.info(
+                    "[eplb/worker] Observed rank load imbalance (per collection sample): "
+                    "sample_mean=%.3f sample_max=%.3f worst_sample=%d worst_local_layer=%d worst_rank=%d",
+                    sample_mean,
+                    sample_max,
+                    worst_sample,
+                    worst_sample_layer,
+                    worst_sample_rank,
+                )
+            logger.info(
+                "[eplb/worker] Estimated rank load imbalance (equal replica split, collection window): "
+                "current: layer_mean=%.3f layer_max=%.3f, candidate: layer_mean=%.3f layer_max=%.3f",
                 current_mean,
                 current_max,
                 update_mean,
                 update_max,
             )
 
-        if not torch.is_tensor(new_placement):
-            new_placement = torch.tensor(new_placement)
-        self.check_expert_placement(old_placement, new_placement)
         new_expert_maps = self.local2global(new_placement)
         self.update_expert_map(new_expert_maps)
 
@@ -301,22 +351,33 @@ class EplbWorker:
 
     @staticmethod
     def _compute_imbalance(deployment_all_layer, hotness_all_layer: np.ndarray, return_list: bool = False):
-        imbalance_list = []
+        rank_loads = []
         deployment_all_layer = np.array(deployment_all_layer)
         for deployment, hotness in zip(deployment_all_layer, hotness_all_layer):
             counts = np.bincount(deployment.reshape(-1), minlength=hotness.shape[0])
 
             unit_hotness = np.divide(hotness, counts, out=np.zeros_like(hotness, dtype=float), where=counts != 0)
 
-            stage_load = unit_hotness[deployment].sum(-1)
-            stage_par = stage_load.max() / stage_load.mean()
-            imbalance_list.append(stage_par)
+            rank_loads.append(unit_hotness[deployment].sum(-1))
 
-        max_val = max(imbalance_list)
-        mean_val = sum(imbalance_list) / len(imbalance_list)
+        return EplbWorker._compute_rank_imbalance(np.asarray(rank_loads), return_list)
+
+    @staticmethod
+    def _compute_rank_imbalance(rank_loads: np.ndarray, return_list: bool = False):
+        """Summarize rank PAR along the last axis; empty entries produce NaN."""
+        mean_loads = rank_loads.mean(-1)
+        imbalance = np.divide(
+            rank_loads.max(-1),
+            mean_loads,
+            out=np.full_like(mean_loads, np.nan, dtype=float),
+            where=mean_loads > 0,
+        )
+        active = imbalance[mean_loads > 0]
+        mean_val = float(active.mean()) if active.size else float("nan")
+        max_val = float(active.max()) if active.size else float("nan")
         # ms-service-metric begin: optionally expose per-layer imbalance without recomputing it.
         if return_list:
-            return mean_val, max_val, imbalance_list
+            return mean_val, max_val, imbalance.tolist()
         # ms-service-metric end.
         return mean_val, max_val
 

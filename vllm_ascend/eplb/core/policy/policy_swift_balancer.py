@@ -696,12 +696,14 @@ class SwiftBalanceEplb(EplbPolicy):
             info.placement_table, info.workload_table, self.num_original_experts
         )
 
-        per_layer_total_load = layer_workloads[0].sum()
-
-        ave_workload = per_layer_total_load / self.num_ranks
-        self.swap_threshold = ave_workload * self.increment
-
-        layer_initial_imbalance = self.calculate_imbalance(info.placement_table, layer_workloads)
+        # Decide whether to rebalance from the observed physical-rank loads.
+        # Logical hotness / replica count can look balanced while one replica
+        # receives most of the traffic. Candidate loads below remain estimates.
+        rank_loads = info.workload_table.sum(-1)
+        ave_workload = rank_loads.mean(-1)
+        layer_initial_imbalance = np.divide(
+            rank_loads.max(-1), ave_workload, out=np.ones_like(ave_workload), where=ave_workload > 0
+        )
 
         new_deployment = info.placement_table.copy()
 
@@ -717,6 +719,7 @@ class SwiftBalanceEplb(EplbPolicy):
                 max_heat_per_layer_after.append(max_heat_per_layer_before[layer])
                 continue
 
+            self.swap_threshold = ave_workload[layer] * self.increment
             (all_node_assignments, all_node_loads, updated_weights, num_com_between_rank, rev_experts_per_rank) = (
                 self.redundant_expert_deployment(cur_layer_workload, cur_layer_deployment)
             )
@@ -725,14 +728,17 @@ class SwiftBalanceEplb(EplbPolicy):
                 all_node_assignments, all_node_loads, num_com_between_rank, rev_experts_per_rank, updated_weights
             )
 
-            after_swap_imbalance = new_max_workload / ave_workload
+            after_swap_imbalance = new_max_workload / ave_workload[layer]
+            self.constraint_expert_local_exchange(cur_layer_deployment[None], new_layer_deployment[None])
 
-            if after_swap_imbalance < layer_initial_imbalance[layer]:
+            if after_swap_imbalance < layer_initial_imbalance[layer] and not np.array_equal(
+                new_layer_deployment, cur_layer_deployment
+            ):
                 new_deployment[layer] = new_layer_deployment
-
-            max_heat_per_layer_after.append(new_max_workload)
-
-        self.constraint_expert_local_exchange(info.placement_table, new_deployment)
+                max_heat_per_layer_after.append(new_max_workload)
+            else:
+                # A rejected or unchanged candidate did not improve the plan.
+                max_heat_per_layer_after.append(max_heat_per_layer_before[layer])
 
         layer_changed_ratio = []
         for layer_idx in range(self.num_layers):

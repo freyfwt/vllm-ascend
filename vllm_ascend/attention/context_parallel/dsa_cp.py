@@ -706,7 +706,15 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         """Build a single unified metadata for all requests (prefill + decode)."""
         num_reqs = common_attn_metadata.num_reqs
         has_prefill = self.num_prefills > 0
-        query_start_loc = common_attn_metadata.query_start_loc
+        request_metadata_snapshot = self.common_ratio_to_sas_metadata.get("_request_metadata_snapshot")
+        if request_metadata_snapshot is None:
+            request_metadata_snapshot = self._snapshot_request_metadata(
+                common_attn_metadata.query_start_loc,
+                self.seq_lens,
+                num_reqs,
+            )
+            self.common_ratio_to_sas_metadata["_request_metadata_snapshot"] = request_metadata_snapshot
+        query_start_loc, seq_lens, start_pos = request_metadata_snapshot
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
         # ── GPU local metadata (cached across kv-cache groups) ──
@@ -722,7 +730,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             num_reqs=num_reqs,
             num_input_tokens=num_input_tokens,
             query_start_loc=query_start_loc,
-            seq_lens=self.seq_lens[:num_reqs],
+            seq_lens=seq_lens,
         )
 
         # RoPE local slices (cached across kv-cache groups: same cos/sin,
@@ -884,7 +892,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             block_table=self.block_table[:num_reqs, ...],
             slot_mapping=slot_mapping,
             block_size=self.block_size,
-            seq_lens=self.seq_lens[:num_reqs],
+            seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             cp_metadata=cp_metadata,
             cache_group_key=self.cache_group_key,
@@ -892,7 +900,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cos=cos,
             full_compress_sin=full_compress_sin,
             full_compress_cos=full_compress_cos,
-            start_pos=self.start_pos_prefill[:num_reqs],
+            start_pos=start_pos,
             num_compressed_tokens=num_compressed_tokens,
             num_reqs_actual=num_reqs_actual,
             sas_metadata=sas_metadata,
@@ -955,6 +963,30 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         tokens_per_rank = num_tokens_pad // tp_group.world_size
         local_start = tp_group.rank_in_group * tokens_per_rank
         return local_start, local_start + tokens_per_rank, tokens_per_rank, num_tokens_pad
+
+    @staticmethod
+    def _snapshot_request_metadata(
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_reqs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Snapshot coupled metadata before dispatching deferred device work."""
+        query_start_loc = query_start_loc[: num_reqs + 1].clone()
+        seq_lens = seq_lens[:num_reqs].clone()
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        start_pos = seq_lens - query_lens
+
+        invalid_mask = start_pos < 0
+        if bool(invalid_mask.any().item()):
+            invalid_indices = invalid_mask.nonzero(as_tuple=False).flatten().cpu().tolist()
+            raise RuntimeError(
+                "Invalid DSA-CP request metadata: start_pos must be non-negative; "
+                f"invalid_indices={invalid_indices}, "
+                f"query_start_loc={query_start_loc.cpu().tolist()}, "
+                f"seq_lens={seq_lens.cpu().tolist()}, "
+                f"start_pos={start_pos.cpu().tolist()}"
+            )
+        return query_start_loc, seq_lens, start_pos
 
     def _build_local_token_metadata(
         self,

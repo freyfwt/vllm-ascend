@@ -40,6 +40,7 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     olora_tp_enable,
 )
+from vllm_ascend.worker.device_metadata import DeviceMetadataStage, DeviceMetadataTask, wait_for_device_metadata
 
 
 def hadamard_transform_ref(
@@ -240,6 +241,8 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             scheduler_config.max_num_seqs + 1, dtype=torch.int32, device=self.device
         )
         self.local_seq_lens = torch.zeros(scheduler_config.max_num_seqs, dtype=torch.int32, device=self.device)
+        self._device_metadata_enabled = False
+        self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
 
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
@@ -777,13 +780,35 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         )
 
         # --- QLI metadata (all requests combined) ---
-        qli_cu_seqlens_q, qli_seqused_k, qli_cmp_residual_k, qli_metadata = self._build_qli_metadata(
-            query_start_loc=local_query_start_loc,
-            seq_lens=local_seq_lens,
-            num_reqs=num_reqs,
-            max_seqlen_q=max_local_query_len,
-            max_seqlen_k=max_local_seq_lens,
-        )
+        qli_cu_seqlens_q = local_query_start_loc if self.compressor_ratio == 4 else None
+        qli_seqused_k = self.qli_seqused_k[:num_reqs] if self.compressor_ratio == 4 else None
+        qli_cmp_residual_k = self.qli_cmp_residual_k[:num_reqs] if self.compressor_ratio == 4 else None
+
+        def build_qli_metadata() -> tuple[
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+        ]:
+            return self._build_qli_metadata(
+                query_start_loc=local_query_start_loc,
+                seq_lens=local_seq_lens,
+                num_reqs=num_reqs,
+                max_seqlen_q=max_local_query_len,
+                max_seqlen_k=max_local_seq_lens,
+            )
+
+        def run_qli_metadata() -> None:
+            build_qli_metadata()
+
+        if self._device_metadata_enabled and self.compressor_ratio == 4:
+            self._device_metadata_tasks = (
+                DeviceMetadataTask(DeviceMetadataStage.INDEXER, run_qli_metadata, id(self.req_qli_metadata)),
+            )
+            qli_metadata = self.req_qli_metadata
+        else:
+            self._device_metadata_tasks = ()
+            qli_cu_seqlens_q, qli_seqused_k, qli_cmp_residual_k, qli_metadata = build_qli_metadata()
 
         cp_metadata = DSACPMetadata(
             local_query_start_loc=local_query_start_loc,
@@ -819,6 +844,14 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             qli_cmp_residual_k=qli_cmp_residual_k,
             cu_cmp_seqlen_list=cu_cmp_seqlens,
         )
+
+    def enable_device_metadata(self) -> None:
+        self._device_metadata_enabled = True
+
+    def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
+        tasks = self._device_metadata_tasks
+        self._device_metadata_tasks = ()
+        return tasks
 
     def _build_local_token_metadata(
         self,
@@ -1774,6 +1807,9 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
         assert indexer_kv_scale_metadata.req_metadata is not None
         dsa_meta = indexer_kv_scale_metadata.req_metadata
+        qli_metadata = dsa_meta.qli_metadata
+        assert qli_metadata is not None
+        wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(qli_metadata))
         topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
             query=q,
             key=indexer_k_cache,
@@ -1786,7 +1822,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
             seqused_k=dsa_meta.qli_seqused_k,
             cmp_residual_k=dsa_meta.qli_cmp_residual_k,
             block_table=dsa_meta.block_table,
-            metadata=dsa_meta.qli_metadata,
+            metadata=qli_metadata,
             layout_q="TND",
             layout_k="PA_BBND",
             mask_mode=3,

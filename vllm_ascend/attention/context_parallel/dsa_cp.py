@@ -734,7 +734,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             assert cpu_cache is not None
             local_query_start_loc_cpu = cpu_cache["qsl_cpu"]
             local_seq_lens_cpu = cpu_cache["sl_cpu"]
-        local_seq_lens_q = local_query_start_loc[1 : num_reqs + 1] - local_query_start_loc[:num_reqs]
         local_seq_lens_q_cpu = local_query_start_loc_cpu[1 : num_reqs + 1] - local_query_start_loc_cpu[:num_reqs]
         max_local_query_len = max(1, int(local_seq_lens_q_cpu.max().item()))
         max_local_seq_lens = max(1, int(local_seq_lens_cpu.max().item()))
@@ -766,18 +765,18 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_heads = self.model_config.hf_config.num_attention_heads
         index_topk = self.model_config.hf_config.index_topk
 
-        sas_metadata = self._build_sas_metadata(
-            num_heads=num_heads,
-            query_start_loc=local_query_start_loc,
-            seq_lens=local_seq_lens,
-            seq_lens_q=local_seq_lens_q,
-            max_query_len=max_local_query_len,
-            max_seq_lens=max_local_seq_lens,
-            index_topk=index_topk,
-            num_reqs=num_reqs,
-            has_prefill=has_prefill,
-            cu_cmp_seqlen_list=cu_cmp_seqlens,
-        )
+        def build_sas_metadata() -> torch.Tensor:
+            return self._build_sas_metadata(
+                num_heads=num_heads,
+                query_start_loc=local_query_start_loc,
+                seq_lens=local_seq_lens,
+                max_query_len=max_local_query_len,
+                max_seq_lens=max_local_seq_lens,
+                index_topk=index_topk,
+                num_reqs=num_reqs,
+                has_prefill=has_prefill,
+                cu_cmp_seqlen_list=cu_cmp_seqlens,
+            )
 
         # --- QLI metadata (all requests combined) ---
         qli_cu_seqlens_q = local_query_start_loc if self.compressor_ratio == 4 else None
@@ -798,16 +797,27 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_k=max_local_seq_lens,
             )
 
+        def run_sas_metadata() -> None:
+            build_sas_metadata()
+
         def run_qli_metadata() -> None:
             build_qli_metadata()
 
-        if self._device_metadata_enabled and self.compressor_ratio == 4:
-            self._device_metadata_tasks = (
-                DeviceMetadataTask(DeviceMetadataStage.INDEXER, run_qli_metadata, id(self.req_qli_metadata)),
-            )
-            qli_metadata = self.req_qli_metadata
+        if self._device_metadata_enabled:
+            if self.compressor_ratio == 4:
+                self._device_metadata_tasks = (
+                    DeviceMetadataTask(DeviceMetadataStage.INDEXER, run_qli_metadata, id(self.req_qli_metadata)),
+                    DeviceMetadataTask(DeviceMetadataStage.ATTENTION, run_sas_metadata, id(self.req_sas_metadata)),
+                )
+            else:
+                self._device_metadata_tasks = (
+                    DeviceMetadataTask(DeviceMetadataStage.ATTENTION, run_sas_metadata, id(self.req_sas_metadata)),
+                )
+            sas_metadata = self.req_sas_metadata
+            qli_metadata = self.req_qli_metadata if self.compressor_ratio == 4 else None
         else:
             self._device_metadata_tasks = ()
+            sas_metadata = build_sas_metadata()
             qli_cu_seqlens_q, qli_seqused_k, qli_cmp_residual_k, qli_metadata = build_qli_metadata()
 
         cp_metadata = DSACPMetadata(
@@ -969,7 +979,6 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         num_heads,
         query_start_loc,
         seq_lens,
-        seq_lens_q,
         max_query_len,
         max_seq_lens,
         index_topk,
@@ -1602,7 +1611,15 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 compressed_kv = None
             DeviceOperator.dsa_kv_compress_scatter(compress_kv_cache, compressed_kv, compress_slot_mapping)
 
+        if self.compress_ratio <= 1:
+            sas_metadata = swa_req_metadata.sas_metadata
+        elif self.compress_ratio == 4:
+            sas_metadata = req_metadata.sas_metadata
+        else:
+            assert compressor_attn_metadata.req_metadata is not None
+            sas_metadata = compressor_attn_metadata.req_metadata.sas_metadata
         notify_kv_cache_written(layer_name)
+        wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(sas_metadata))
         record_attention_compute_start()
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
@@ -1635,7 +1652,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 q,
                 ori_kv=swa_kv_cache,
                 ori_block_table=swa_metadata.req_metadata.block_table,
-                metadata=swa_metadata.req_metadata.sas_metadata,
+                metadata=sas_metadata,
                 **common_attn_kwargs,
             )[0]
         elif self.compress_ratio == 4:
@@ -1650,7 +1667,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 cmp_sparse_indices=compress_topk_idxs,
                 ori_block_table=swa_metadata.req_metadata.block_table,
                 cmp_block_table=compressor_attn_metadata.req_metadata.block_table,
-                metadata=req_metadata.sas_metadata,
+                metadata=sas_metadata,
                 cmp_mask_mode=3,
                 **common_attn_kwargs,
             )[0]
@@ -1665,7 +1682,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 cmp_kv=compress_kv_cache,
                 ori_block_table=swa_metadata.req_metadata.block_table,
                 cmp_block_table=compressor_attn_metadata.req_metadata.block_table,
-                metadata=compressor_attn_metadata.req_metadata.sas_metadata,
+                metadata=sas_metadata,
                 cmp_mask_mode=3,
                 **common_attn_kwargs,
             )[0]

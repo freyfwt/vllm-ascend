@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar, TypeVar
 
@@ -108,6 +109,7 @@ class AscendDSAReqMetadata:
     qli_cu_seqlens_q: torch.Tensor = None
     qli_seqused_k: torch.Tensor = None
     qli_cmp_residual_k: torch.Tensor = None
+    device_local_metadata_group_id: int | None = None
     cu_cmp_seqlen_list: torch.Tensor = None
     attn_mask: torch.Tensor | None = None
     ori_win_left: int | None = None
@@ -621,46 +623,58 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         The computation (clamp + cumsum + offset + mask) is identical for
         all attention groups, so we compute once and cache the results.
         """
+        build_local_metadata: Callable[[], None] | None = None
         cache = self.common_ratio_to_sas_metadata.get("_device_local")
         if cache is None:
-            # Calc and cache device tensor results
-            (
-                local_start,
-                local_end_with_pad,
-                tokens_per_rank,
-                num_tokens_pad,
-                local_query_start_loc,
-                local_seq_lens,
-            ) = self._build_local_token_metadata(
-                num_reqs=num_reqs,
-                num_input_tokens=num_input_tokens,
-                query_start_loc=query_start_loc,
-                seq_lens=seq_lens,
-                local_query_start_loc=self.local_query_start_loc,
-                local_seq_lens=self.local_seq_lens,
-                start_pos_out=self.start_pos_prefill,
-            )
+            local_start, local_end_with_pad, tokens_per_rank, num_tokens_pad = self._local_token_range(num_input_tokens)
+            local_query_start_loc = self.local_query_start_loc[: num_reqs + 1]
+            local_seq_lens = self.local_seq_lens[:num_reqs]
+
+            def build_first_local_metadata() -> None:
+                self._build_local_token_metadata(
+                    num_reqs=num_reqs,
+                    num_input_tokens=num_input_tokens,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    local_query_start_loc=self.local_query_start_loc,
+                    local_seq_lens=self.local_seq_lens,
+                    start_pos_out=self.start_pos_prefill,
+                )
+
+            if self._device_metadata_enabled:
+                build_local_metadata = build_first_local_metadata
+            else:
+                build_first_local_metadata()
             self.common_ratio_to_sas_metadata["_device_local"] = {
                 "local_start": local_start,
                 "local_end": local_end_with_pad,
                 "tokens_per_rank": tokens_per_rank,
                 "num_tokens_pad": num_tokens_pad,
-                "qsl": self.local_query_start_loc[: num_reqs + 1].clone(),
-                "sl": self.local_seq_lens[:num_reqs].clone(),
-                "sp": self.start_pos_prefill[:num_reqs].clone(),
+                "qsl": local_query_start_loc if self._device_metadata_enabled else local_query_start_loc.clone(),
+                "sl": local_seq_lens if self._device_metadata_enabled else local_seq_lens.clone(),
+                "sp": (
+                    self.start_pos_prefill[:num_reqs]
+                    if self._device_metadata_enabled
+                    else self.start_pos_prefill[:num_reqs].clone()
+                ),
             }
         else:
-            # copy from cache
-            assert cache is not None
             local_start = cache["local_start"]
             local_end_with_pad = cache["local_end"]
             tokens_per_rank = cache["tokens_per_rank"]
             num_tokens_pad = cache["num_tokens_pad"]
-            self.local_query_start_loc[: num_reqs + 1].copy_(cache["qsl"])
-            self.local_seq_lens[:num_reqs].copy_(cache["sl"])
-            self.start_pos_prefill[:num_reqs].copy_(cache["sp"])
             local_query_start_loc = self.local_query_start_loc[: num_reqs + 1]
             local_seq_lens = self.local_seq_lens[:num_reqs]
+
+            def copy_local_metadata() -> None:
+                local_query_start_loc.copy_(cache["qsl"])
+                local_seq_lens.copy_(cache["sl"])
+                self.start_pos_prefill[:num_reqs].copy_(cache["sp"])
+
+            if self._device_metadata_enabled:
+                build_local_metadata = copy_local_metadata
+            else:
+                copy_local_metadata()
 
         return (
             local_start,
@@ -669,6 +683,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             num_tokens_pad,
             local_query_start_loc,
             local_seq_lens,
+            build_local_metadata,
         )
 
     def build_req_metadata(
@@ -695,6 +710,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             num_tokens_pad,
             local_query_start_loc,
             local_seq_lens,
+            build_local_metadata,
         ) = self._ensure_device_local_metadata(
             num_reqs=num_reqs,
             num_input_tokens=num_input_tokens,
@@ -743,7 +759,16 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         else:
             num_reqs_actual = min(num_reqs_actual, num_reqs)
             if num_reqs_actual < num_reqs:
-                self.start_pos_prefill[num_reqs_actual:].fill_(0)
+                if build_local_metadata is None:
+                    self.start_pos_prefill[num_reqs_actual:].fill_(0)
+                else:
+                    build_device_local_metadata = build_local_metadata
+                    valid_num_reqs = num_reqs_actual
+
+                    def build_local_metadata() -> None:
+                        build_device_local_metadata()
+                        self.start_pos_prefill[valid_num_reqs:].fill_(0)
+
                 self.block_table[num_reqs_actual:num_reqs, ...].fill_(0)
 
         # --- Compressed positions ---
@@ -804,18 +829,27 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             build_qli_metadata()
 
         if self._device_metadata_enabled:
+            assert build_local_metadata is not None
+            local_group_id = id(self.req_sas_metadata)
+            local_metadata_task = DeviceMetadataTask(
+                DeviceMetadataStage.COMPRESSOR, build_local_metadata, local_group_id
+            )
+
             if self.compressor_ratio == 4:
                 self._device_metadata_tasks = (
+                    local_metadata_task,
                     DeviceMetadataTask(DeviceMetadataStage.INDEXER, run_qli_metadata, id(self.req_qli_metadata)),
                     DeviceMetadataTask(DeviceMetadataStage.ATTENTION, run_sas_metadata, id(self.req_sas_metadata)),
                 )
             else:
                 self._device_metadata_tasks = (
+                    local_metadata_task,
                     DeviceMetadataTask(DeviceMetadataStage.ATTENTION, run_sas_metadata, id(self.req_sas_metadata)),
                 )
             sas_metadata = self.req_sas_metadata
             qli_metadata = self.req_qli_metadata if self.compressor_ratio == 4 else None
         else:
+            local_group_id = None
             self._device_metadata_tasks = ()
             sas_metadata = build_sas_metadata()
             qli_cu_seqlens_q, qli_seqused_k, qli_cmp_residual_k, qli_metadata = build_qli_metadata()
@@ -852,6 +886,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             qli_cu_seqlens_q=qli_cu_seqlens_q,
             qli_seqused_k=qli_seqused_k,
             qli_cmp_residual_k=qli_cmp_residual_k,
+            device_local_metadata_group_id=local_group_id,
             cu_cmp_seqlen_list=cu_cmp_seqlens,
         )
 
@@ -862,6 +897,14 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         tasks = self._device_metadata_tasks
         self._device_metadata_tasks = ()
         return tasks
+
+    @staticmethod
+    def _local_token_range(num_input_tokens: int) -> tuple[int, int, int, int]:
+        tp_group = get_tp_group()
+        num_tokens_pad = ((num_input_tokens + tp_group.world_size - 1) // tp_group.world_size) * tp_group.world_size
+        tokens_per_rank = num_tokens_pad // tp_group.world_size
+        local_start = tp_group.rank_in_group * tokens_per_rank
+        return local_start, local_start + tokens_per_rank, tokens_per_rank, num_tokens_pad
 
     def _build_local_token_metadata(
         self,
@@ -889,15 +932,9 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         local_reqs_mask = [0, 0, 0, 0, 0, 1, 1, 1, 0]
         local_seq_lens = [0, 0, 0, 0, 0, 6, 7, 2, 0]
         """
-        tp_group = get_tp_group()
-        tp_size = tp_group.world_size
-        tp_rank = tp_group.rank_in_group
         # Split the flattened token stream evenly across TP ranks. Padding keeps
         # every rank's local slice the same length, which simplifies CP kernels.
-        num_tokens_pad = ((num_input_tokens + tp_size - 1) // tp_size) * tp_size
-        tokens_per_rank = num_tokens_pad // tp_size
-        local_start = tp_rank * tokens_per_rank
-        local_end = local_start + tokens_per_rank
+        local_start, local_end, tokens_per_rank, num_tokens_pad = self._local_token_range(num_input_tokens)
 
         if local_query_start_loc is not None:
             local_query_start_loc.fill_(0)
@@ -1225,6 +1262,11 @@ class AscendDSACPImpl(DSAAttentionImpl):
         self,
         metadata: AscendDSAReqMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if metadata.device_local_metadata_group_id is not None:
+            wait_for_device_metadata(
+                DeviceMetadataStage.COMPRESSOR,
+                metadata.device_local_metadata_group_id,
+            )
         return get_or_compute_compressor_metadata(metadata, self.compress_ratio)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):

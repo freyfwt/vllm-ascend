@@ -225,6 +225,7 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTaskProvider,
 )
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
+from vllm_ascend.worker.logits_anomaly_monitor import LogitsAnomalyMonitor
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer, disable_compilation
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
@@ -396,6 +397,7 @@ class NPUModelRunner(GPUModelRunner):
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
 
         self.sampler = AscendSampler()
+        self.logits_anomaly_monitor = LogitsAnomalyMonitor()
         self.attn_state: AscendAttentionState | None = None
 
         # Ascend-specific configurations
@@ -2622,6 +2624,8 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        self._check_logits_before_sampling(logits, spec_decode_metadata)
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             # here we are different from gpu_model_runner,
@@ -2813,6 +2817,21 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
+    def _check_logits_before_sampling(
+        self,
+        logits: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        if lmhead_tp_enable():
+            num_logits = (
+                self.input_batch.num_reqs
+                if spec_decode_metadata is None
+                else len(spec_decode_metadata.logits_indices)
+            )
+            logits = logits[:num_logits]
+        sampling_stage = "rejection sampling" if spec_decode_metadata is not None else "sampling"
+        self.logits_anomaly_monitor.check(logits, sampling_stage)
+
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.
@@ -2842,6 +2861,12 @@ class NPUModelRunner(GPUModelRunner):
             sampling_metadata,
         )
         return sampler_output
+
+    def shutdown(self) -> None:
+        logits_anomaly_monitor = getattr(self, "logits_anomaly_monitor", None)
+        if logits_anomaly_monitor is not None:
+            logits_anomaly_monitor.flush()
+        super().shutdown()
 
     def _get_nans_in_logits(self, logits: torch.Tensor | None) -> dict[str, int]:
         """Count NaNs per request with an NPU-compatible reduction."""

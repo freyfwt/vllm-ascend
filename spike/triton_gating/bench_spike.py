@@ -29,18 +29,17 @@ import torch_npu  # noqa: F401
 
 from vllm.triton_utils import tl, triton  # noqa: F401  (env probe needs tl/triton)
 
-import vllm_ascend  # noqa: F401
-import vllm_ascend.vllm_ascend_C  # noqa: F401  (lazy native ext; registers _C_ascend ops)
-from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.ops.fused_moe.eplb import build_expert_replica_routing_table
-from vllm_ascend.ops.triton.eplb import (
-    map_to_physical_triton,
-    record_expert_tokens_triton,
-)
+# Registers torch.ops._C_ascend.*. Kept minimal on purpose: importing the full
+# vllm_ascend package pulls in a circular module chain that is only safe in the
+# production import order.
+import vllm_ascend.vllm_ascend_C  # noqa: F401
 
 from spike.triton_gating.fused_kernels import (
+    build_expert_replica_routing_table,
     gating_map_record,
     map_record,
+    map_to_physical_triton,
+    record_expert_tokens_triton,
     reference_gating_torch,
 )
 
@@ -107,7 +106,9 @@ def make_setup(num_tokens: int, device) -> dict:
 
 
 def run_baseline_gating(s):
-    return DeviceOperator.moe_gating_top_k(
+    # Mirrors DeviceOperator.moe_gating_top_k (vllm_ascend/device/device_op.py:151)
+    # without importing the full device_op module chain.
+    topk_weights, topk_ids, out = torch.ops._C_ascend.moe_gating_top_k(
         s["logits"],
         k=K,
         k_group=K_GROUP,
@@ -120,6 +121,7 @@ def run_baseline_gating(s):
         eps=EPS,
         bias_opt=s["bias"],
     )
+    return topk_weights, topk_ids.to(torch.int32), out
 
 
 def synthesize_counts(physical: torch.Tensor, s: dict) -> torch.Tensor:

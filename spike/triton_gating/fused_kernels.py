@@ -31,6 +31,128 @@ _BIG = 1 << 30
 _NEG_INF = float("-inf")
 
 
+# ---------------------------------------------------------------------------
+# Verbatim copies of the current-route Triton kernels and the routing-table
+# builder (vllm_ascend/ops/triton/eplb.py, vllm_ascend/ops/fused_moe/eplb.py).
+# The spike keeps them local so it can import without the full vllm_ascend
+# package; the full-fusion kernel's map segment below must stay identical to
+# _map_to_physical_kernel for the bit-exact parity gate.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _map_to_physical_kernel(
+    topk_ids_ptr,
+    routing_table_ptr,
+    physical_ids_ptr,
+    num_logical_experts,
+    numel,
+    topk,
+    routing_table_rows,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+
+    logical_id = tl.load(topk_ids_ptr + offsets, mask=mask, other=-1).to(tl.int64)
+    valid_logical_id = (logical_id >= 0) & (logical_id < num_logical_experts)
+    safe_logical_id = tl.where(valid_logical_id, logical_id, 0)
+
+    token_idx = offsets // topk
+    routing_row = token_idx % routing_table_rows
+    routing_index = routing_row * num_logical_experts + safe_logical_id
+    physical_id = tl.load(
+        routing_table_ptr + routing_index,
+        mask=mask & valid_logical_id,
+        other=-1,
+    )
+    tl.store(physical_ids_ptr + offsets, physical_id, mask=mask)
+
+
+@triton.jit
+def _record_expert_tokens_kernel(
+    expert_tokens_ptr,
+    expert_load_ptr,
+    record_enabled_ptr,
+    num_local_experts,
+    local_expert_start,
+    group_list_type: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    if tl.load(record_enabled_ptr) != 0:
+        mask = offsets < num_local_experts
+        current = tl.load(expert_tokens_ptr + offsets, mask=mask, other=0)
+        if group_list_type == 1:
+            local_load = current
+        else:
+            previous_offset = tl.maximum(offsets - 1, 0)
+            previous = tl.load(expert_tokens_ptr + previous_offset, mask=mask & (offsets > 0), other=0)
+            local_load = current - previous
+        load_offsets = local_expert_start + offsets
+        previous_load = tl.load(expert_load_ptr + load_offsets, mask=mask, other=0)
+        tl.store(expert_load_ptr + load_offsets, previous_load + local_load, mask=mask)
+
+
+def map_to_physical_triton(topk_ids: torch.Tensor, expert_replica_routing_table: torch.Tensor) -> torch.Tensor:
+    if topk_ids.numel() == 0:
+        return topk_ids
+    physical_ids = torch.empty_like(topk_ids)
+    numel = topk_ids.numel()
+    grid = lambda meta: (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
+    _map_to_physical_kernel[grid](
+        topk_ids,
+        expert_replica_routing_table,
+        physical_ids,
+        expert_replica_routing_table.shape[1],
+        numel,
+        topk_ids.shape[1],
+        expert_replica_routing_table.shape[0],
+        BLOCK_SIZE=256,
+    )
+    return physical_ids
+
+
+def record_expert_tokens_triton(
+    expert_tokens: torch.Tensor,
+    expert_load_view: torch.Tensor,
+    record_enabled: torch.Tensor,
+    group_list_type: int,
+    local_expert_start: int,
+) -> None:
+    num_local_experts = expert_tokens.numel()
+    if num_local_experts == 0:
+        return
+    _record_expert_tokens_kernel[(1,)](
+        expert_tokens,
+        expert_load_view,
+        record_enabled,
+        num_local_experts,
+        local_expert_start,
+        group_list_type=group_list_type,
+        BLOCK_SIZE=triton.next_power_of_2(num_local_experts),
+    )
+
+
+EXPERT_REPLICA_ROUTING_TABLE_NUM_ROWS = 1024
+
+
+def build_expert_replica_routing_table(
+    logical_to_physical_map: torch.Tensor,
+    logical_replica_count: torch.Tensor,
+    ep_rank: int,
+) -> torch.Tensor:
+    num_logical_experts = logical_replica_count.shape[0]
+    device = logical_to_physical_map.device
+    table_rows = torch.arange(
+        EXPERT_REPLICA_ROUTING_TABLE_NUM_ROWS, dtype=torch.int64, device=device
+    )[:, None]
+    logical_expert_ids = torch.arange(num_logical_experts, dtype=torch.int64, device=device)[None, :]
+    replica_count = logical_replica_count.to(torch.int64).clamp_min(1)[None, :]
+    replica_indices = (table_rows + ep_rank + logical_expert_ids) % replica_count
+    routing_table = logical_to_physical_map.gather(1, replica_indices.T).T
+    return routing_table.to(torch.int32).contiguous()
+
+
 @triton.jit
 def gating_map_record_kernel(
     x_ptr,  # [num_tokens, num_experts] router logits (fp32/bf16, cast in-kernel)

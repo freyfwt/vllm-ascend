@@ -98,18 +98,33 @@ def gating_map_record_kernel(
     active = rec_on & tok_valid & tmask
 
     # Group score: sum of the top-2 keys per group, as one 3D reduction over
-    # the (TOKENS_PER_PROGRAM, GROUP_COUNT, GROUP_SIZE) view. The group-max
-    # element is removed by its within-group index (lowest on ties, like the
-    # CANN kernel) so duplicated values are handled. NOTE: iterative
-    # tl.argmax is unusable on triton-ascend 3.2.x (returns wrong indices
-    # once -inf replacements appear); every selection round therefore uses
-    # the max + min-index pattern.
-    x3 = tl.reshape(key, (TOKENS_PER_PROGRAM, GROUP_COUNT, GROUP_SIZE))
-    gs_cols = tl.arange(0, GROUP_SIZE)
-    m1 = tl.max(x3, axis=2)
-    i1 = tl.min(tl.where(x3 == m1[:, :, None], gs_cols[None, None, :], GROUP_SIZE), axis=2)
-    x_removed = tl.where(gs_cols[None, None, :] != i1[:, :, None], x3, _NEG_INF)
-    gs = m1 + tl.max(x_removed, axis=2)
+    # the (TOKENS_PER_PROGRAM, GROUP_COUNT, GROUP_SIZE) view. The tile is
+    # loaded straight through 3D pointer arithmetic: tl.reshape from the 2D
+    # tile trips UB-overflowing layout conversions on this backend. The
+    # group-max element is removed by its within-group index (lowest on
+    # ties, like the CANN kernel) so duplicated values are handled. NOTE:
+    # iterative tl.argmax is unusable on triton-ascend 3.2.x (returns wrong
+    # indices once -inf replacements appear); every selection round
+    # therefore uses the max + min-index pattern.
+    g_cols = tl.arange(0, GROUP_COUNT)
+    s_cols = tl.arange(0, GROUP_SIZE)
+    e_idx3 = g_cols[None, :, None] * GROUP_SIZE + s_cols[None, None, :]
+    x3 = tl.load(x_ptr + trows[:, None, None] * num_experts + e_idx3,
+                 mask=tmask[:, None, None] & (e_idx3 < num_experts), other=_NEG_INF).to(tl.float32)
+    if NORM_TYPE == 0:
+        xexp3 = tl.exp(x3 - tl.max(x3, axis=2)[:, :, None])
+        score3 = xexp3 / tl.sum(xexp3, axis=2)[:, :, None]
+    else:
+        score3 = tl.sigmoid(x3)
+    if HAS_BIAS:
+        bias3 = tl.load(bias_ptr + e_idx3, mask=e_idx3 < num_experts, other=0.0).to(tl.float32)
+        key3 = score3 + bias3
+    else:
+        key3 = score3
+    m1 = tl.max(key3, axis=2)
+    i1 = tl.min(tl.where(key3 == m1[:, :, None], s_cols[None, None, :], GROUP_SIZE), axis=2)
+    key_removed = tl.where(s_cols[None, None, :] != i1[:, :, None], key3, _NEG_INF)
+    gs = m1 + tl.max(key_removed, axis=2)
 
     # Select the top K_GROUP groups per token; record the winning expert mask.
     sel = tl.zeros((TOKENS_PER_PROGRAM, E_ALIGN), dtype=tl.int32)

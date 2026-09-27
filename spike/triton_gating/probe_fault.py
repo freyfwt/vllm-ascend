@@ -65,6 +65,42 @@ def _k_gather_load(table_ptr, idx_ptr, o_ptr, R: tl.constexpr, K: tl.constexpr, 
     tl.store(o_ptr + row * K + karange, phys)
 
 
+@triton.jit
+def _k_topk_f32_2d_dim1(x_ptr, o_ptr, R: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, N)
+    x = tl.load(x_ptr + row * N + offs)
+    v = tl.topk(x, K, dim=1)
+    tl.store(o_ptr + row * K + tl.arange(0, K), v)
+
+
+@triton.jit
+def _k_sort_i64_2d(x_ptr, o_ptr, R: tl.constexpr, N: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, N)
+    x = tl.load(x_ptr + row * N + offs)
+    v = tl.sort(x, descending=True)
+    tl.store(o_ptr + row * N + offs, v)
+
+
+@triton.jit
+def _k_topk_f64_2d(x_ptr, o_ptr, R: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, N)
+    x = tl.load(x_ptr + row * N + offs).to(tl.float64)
+    v = tl.topk(x, K, dim=1)
+    tl.store(o_ptr + row * K + tl.arange(0, K), v)
+
+
+@triton.jit
+def _k_topk_i64_2d_nopack(x_ptr, o_ptr, R: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, N)
+    x = tl.load(x_ptr + row * N + offs)
+    v = tl.topk(x, K, dim=1)
+    tl.store(o_ptr + row * K + tl.arange(0, K), v)
+
+
 def main():
     torch.npu.set_device(0)
     R, N, K, LC, START, E, TR = 16, 256, 8, 64, 36, 256, 1024
@@ -93,6 +129,16 @@ def main():
     table = torch.randint(0, 300, (TR, E), dtype=torch.int32, device="npu:0")
     idx = torch.randint(-1, E, (R, K), dtype=torch.int32, device="npu:0")
     try_kernel("2d gather load with mask", _k_gather_load, (R,), table, idx, torch.empty(R, K, dtype=torch.int32, device="npu:0"), R, K, E, TR)
+
+    try_kernel("topk f32 (16,256) dim1 k8", _k_topk_f32_2d_dim1, (R,), x, torch.empty(R, K, device="npu:0"), R, N, K)
+    x32 = torch.randn(128, 32, device="npu:0")
+    try_kernel("topk f32 (128,32) dim1 k2", _k_topk_f32_2d_dim1, (1,), x32, torch.empty(128, 2, device="npu:0"), 1, 32, 2)
+    xi = torch.randint(-(2**40), 2**40, (128, 32), dtype=torch.int64, device="npu:0")
+    try_kernel("topk i64 (128,32) dim1", _k_topk_i64_2d_nopack, (1,), xi, torch.empty(128, 8, dtype=torch.int64, device="npu:0"), 1, 32, 8)
+    xi2 = torch.randint(-(2**40), 2**40, (R, N), dtype=torch.int64, device="npu:0")
+    try_kernel("sort i64 (16,256)", _k_sort_i64_2d, (R,), xi2, torch.empty(R, N, dtype=torch.int64, device="npu:0"), R, N)
+    try_kernel("topk f64 (16,256) k8", _k_topk_f64_2d, (R,), x, torch.empty(R, K, dtype=torch.float64, device="npu:0"), R, N, K)
+    try_kernel("full err of i64 topk:", _k_topk_i64_2d, (R,), x, packed_out, R, N, K)
 
 
 if __name__ == "__main__":

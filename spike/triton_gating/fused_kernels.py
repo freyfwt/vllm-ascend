@@ -232,12 +232,8 @@ def gating_map_record_kernel(
         v = tl.max(cand, axis=1)
         e = tl.min(tl.where(cand == v[:, None], offs[None, :], _BIG), axis=1)
         s = tl.sum(tl.where(offs[None, :] == e[:, None], score, 0.0), axis=1)
-        phys = tl.load(
-            table_ptr + (trows % TABLE_ROWS)[:, None] * num_experts + e[:, None],
-            mask=tmask[:, None],
-            other=-1,
-        )
-        tl.store(ids_ptr + trows[:, None] * K + j, phys[:, None], mask=tmask[:, None])
+        phys = tl.load(table_ptr + (trows % TABLE_ROWS) * num_experts + e, mask=tmask, other=-1)
+        tl.store(ids_ptr + trows * K + j, phys, mask=tmask)
         local = phys - local_expert_start
         hits += ((lc[None, :] == local[:, None]) & active[:, None]).to(tl.int32)
         cand = tl.where(offs[None, :] == e[:, None], _NEG_INF, cand)

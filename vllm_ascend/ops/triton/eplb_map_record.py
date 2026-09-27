@@ -302,28 +302,22 @@ def hash_map_record_kernel(
     # DeepSeek V4 hash route: the expert ids come straight from the lookup
     # table; the logits only provide the weights, scored as
     # sqrt(softplus(x)) (pre-bias) and re-normalized over the selected
-    # subset exactly like the CANN regbase variant.
+    # subset exactly like the CANN regbase variant. The lookup, mapping and
+    # recording run as K single-column steps: 2D gather loads with a
+    # row-broadcast mask are unreliable on this backend.
     x = tl.load(x_ptr + trows[:, None] * num_experts + offs[None, :], mask=tmask[:, None] & emask[None, :], other=0.0).to(tl.float32)
     score = tl.sqrt(tl.log(1.0 + tl.exp(x)))
 
     key = tl.load(input_ids_ptr + trows, mask=tmask, other=0)
-    e_all = tl.load(tid2eid_ptr + key[:, None] * K + karange[None, :], mask=tmask[:, None], other=0).to(tl.int32)
-
-    phys_all = tl.load(
-        table_ptr + (trows % TABLE_ROWS)[:, None] * num_experts + e_all,
-        mask=tmask[:, None],
-        other=-1,
-    )
-    tl.store(ids_ptr + trows[:, None] * K + karange[None, :], phys_all, mask=tmask[:, None])
-
-    local_all = phys_all - local_expert_start
-    hit = active[:, None] & (local_all >= 0) & (local_all < LOCAL_COUNT)
-    tl.atomic_add(load_ptr + local_expert_start + local_all, 1, mask=hit)
-
     sc = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.float32)
     for j in tl.static_range(K):
-        e_j = tl.sum(tl.where(karange[None, :] == j, e_all, 0), axis=1)
+        e_j = tl.load(tid2eid_ptr + key * K + j, mask=tmask, other=0).to(tl.int32)
         s_j = tl.sum(tl.where(offs[None, :] == e_j[:, None], score, 0.0), axis=1)
+        phys = tl.load(table_ptr + (trows % TABLE_ROWS) * num_experts + e_j, mask=tmask, other=-1)
+        tl.store(ids_ptr + trows * K + j, phys, mask=tmask)
+        local = phys - local_expert_start
+        hit = active & (local >= 0) & (local < LOCAL_COUNT)
+        tl.atomic_add(load_ptr + local_expert_start + local, 1, mask=hit)
         sc = tl.where(karange[None, :] == j, s_j[:, None], sc)
 
     ysum = tl.sum(sc, axis=1)

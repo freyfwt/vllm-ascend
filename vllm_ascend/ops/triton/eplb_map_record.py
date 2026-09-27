@@ -300,10 +300,11 @@ def hash_map_record_kernel(
     active = rec_on & tok_valid & tmask
 
     # DeepSeek V4 hash route: the expert ids come straight from the lookup
-    # table, the logits only provide the weights (sigmoid, then subset
-    # renormalization exactly like the CANN regbase variant).
+    # table; the logits only provide the weights, scored as
+    # sqrt(softplus(x)) (pre-bias) and re-normalized over the selected
+    # subset exactly like the CANN regbase variant.
     x = tl.load(x_ptr + trows[:, None] * num_experts + offs[None, :], mask=tmask[:, None] & emask[None, :], other=0.0).to(tl.float32)
-    score = tl.sigmoid(x)
+    score = tl.sqrt(tl.log(1.0 + tl.exp(x)))
 
     key = tl.load(input_ids_ptr + trows, mask=tmask, other=0)
     e_all = tl.load(tid2eid_ptr + key[:, None] * K + karange[None, :], mask=tmask[:, None], other=0).to(tl.int32)

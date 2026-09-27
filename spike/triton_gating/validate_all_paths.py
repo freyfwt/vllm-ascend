@@ -30,7 +30,7 @@ TABLE_ROWS = 1024
 
 def make_table(device):
     gen = torch.Generator(device="cpu").manual_seed(11)
-    l2p = torch.full((NUM_LOGICAL, 2), -1, dtype=torch.int64)
+    l2p = torch.stack([torch.arange(NUM_LOGICAL), torch.full((NUM_LOGICAL,), -1)], dim=1)
     rep = torch.ones(NUM_LOGICAL, dtype=torch.int64)
     for i in range(NUM_REDUNDANT):
         l2p[i, 1] = NUM_LOGICAL + i

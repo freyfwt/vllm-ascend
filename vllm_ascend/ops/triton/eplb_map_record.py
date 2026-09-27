@@ -102,14 +102,14 @@ def gating_map_record_kernel(
     # element is removed by index (not value) so duplicates are handled.
     x3 = tl.reshape(key, (TOKENS_PER_PROGRAM, GROUP_COUNT, GROUP_SIZE))
     m1 = tl.max(x3, axis=2)
-    i1 = tl.argmax(x3, axis=2)  # lowest in-group index on ties
+    i1 = tl.argmax(x3, axis=2).to(tl.int32)  # lowest in-group index on ties
     x_removed = tl.where(tl.arange(0, GROUP_SIZE)[None, None, :] != i1[:, :, None], x3, _NEG_INF)
     gs = m1 + tl.max(x_removed, axis=2)
 
     # Select the top K_GROUP groups per token; record the winning expert mask.
     sel = tl.zeros((TOKENS_PER_PROGRAM, E_ALIGN), dtype=tl.int32)
     for _ in tl.static_range(K_GROUP):
-        gi = tl.argmax(gs, axis=1)
+        gi = tl.argmax(gs, axis=1).to(tl.int32)
         sel = sel | (g_idx[None, :] == gi[:, None]).to(tl.int32)
         gs = tl.where(garange[None, :] == gi[:, None], _NEG_INF, gs)
 
@@ -118,7 +118,7 @@ def gating_map_record_kernel(
     cand = tl.where((sel > 0) & lmask, key, _NEG_INF)
     e_all = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.int32)
     for j in tl.static_range(K):
-        e_j = tl.argmax(cand, axis=1)
+        e_j = tl.argmax(cand, axis=1).to(tl.int32)
         e_all = tl.where(karange[None, :] == j, e_j[:, None], e_all)
         cand = tl.where(offs[None, :] == e_j[:, None], _NEG_INF, cand)
 

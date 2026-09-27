@@ -240,7 +240,9 @@ def padding_check(s, ids_c_full: torch.Tensor) -> dict:
         (ids_c_full[in_local] - s["local_start"]).flatten(),
         minlength=s["local_count"],
     ).to(torch.int32)
-    removed = load_full - s["load_c"]
+    removed = (load_full - s["load_c"])[
+        s["local_start"]: s["local_start"] + s["local_count"]
+    ]
 
     s["num_valid"].fill_(s["num_tokens"])
     s["load_c"].copy_(load_full)

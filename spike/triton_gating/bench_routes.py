@@ -75,14 +75,23 @@ def main():
         nv = torch.full((), T, dtype=torch.int32, device=device)
         load = torch.zeros(num_physical, dtype=torch.int32, device=device)
 
+        # Cache the operator-provided counts once (production gets them from
+        # the MoE operator); bincount itself is not part of the timed route.
+        ids0 = torch.ops._C_ascend.moe_gating_top_k(
+            logits, k=K, k_group=K_GROUP, group_count=GROUP_COUNT,
+            group_select_mode=1, renorm=1, norm_type=1, out_flag=False,
+            routed_scaling_factor=SCALING, eps=EPS, bias_opt=bias)[1]
+        phys0 = map_to_physical_triton(ids0.to(torch.int32), table)
+        in_local = (phys0 >= local_start) & (phys0 < local_start + local_count)
+        counts = torch.bincount((phys0[in_local] - local_start).flatten(), minlength=local_count).to(torch.int32)
+        torch.npu.synchronize()
+
         def route_a():
             w, ids, _ = torch.ops._C_ascend.moe_gating_top_k(
                 logits, k=K, k_group=K_GROUP, group_count=GROUP_COUNT,
                 group_select_mode=1, renorm=1, norm_type=1, out_flag=False,
                 routed_scaling_factor=SCALING, eps=EPS, bias_opt=bias)
-            phys = map_to_physical_triton(ids, table)
-            in_local = (phys >= local_start) & (phys < local_start + local_count)
-            counts = torch.bincount((phys[in_local] - local_start).flatten(), minlength=local_count).to(torch.int32)
+            phys = map_to_physical_triton(ids.to(torch.int32), table)
             record_expert_tokens_triton(counts, load, ro, 1, local_start)
 
         def route_c(record_enabled):

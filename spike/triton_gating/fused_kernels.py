@@ -208,33 +208,37 @@ def gating_map_record_kernel(
 
     g_idx = offs // GROUP_SIZE
     garange = tl.arange(0, GROUP_COUNT)
+    gs_cols = tl.arange(0, GROUP_SIZE)
     karange = tl.arange(0, K)
-    ksel = tl.arange(0, K_GROUP)
-    lc = tl.arange(0, LOCAL_COUNT_POW2)
     rec_on = tl.load(record_enabled_ptr) != 0
     tok_valid = trows < tl.load(num_valid_ptr)
     active = rec_on & tok_valid & tmask
 
-    # Group score: top-2 sum per group via one partial sort over the
+    # Group score: top-2 sum per group via one sort over the
     # (TOKENS_PER_PROGRAM * GROUP_COUNT, GROUP_SIZE) view.
     key3 = tl.reshape(key, (TOKENS_PER_PROGRAM * GROUP_COUNT, GROUP_SIZE))
-    gtop2 = tl.topk(key3, 2, dim=1)
-    gs = tl.reshape(tl.sum(gtop2, axis=1), (TOKENS_PER_PROGRAM, GROUP_COUNT))
+    sorted_g = tl.sort(key3, descending=True)
+    top2 = tl.sum(tl.where(gs_cols[None, :] < 2, sorted_g, 0.0), axis=1)
+    gs = tl.reshape(top2, (TOKENS_PER_PROGRAM, GROUP_COUNT))
 
-    # Group selection: pack score+inverted index, topk(K_GROUP), unpack ids.
+    # Group selection: pack score+inverted index, sort, unpack the winning ids.
     packed_g = _pack_f32_desc(gs, GROUP_COUNT - 1 - garange, 3)
-    gwin = tl.topk(packed_g, K_GROUP, dim=1)
+    sorted_gp = tl.sort(packed_g, descending=True)
     sel = tl.zeros((TOKENS_PER_PROGRAM, E_ALIGN), dtype=tl.int32)
     for j in tl.static_range(K_GROUP):
-        g_j = tl.sum(tl.where(ksel[None, :] == j, gwin, 0), axis=1)
+        g_j = tl.sum(tl.where(garange[None, :] == j, sorted_gp, 0), axis=1)
         g_j = GROUP_COUNT - 1 - (g_j & (GROUP_COUNT - 1)).to(tl.int32)
         sel = sel | (g_idx[None, :] == g_j[:, None]).to(tl.int32)
 
-    # Expert selection: pack key+inverted index, topk(K), unpack expert ids.
+    # Expert selection: pack key+inverted index, sort, unpack expert ids.
     mkey = tl.where((sel > 0) & lmask, key, _NEG_INF)
     packed_e = _pack_f32_desc(mkey, 511 - offs, 9)
-    ewin = tl.topk(packed_e, K, dim=1)
-    e_all = (511 - (ewin & 511)).to(tl.int32)  # (TS, K) winning expert ids
+    sorted_e = tl.sort(packed_e, descending=True)
+    e_all = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.int32)
+    for j in tl.static_range(K):
+        e_j = tl.sum(tl.where(offs[None, :] == j, sorted_e, 0), axis=1)
+        e_j = (511 - (e_j & 511)).to(tl.int32)
+        e_all = tl.where(karange[None, :] == j, e_j[:, None], e_all)
 
     # Map all winners through the replica table with one gather load.
     phys_all = tl.load(

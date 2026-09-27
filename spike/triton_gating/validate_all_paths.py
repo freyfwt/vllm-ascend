@@ -163,7 +163,9 @@ def main():
 
     # --- hash (DSV4-style): tid2eid lookup, sigmoid weights ---
     num_ids = 4096
-    tid2eid = torch.randint(0, num_physical, (num_ids, K), dtype=torch.int32, generator=gen).to(device)
+    # tid2eid holds LOGICAL expert ids (< num_logical); the replica table
+    # maps them to physical slots, exactly like production.
+    tid2eid = torch.randint(0, NUM_LOGICAL, (num_ids, K), dtype=torch.int32, generator=gen).to(device)
     input_ids = torch.randint(0, num_ids, (T,), dtype=torch.int64, generator=gen).to(device)
     load_a = torch.zeros(num_physical, dtype=torch.int32, device=device)
     load_c = torch.zeros(num_physical, dtype=torch.int32, device=device)

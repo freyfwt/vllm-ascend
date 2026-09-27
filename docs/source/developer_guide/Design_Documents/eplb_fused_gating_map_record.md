@@ -8,7 +8,9 @@ On the STAIR/EPLB path, every MoE layer in every forward pass used to run three 
 2. `ascend_eplb_map_to_physical` (Triton): replica-table lookup, producing physical expert ids;
 3. `ascend_eplb_record_expert_tokens` (Triton): accumulating operator-provided expert counts into the load vector.
 
-This document describes a Triton kernel that fuses all three steps into a single launch (`vllm_ascend/ops/triton/eplb_map_record.py`), fixes two pre-existing issues — the recording kernel launches unconditionally even when collection is disabled, and padding rows leak into the recorded load — and the batch-bucket routing that makes the fused path strictly non-regressive.
+This document describes Triton kernels that fuse all three steps into a single launch (`vllm_ascend/ops/triton/eplb_map_record.py`), fix two pre-existing issues — the recording kernel launches unconditionally even when collection is disabled, and padding rows leak into the recorded load — and the batch-bucket routing that makes the fused path strictly non-regressive.
+
+The coverage goal is the sigmoid and softmax scoring paths plus the DeepSeek V4 hash route (all routes where gating runs as a CANN device kernel), validated bit-exactly against each CANN op. Explicitly out of scope, each keeping the unfused route with no regression: the DeepSeek V4 vision sub-path, `GroupedTopKRouter` torch-composed fallbacks, `CustomRoutingRouter` (arbitrary Python functions cannot be fused statically), the 310P hardware path and the xlite engine.
 
 The result is verified bit-exact against the three-launch route and measured on Atlas 800I A3 (Ascend 910C, CANN 9.0.1, torch_npu 2.10.0, triton-ascend 3.2.2):
 
@@ -25,14 +27,20 @@ The integrated route is therefore bucketed: batches up to `EPLB_FUSED_MAP_RECORD
 
 ## Semantics Baseline
 
-The kernel replicates the CANN `moe_gating_top_k` sigmoid path (the `e_k_fullload` variant) exactly:
+The kernels replicate the CANN gating ops exactly.
 
-- `score = sigmoid(x)`, `key = score + bias`;
-- group score = sum of the top-2 keys inside each group;
-- select the top `k_group` groups by group score, then the top `k` experts among them by key;
-- weights use the **pre-bias** sigmoid scores (the CANN kernel gathers from `xSigmoidTensor`): `y = score / (sum(score) + eps) * routed_scaling_factor`.
+**Sigmoid and softmax** (`moe_gating_top_k`, generalized variant):
 
-Ties break toward the lowest expert index, matching the CANN behavior.
+- sigmoid: `score = sigmoid(x)`; softmax: `score = softmax(x)` over all experts;
+- `key = score + bias` drives selection; weights gather the **pre-bias** scores;
+- re-normalization over the selected subset: sigmoid always (`y = score / (sum(score) + eps)`), softmax only when `renorm == 1` (the CANN generalized variant's `needRenorm` rule); without it the full softmax values pass through;
+- group score = sum of the top-2 keys inside each group; select the top `k_group` groups, then the top `k` experts among them;
+- ties break toward the lowest expert index.
+
+**DeepSeek V4 hash** (`moe_gating_top_k_hash`, regbase variant, `group_count == 1`):
+
+- the expert ids come directly from the `tid2eid[token_id]` lookup table — no selection network;
+- weights = `sqrt(softplus(x))` gathered at those ids (pre-bias), re-normalized over the selected subset: `y = score / (sum(score) + eps) * routed_scaling_factor`.
 
 ## Kernel Structure
 
@@ -65,6 +73,11 @@ Every per-step mutable input (`record_enabled`, `num_valid_tokens`, the replica 
 
 ## Verification
 
+All routes validated on Ascend 910C against their CANN ops (`spike/triton_gating/validate_all_paths.py`): ids exact, recorded load integer-equal, weights within 1e-5 (sigmoid and hash are bit-exact at 0.0; softmax shows <= 2.4e-7 from exp/reduction-order ulps):
+
+- sigmoid + bias + renorm: bit-exact;
+- softmax x {bias, no-bias} x {renorm 0, 1}: all pass;
+- hash (tid2eid lookup, 4096 ids): bit-exact.
 - Bit-exact: `topk_ids` zero mismatches, `topk_weights` max diff 0.0, `expert_load_view` integer-equal, against the three-launch route on identical inputs, across all measured batch sizes.
 - Padding: with `num_valid_tokens = T - T/8`, the load difference matches the padding-row histogram exactly, per expert.
 - No double counting: `_record_v2_eplb_load` invocation count is zero on the fused path.

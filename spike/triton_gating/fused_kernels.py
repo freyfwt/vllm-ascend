@@ -319,8 +319,11 @@ def gating_map_record(
     group_size = num_experts // group_count
     if tokens_per_program is None:
         # Keep enough programs in flight for occupancy while amortizing the
-        # serial per-program reduction chain.
-        tokens_per_program = min(32, max(1, num_tokens // 96))
+        # serial per-program reduction chain. The backend only tolerates
+        # power-of-two tile heights (TS=5 aborted in parseSelect) and TS=1
+        # or TS>16 hit other shape quirks.
+        ts = max(2, min(16, num_tokens // 96))
+        tokens_per_program = 2 ** (ts.bit_length() - 1)
     weights = torch.empty((num_tokens, k), dtype=torch.float32, device=logits.device)
     ids = torch.empty((num_tokens, k), dtype=torch.int32, device=logits.device)
     gating_map_record_kernel[(triton.cdiv(num_tokens, tokens_per_program),)](

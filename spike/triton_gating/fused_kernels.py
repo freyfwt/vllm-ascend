@@ -319,8 +319,9 @@ def gating_map_record(
     group_size = num_experts // group_count
     if tokens_per_program is None:
         # Keep enough programs in flight for occupancy while amortizing the
-        # serial per-program reduction chain.
-        tokens_per_program = min(32, max(1, num_tokens // 96))
+        # serial per-program reduction chain. TS=1 and TS>16 hit shape quirks
+        # in the triton-ascend 3.2 backend (parseSelect assertion).
+        tokens_per_program = min(16, max(2, num_tokens // 96))
     weights = torch.empty((num_tokens, k), dtype=torch.float32, device=logits.device)
     ids = torch.empty((num_tokens, k), dtype=torch.int32, device=logits.device)
     gating_map_record_kernel[(triton.cdiv(num_tokens, tokens_per_program),)](

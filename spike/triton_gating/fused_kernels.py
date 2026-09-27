@@ -247,10 +247,11 @@ def gating_map_record_kernel(
     )
 
     # One vector atomic per program instead of K scalar atomics per token.
+    lc_ok = (lc < LOCAL_COUNT) & (lc < num_physical - local_expert_start)
     tl.atomic_add(
         load_ptr + local_expert_start + lc[None, :],
         hits,
-        mask=(lc[None, :] < LOCAL_COUNT) & active[:, None] & (lc[None, :] < num_physical - local_expert_start),
+        mask=lc_ok[None, :] & active[:, None],
     )
 
 

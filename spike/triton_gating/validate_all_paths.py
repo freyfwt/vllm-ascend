@@ -167,7 +167,9 @@ def main():
     input_ids = torch.randint(0, num_ids, (T,), dtype=torch.int64, generator=gen).to(device)
     load_a = torch.zeros(num_physical, dtype=torch.int32, device=device)
     load_c = torch.zeros(num_physical, dtype=torch.int32, device=device)
-    w_a, ids_a = cann_hash(logits, input_ids, tid2eid, bias)
+    import os
+    hash_bias = None if os.getenv("HASH_NO_BIAS") else bias
+    w_a, ids_a = cann_hash(logits, input_ids, tid2eid, hash_bias)
     # cann hash already returns final expert ids (logical == table domain here:
     # route them through the table the same way the Triton kernel does)
     phys_a = table[torch.arange(T, device=device)[:, None] % TABLE_ROWS, ids_a]
@@ -176,6 +178,8 @@ def main():
         logits, input_ids, tid2eid, table, record_on, num_valid, load_c,
         local_start, local_count, k=K, routed_scaling_factor=SCALING,
     )
+    print("  first-row ids A:", ids_a[0].tolist(), "C:", ids_c[0].tolist(),
+          "lookup:", tid2eid[input_ids[:1].cpu()].tolist())
     torch.npu.synchronize()
     ok &= check("hash (tid2eid)", phys_a, w_a, ids_c, w_c,
                 load_a[local_start: local_start + local_count],

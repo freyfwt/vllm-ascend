@@ -161,7 +161,7 @@ def route_b(s, ids_logical: torch.Tensor):
     return weights, physical
 
 
-def route_c(s, num_warps: int):
+def route_c(s, num_warps: int, tokens_per_program=None):
     """Full-fusion Triton kernel (1 launch)."""
     return gating_map_record(
         s["logits"],
@@ -226,7 +226,7 @@ def padding_check(s, ids_c_full: torch.Tensor) -> dict:
     load_full = s["load_c"].clone()
     s["load_c"].zero_()
     s["num_valid"].fill_(s["num_tokens"] - pad_rows)
-    route_c(s, num_warps=4)
+    route_c(s, num_warps=4, tokens_per_program=None)
     torch.npu.synchronize()
 
     pad_mask = torch.zeros(s["num_tokens"], dtype=torch.bool, device=ids_c_full.device)
@@ -255,6 +255,7 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--num-warps", type=int, default=4)
+    parser.add_argument("--tokens-per-program", type=int, default=None)
     parser.add_argument("--out", default="spike_triton_gating_results.json")
     args = parser.parse_args()
 
@@ -276,7 +277,7 @@ def main() -> None:
         counts = synthesize_counts(ids_a, s)
         ids_logical = run_baseline_gating(s)[1]
         w_b, ids_b = route_b(s, ids_logical)
-        w_c, ids_c = route_c(s, args.num_warps)
+        w_c, ids_c = route_c(s, args.num_warps, args.tokens_per_program)
         torch.npu.synchronize()
         case["parity_a_vs_c"] = parity(s, w_a, ids_a, w_c, ids_c)
         case["parity_b_ids_vs_a"] = bool((ids_b == ids_a).all())
@@ -322,7 +323,7 @@ def main() -> None:
         )
         case["B_total"] = time_fn(route_b_timed, args.warmup, args.iters)
         case["C_total"] = time_fn(
-            lambda: route_c(s, args.num_warps), args.warmup, args.iters
+            lambda: route_c(s, args.num_warps, args.tokens_per_program), args.warmup, args.iters
         )
 
         case["speedup_C_vs_A"] = case["A_total"]["p50_ms"] / case["C_total"]["p50_ms"]

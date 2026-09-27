@@ -141,6 +141,12 @@ def main():
     ok &= check("sigmoid+bias renorm1", phys_a, w_a, ids_c, w_c,
                 load_a[local_start: local_start + local_count],
                 load_c[local_start: local_start + local_count])
+    print("DBG row0 A:", phys_a[0].tolist())
+    print("DBG row0 C:", ids_c[0].tolist())
+    print("DBG row1 A:", phys_a[1].tolist())
+    print("DBG row1 C:", ids_c[1].tolist())
+    print("DBG row2 A:", phys_a[2].tolist())
+    print("DBG row2 C:", ids_c[2].tolist())
 
     # --- softmax renorm 0/1, with/without bias ---
     for norm_bias in (bias, None):

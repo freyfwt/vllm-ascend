@@ -99,26 +99,34 @@ def gating_map_record_kernel(
 
     # Group score: sum of the top-2 keys per group, as one 3D reduction over
     # the (TOKENS_PER_PROGRAM, GROUP_COUNT, GROUP_SIZE) view. The group-max
-    # element is removed by index (not value) so duplicates are handled.
+    # element is removed by its within-group index (lowest on ties, like the
+    # CANN kernel) so duplicated values are handled. NOTE: iterative
+    # tl.argmax is unusable on triton-ascend 3.2.x (returns wrong indices
+    # once -inf replacements appear); every selection round therefore uses
+    # the max + min-index pattern.
     x3 = tl.reshape(key, (TOKENS_PER_PROGRAM, GROUP_COUNT, GROUP_SIZE))
+    gs_cols = tl.arange(0, GROUP_SIZE)
     m1 = tl.max(x3, axis=2)
-    i1 = tl.argmax(x3, axis=2).to(tl.int32)  # lowest in-group index on ties
-    x_removed = tl.where(tl.arange(0, GROUP_SIZE)[None, None, :] != i1[:, :, None], x3, _NEG_INF)
+    i1 = tl.min(tl.where(x3 == m1[:, :, None], gs_cols[None, None, :], GROUP_SIZE), axis=2)
+    x_removed = tl.where(gs_cols[None, None, :] != i1[:, :, None], x3, _NEG_INF)
     gs = m1 + tl.max(x_removed, axis=2)
 
     # Select the top K_GROUP groups per token; record the winning expert mask.
     sel = tl.zeros((TOKENS_PER_PROGRAM, E_ALIGN), dtype=tl.int32)
     for _ in tl.static_range(K_GROUP):
-        gi = tl.argmax(gs, axis=1).to(tl.int32)
+        gv = tl.max(gs, axis=1)
+        gi = tl.min(tl.where(gs == gv[:, None], garange[None, :], GROUP_COUNT), axis=1)
         sel = sel | (g_idx[None, :] == gi[:, None]).to(tl.int32)
         gs = tl.where(garange[None, :] == gi[:, None], _NEG_INF, gs)
 
-    # Top-K experts per token among the selected groups: K argmax rounds that
-    # only collect ids; mapping, recording and scoring run vectorized after.
+    # Top-K experts per token among the selected groups: K max+min rounds
+    # that only collect ids; mapping, recording and scoring run vectorized
+    # after the loop.
     cand = tl.where((sel > 0) & lmask, key, _NEG_INF)
     e_all = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.int32)
     for j in tl.static_range(K):
-        e_j = tl.argmax(cand, axis=1).to(tl.int32)
+        v = tl.max(cand, axis=1)
+        e_j = tl.min(tl.where(cand == v[:, None], offs[None, :], _BIG), axis=1).to(tl.int32)
         e_all = tl.where(karange[None, :] == j, e_j[:, None], e_all)
         cand = tl.where(offs[None, :] == e_j[:, None], _NEG_INF, cand)
 

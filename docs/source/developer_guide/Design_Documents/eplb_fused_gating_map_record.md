@@ -16,12 +16,13 @@ The result is verified bit-exact against the three-launch route and measured on 
 
 | tokens | three-launch route | fused kernel | speedup |
 |---|---|---|---|
-| 64 | 0.240 ms | **0.142 ms** | **1.69x** |
-| 128 | 0.246 ms | **0.175 ms** | **1.41x** |
-| 256 | 0.242 ms | **0.220 ms** | **1.10x** |
-| 512 | 0.247 ms | 0.254 ms | 0.97x (parity) |
-| 1024 | 0.234 ms | 0.339 ms | 0.69x |
-| 6144 (prefill) | 0.445 ms | 1.005 ms | 0.43x |
+| 64 | 0.256 ms | **0.156 ms** | **1.65x** |
+| 256 | 0.253 ms | **0.223 ms** | **1.14x** |
+| 512 | 0.249 ms | 0.262 ms | 0.95x (parity) |
+| 1024 | 0.243 ms | 0.379 ms | 0.64x |
+| 6144 (prefill) | 0.461 ms | 1.547 ms | 0.30x |
+
+(The 1024/6144 rows run at tile heights the backend barely tolerates and are irrelevant under bucket routing, which sends those batches to the unfused route.)
 
 The integrated route is therefore bucketed: batches up to `EPLB_FUSED_MAP_RECORD_MAX_TOKENS` (512, tunable) take the fused kernel; larger batches keep the unfused CANN route and match the current behavior exactly.
 
@@ -75,9 +76,10 @@ Every per-step mutable input (`record_enabled`, `num_valid_tokens`, the replica 
 
 All routes validated on Ascend 910C against their CANN ops (`spike/triton_gating/validate_all_paths.py`): ids exact, recorded load integer-equal, weights within 1e-5 (sigmoid and hash are bit-exact at 0.0; softmax shows <= 2.4e-7 from exp/reduction-order ulps):
 
-- sigmoid + bias + renorm: bit-exact;
-- softmax x {bias, no-bias} x {renorm 0, 1}: all pass;
-- hash (tid2eid lookup, 4096 ids): bit-exact.
+- sigmoid + bias + renorm: bit-exact (0.0 diff);
+- softmax x {bias, no-bias} x {renorm 0, 1}: ids exact, weights <= 2.4e-7 (exp/reduction-order ulps);
+- hash (tid2eid lookup, 4096 ids): bit-exact;
+- validated at tile heights 4 and 16 (the bucket shapes and the largest probed height).
 - Bit-exact: `topk_ids` zero mismatches, `topk_weights` max diff 0.0, `expert_load_view` integer-equal, against the three-launch route on identical inputs, across all measured batch sizes.
 - Padding: with `num_valid_tokens = T - T/8`, the load difference matches the padding-row histogram exactly, per expert.
 - No double counting: `_record_v2_eplb_load` invocation count is zero on the fused path.
@@ -96,11 +98,13 @@ All routes validated on Ascend 910C against their CANN ops (`spike/triton_gating
 
 1. `tl.topk` (partial sort, values only) compiles on 1D tiles only; 2D `dim=1` fails for every dtype.
 2. 2D `tl.sort` passes standalone probes but triggers "cannot align N axis" layout-propagation errors when its result feeds further ops.
-3. Tile heights must be powers of two; TS=5 aborts in `parseSelect`, TS=1 and TS>16 have other shape issues.
+3. Tile heights must be powers of two; TS=5 aborts in `parseSelect`, TS=1 and TS>16 have other shape issues; the fused kernel caps at TS=4 (bucket shapes only need 2/4).
 4. `tl.argsort` does not exist and `tl.sort` returns no indices.
-5. UB budget is 196 KB; a (256, 64) int32 broadcast histogram exceeds it.
+5. UB budget is 196 KB; the (TS=8, 256) tile with a 3D group phase overflows it via reshape layout conversions, and `tl.reshape` between 2D and 3D tiles is the trigger.
 6. `num_warps` does not affect `axis=1` reduction latency.
-7. Index packing is available and lossless: an order-preserving int32 map of the fp32 key (`u < 0 ? ~u : u ^ (1 << 31)`) shifted left with the inverted index in the low 9 bits sorts identically to fp32 argsort with lowest-index-first ties. This unblocks the prefill fused route as soon as the backend ships index-bearing sort primitives.
+7. **Iterative `tl.argmax` is unusable**: once `-inf` replacements appear between rounds it returns wrong indices (known Triton bug, reproduced in `spike/triton_gating/probe_argmax_iter.py`); selection rounds use the max + min-index pattern instead.
+8. Loads/atomics whose mask is a row-broadcast (TS, 1) expression are unreliable at some (TS, K) shapes; masks built from full 2D terms or per-column 1D ops are safe.
+9. Index packing is available and lossless: an order-preserving int32 map of the fp32 key (`u < 0 ? ~u : u ^ (1 << 31)`) shifted left with the inverted index in the low 9 bits sorts identically to fp32 argsort with lowest-index-first ties. This unblocks the prefill fused route as soon as the backend ships index-bearing sort primitives.
 
 ## Follow-up
 

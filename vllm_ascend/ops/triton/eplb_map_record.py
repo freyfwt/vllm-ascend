@@ -119,34 +119,26 @@ def gating_map_record_kernel(
         sel = sel | (g_idx[None, :] == gi[:, None]).to(tl.int32)
         gs = tl.where(garange[None, :] == gi[:, None], _NEG_INF, gs)
 
-    # Top-K experts per token among the selected groups: K max+min rounds
-    # that only collect ids; mapping, recording and scoring run vectorized
-    # after the loop.
+    # Top-K experts per token among the selected groups, then map + record.
+    # NOTE: collecting the ids first and vectorizing the map/record epilogue
+    # miscompiles on this backend (loop-carried int32 accumulation); the
+    # per-step loop below is the validated form.
     cand = tl.where((sel > 0) & lmask, key, _NEG_INF)
-    e_all = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.int32)
+    karange = tl.arange(0, K)
+    lc = tl.arange(0, LOCAL_COUNT_POW2)
+    hits = tl.zeros((TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2), dtype=tl.int32)
+    sc = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.float32)
+
     for j in tl.static_range(K):
         v = tl.max(cand, axis=1)
-        e_j = tl.min(tl.where(cand == v[:, None], offs[None, :], _BIG), axis=1).to(tl.int32)
-        e_all = tl.where(karange[None, :] == j, e_j[:, None], e_all)
-        cand = tl.where(offs[None, :] == e_j[:, None], _NEG_INF, cand)
-
-    # Map all winners through the replica table with one gather load, record
-    # with one 2D vector atomic, then gather the exact pre-bias scores.
-    phys_all = tl.load(
-        table_ptr + (trows % TABLE_ROWS)[:, None] * num_experts + e_all,
-        mask=tmask[:, None],
-        other=-1,
-    )
-    tl.store(ids_ptr + trows[:, None] * K + karange[None, :], phys_all, mask=tmask[:, None])
-    local_all = phys_all - local_expert_start
-    hit = active[:, None] & (local_all >= 0) & (local_all < LOCAL_COUNT)
-    tl.atomic_add(load_ptr + local_expert_start + local_all, 1, mask=hit)
-
-    sc = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.float32)
-    for j in tl.static_range(K):
-        e_j = tl.sum(tl.where(karange[None, :] == j, e_all, 0), axis=1)
-        s_j = tl.sum(tl.where(offs[None, :] == e_j[:, None], score, 0.0), axis=1)
-        sc = tl.where(karange[None, :] == j, s_j[:, None], sc)
+        e = tl.min(tl.where(cand == v[:, None], offs[None, :], _BIG), axis=1)
+        s = tl.sum(tl.where(offs[None, :] == e[:, None], score, 0.0), axis=1)
+        phys = tl.load(table_ptr + (trows % TABLE_ROWS) * num_experts + e, mask=tmask, other=-1)
+        tl.store(ids_ptr + trows * K + j, phys, mask=tmask)
+        local = phys - local_expert_start
+        hits += ((lc[None, :] == local[:, None]) & active[:, None]).to(tl.int32)
+        cand = tl.where(offs[None, :] == e[:, None], _NEG_INF, cand)
+        sc = tl.where(karange[None, :] == j, s[:, None], sc)
 
     ysum = tl.sum(sc, axis=1)
     if RENORM:

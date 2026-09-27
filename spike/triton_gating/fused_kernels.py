@@ -28,8 +28,8 @@ harness measures the mismatch rate instead of assuming it is zero.
 import torch
 from vllm.triton_utils import tl, triton
 
-_BIG = 1 << 30
-_NEG_INF = float("-inf")
+_BIG = tl.constexpr(1 << 30)
+_NEG_INF = tl.constexpr(float("-inf"))
 
 
 # ---------------------------------------------------------------------------

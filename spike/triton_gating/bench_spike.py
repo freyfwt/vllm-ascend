@@ -220,7 +220,7 @@ def parity(s, w_a, ids_a, w_c, ids_c) -> dict:
     }
 
 
-def padding_check(s, ids_c_full: torch.Tensor) -> dict:
+def padding_check(s, ids_c_full: torch.Tensor, tokens_per_program=None) -> dict:
     """C with num_valid < T must exclude padding rows from the recorded load."""
     pad_rows = max(s["num_tokens"] // 8, 1)
     load_full = s["load_c"].clone()
@@ -282,7 +282,7 @@ def main() -> None:
         case["parity_a_vs_c"] = parity(s, w_a, ids_a, w_c, ids_c)
         case["parity_b_ids_vs_a"] = bool((ids_b == ids_a).all())
         case["parity_load_b_vs_a"] = bool((s["load_b"] == s["load_a"]).all())
-        case["padding"] = padding_check(s, ids_c)
+        case["padding"] = padding_check(s, ids_c, args.tokens_per_program)
 
         # Cached intermediates so timing loops do not re-synthesize counts.
         ids_logical = run_baseline_gating(s)[1]

@@ -58,7 +58,11 @@ def main():
     gen = torch.Generator(device="cpu").manual_seed(7)
     rows = torch.arange(TABLE_ROWS, dtype=torch.int64)[:, None]
     logical = torch.arange(NUM_LOGICAL, dtype=torch.int64)[None, :]
-    l2p = torch.stack([torch.arange(NUM_LOGICAL), torch.arange(NUM_REDUNDANT) + NUM_LOGICAL], dim=1)
+    l2p = torch.stack([
+        torch.arange(NUM_LOGICAL),
+        torch.where(torch.arange(NUM_LOGICAL) < NUM_REDUNDANT,
+                    torch.arange(NUM_LOGICAL) + NUM_LOGICAL, torch.full((NUM_LOGICAL,), -1)),
+    ], dim=1)
     rep = torch.where(torch.arange(NUM_LOGICAL) < NUM_REDUNDANT, 2, 1)
     idx = (rows + EP_RANK + logical) % rep[None, :]
     table = l2p.gather(1, idx.T).T.to(torch.int32).contiguous().to(device)

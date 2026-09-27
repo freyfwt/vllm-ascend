@@ -125,8 +125,6 @@ def gating_map_record_kernel(
     # per-step loop below is the validated form.
     cand = tl.where((sel > 0) & lmask, key, _NEG_INF)
     karange = tl.arange(0, K)
-    lc = tl.arange(0, LOCAL_COUNT_POW2)
-    hits = tl.zeros((TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2), dtype=tl.int32)
     sc = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.float32)
 
     for j in tl.static_range(K):
@@ -135,8 +133,11 @@ def gating_map_record_kernel(
         s = tl.sum(tl.where(offs[None, :] == e[:, None], score, 0.0), axis=1)
         phys = tl.load(table_ptr + (trows % TABLE_ROWS) * num_experts + e, mask=tmask, other=-1)
         tl.store(ids_ptr + trows * K + j, phys, mask=tmask)
+        # Per-column 1D atomic: 2D broadcast atomic masks are unreliable on
+        # this backend (same class as the 2D gather bug).
         local = phys - local_expert_start
-        hits += ((lc[None, :] == local[:, None]) & active[:, None]).to(tl.int32)
+        hit = active & (local >= 0) & (local < LOCAL_COUNT)
+        tl.atomic_add(load_ptr + local_expert_start + local, 1, mask=hit)
         cand = tl.where(offs[None, :] == e[:, None], _NEG_INF, cand)
         sc = tl.where(karange[None, :] == j, s[:, None], sc)
 

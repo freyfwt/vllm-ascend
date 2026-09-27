@@ -8,7 +8,6 @@ import torch
 import torch_npu  # noqa: F401
 
 import vllm_ascend.vllm_ascend_C  # noqa: F401
-from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.triton.eplb import (
     map_to_physical_triton,
     record_expert_tokens_triton,
@@ -73,7 +72,7 @@ def main():
         load = torch.zeros(num_physical, dtype=torch.int32, device=device)
 
         def route_a():
-            w, ids, _ = DeviceOperator.moe_gating_top_k(
+            w, ids, _ = torch.ops._C_ascend.moe_gating_top_k(
                 logits, k=K, k_group=K_GROUP, group_count=GROUP_COUNT,
                 group_select_mode=1, renorm=1, norm_type=1, out_flag=False,
                 routed_scaling_factor=SCALING, eps=EPS, bias_opt=bias)

@@ -145,12 +145,15 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         topk_group: int,
         num_expert_group: int,
         indices_type: torch.dtype | None,
+        norm_type: int = 1,
+        renorm: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Gating, EPLB replica mapping and load recording in one Triton launch.
 
         Returns None when any fallback condition holds; callers keep the
-        unfused route then. Only the sigmoid path with renormalization
-        reaches here (the validated kernel semantics).
+        unfused route then. Supports the sigmoid path (always
+        re-normalized, like the CANN kernel) and the softmax path
+        (re-normalized only when renorm is set).
         """
         state = getattr(self, "eplb_state", None)
         if state is None or not state.fused_record_allowed:
@@ -174,8 +177,47 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
             topk_group,
             num_expert_group,
             self.routed_scaling_factor,
+            norm_type=norm_type,
+            renorm=renorm,
         )
         # Skip the standalone mapping and recording passes downstream.
+        state.fused_map_record_active = True
+        return weights, ids.to(torch.int32 if indices_type is None else indices_type)
+
+    def _try_fused_hash_map_record(
+        self,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        tid2eid: torch.Tensor,
+        indices_type: torch.dtype | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """DeepSeek V4 hash route fused with mapping and recording.
+
+        The expert ids come from the tid2eid lookup table and the logits
+        only provide sigmoid weights, so no selection network is needed.
+        """
+        state = getattr(self, "eplb_state", None)
+        if state is None or not state.fused_record_allowed:
+            return None
+        if not envs.VLLM_ASCEND_EPLB_FUSED_MAP_RECORD:
+            return None
+        if state.expert_replica_routing_table is None or state.num_valid_tokens_tensor is None:
+            return None
+        if router_logits.shape[0] > EPLB_FUSED_MAP_RECORD_MAX_TOKENS:
+            return None
+        weights, ids = torch.ops.vllm.ascend_eplb_hash_map_record(
+            router_logits,
+            input_ids,
+            tid2eid,
+            state.expert_replica_routing_table,
+            state.should_record_tensor,
+            state.num_valid_tokens_tensor,
+            state.expert_load_view,
+            state.local_expert_start,
+            state.local_expert_count,
+            self.top_k,
+            self.routed_scaling_factor,
+        )
         state.fused_map_record_active = True
         return weights, ids.to(torch.int32 if indices_type is None else indices_type)
 
@@ -243,6 +285,11 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
             text_bias = self.e_score_correction_bias
             if text_bias is not None and text_bias.dtype != router_logits.dtype:
                 text_bias = text_bias.to(router_logits.dtype)
+            fused_hash = self._try_fused_hash_map_record(
+                router_logits, input_ids, tid2eid_ones, indices_type
+            )
+            if fused_hash is not None:
+                return fused_hash
             topk_weights, topk_ids, _ = torch.ops._C_ascend.moe_gating_top_k_hash(
                 x=router_logits,
                 k=self.top_k,
@@ -264,9 +311,14 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
             )
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32 if indices_type is None else indices_type)
         norm_type = 0 if self.scoring_func == "softmax" else 1
-        if norm_type == 1 and renorm == 1:
+        if norm_type in (0, 1) and (norm_type == 0 or renorm == 1):
             fused = self._try_fused_gating_map_record(
-                router_logits, topk_group, num_expert_group, indices_type
+                router_logits,
+                topk_group,
+                num_expert_group,
+                indices_type,
+                norm_type=norm_type,
+                renorm=bool(renorm),
             )
             if fused is not None:
                 return fused

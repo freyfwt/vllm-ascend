@@ -3,6 +3,11 @@
 
 """Fused EPLB gating, replica mapping and load recording for small batches.
 
+    Covers the sigmoid and softmax scoring paths (NORM_TYPE) with optional
+    renormalization (RENORM), plus the DeepSeek V4 hash route where the
+    expert ids come directly from the tid2eid lookup table (no selection
+    network).
+
 One Triton kernel replaces the three-launch route
 ``moe_gating_top_k`` -> ``ascend_eplb_map_to_physical`` ->
 ``ascend_eplb_record_expert_tokens``:
@@ -61,6 +66,8 @@ def gating_map_record_kernel(
     HAS_BIAS: tl.constexpr,
     E_ALIGN: tl.constexpr,
     TOKENS_PER_PROGRAM: tl.constexpr,
+    NORM_TYPE: tl.constexpr,
+    RENORM: tl.constexpr,
 ):
     tok0 = tl.program_id(0) * TOKENS_PER_PROGRAM
     trows = tok0 + tl.arange(0, TOKENS_PER_PROGRAM)  # (TS,)
@@ -70,7 +77,13 @@ def gating_map_record_kernel(
     lmask = tmask[:, None] & emask[None, :]
 
     x = tl.load(x_ptr + trows[:, None] * num_experts + offs[None, :], mask=lmask, other=0.0).to(tl.float32)
-    score = tl.sigmoid(x)
+    if NORM_TYPE == 0:
+        # Full softmax over all experts; masked lanes contribute exp(-inf) = 0.
+        xsafe = tl.where(lmask, x, _NEG_INF)
+        xexp = tl.exp(xsafe - tl.max(xsafe, axis=1)[:, None])
+        score = xexp / tl.sum(xexp, axis=1)[:, None]
+    else:
+        score = tl.sigmoid(x)
     if HAS_BIAS:
         bias = tl.load(bias_ptr + offs, mask=emask, other=0.0).to(tl.float32)
         key = tl.where(lmask, score + bias[None, :], _NEG_INF)
@@ -121,9 +134,15 @@ def gating_map_record_kernel(
         sc = tl.where(karange[None, :] == j, s[:, None], sc)
 
     ysum = tl.sum(sc, axis=1)
+    if RENORM:
+        # Sigmoid always re-normalizes over the selected subset; softmax only
+        # when renorm == 1 (the CANN generalized variant's needRenorm rule).
+        sc = sc / (ysum[:, None] + eps)
+    elif NORM_TYPE == 0:
+        pass  # full softmax values are already globally normalized
     tl.store(
         y_ptr + trows[:, None] * K + karange[None, :],
-        sc / (ysum[:, None] + eps) * scaling,
+        sc * scaling,
         mask=tmask[:, None],
     )
 
@@ -151,6 +170,8 @@ def gating_map_record(
     group_count: int,
     routed_scaling_factor: float,
     eps: float = 1e-20,
+    norm_type: int = 1,
+    renorm: bool = True,
     num_warps: int = 4,
     tokens_per_program: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -191,6 +212,8 @@ def gating_map_record(
         HAS_BIAS=bias is not None,
         E_ALIGN=triton.next_power_of_2(num_experts),
         TOKENS_PER_PROGRAM=tokens_per_program,
+        NORM_TYPE=norm_type,
+        RENORM=renorm,
         num_warps=num_warps,
     )
     return weights, ids
@@ -209,6 +232,8 @@ def map_to_physical_and_record(
     k_group: int,
     group_count: int,
     routed_scaling_factor: float,
+    norm_type: int = 1,
+    renorm: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton gating + replica mapping + load recording in a single launch.
 
@@ -234,4 +259,125 @@ def map_to_physical_and_record(
         k_group,
         group_count,
         routed_scaling_factor,
+        norm_type=norm_type,
+        renorm=renorm,
     )
+
+
+@triton.jit
+def hash_map_record_kernel(
+    x_ptr,  # [num_tokens, num_experts] logits providing the weights
+    table_ptr,  # [TABLE_ROWS, num_experts] int32 replica routing table
+    input_ids_ptr,  # [num_tokens] token ids (padding already sanitized)
+    tid2eid_ptr,  # [num_ids, K] token-id -> expert-id lookup table
+    record_enabled_ptr,  # 0-D device int
+    num_valid_ptr,  # 0-D device int
+    load_ptr,  # [num_physical] int32
+    y_ptr,  # [num_tokens, K] fp32
+    ids_ptr,  # [num_tokens, K] int32
+    num_tokens,
+    num_experts,
+    local_expert_start,
+    eps,
+    scaling,
+    num_physical,
+    K: tl.constexpr,
+    LOCAL_COUNT: tl.constexpr,
+    LOCAL_COUNT_POW2: tl.constexpr,
+    TABLE_ROWS: tl.constexpr,
+    E_ALIGN: tl.constexpr,
+    TOKENS_PER_PROGRAM: tl.constexpr,
+):
+    tok0 = tl.program_id(0) * TOKENS_PER_PROGRAM
+    trows = tok0 + tl.arange(0, TOKENS_PER_PROGRAM)
+    tmask = trows < num_tokens
+    offs = tl.arange(0, E_ALIGN)
+    emask = offs < num_experts
+    karange = tl.arange(0, K)
+    lc = tl.arange(0, LOCAL_COUNT_POW2)
+    rec_on = tl.load(record_enabled_ptr) != 0
+    tok_valid = trows < tl.load(num_valid_ptr)
+    active = rec_on & tok_valid & tmask
+
+    # DeepSeek V4 hash route: the expert ids come straight from the lookup
+    # table, the logits only provide the weights (sigmoid, then subset
+    # renormalization exactly like the CANN regbase variant).
+    x = tl.load(x_ptr + trows[:, None] * num_experts + offs[None, :], mask=tmask[:, None] & emask[None, :], other=0.0).to(tl.float32)
+    score = tl.sigmoid(x)
+
+    key = tl.load(input_ids_ptr + trows, mask=tmask, other=0)
+    e_all = tl.load(tid2eid_ptr + key[:, None] * K + karange[None, :], mask=tmask[:, None], other=0).to(tl.int32)
+
+    phys_all = tl.load(
+        table_ptr + (trows % TABLE_ROWS)[:, None] * num_experts + e_all,
+        mask=tmask[:, None],
+        other=-1,
+    )
+    tl.store(ids_ptr + trows[:, None] * K + karange[None, :], phys_all, mask=tmask[:, None])
+
+    local_all = phys_all - local_expert_start
+    hit = active[:, None] & (local_all >= 0) & (local_all < LOCAL_COUNT)
+    tl.atomic_add(load_ptr + local_expert_start + local_all, 1, mask=hit)
+
+    sc = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.float32)
+    for j in tl.static_range(K):
+        e_j = tl.sum(tl.where(karange[None, :] == j, e_all, 0), axis=1)
+        s_j = tl.sum(tl.where(offs[None, :] == e_j[:, None], score, 0.0), axis=1)
+        sc = tl.where(karange[None, :] == j, s_j[:, None], sc)
+
+    ysum = tl.sum(sc, axis=1)
+    tl.store(
+        y_ptr + trows[:, None] * K + karange[None, :],
+        sc / (ysum[:, None] + eps) * scaling,
+        mask=tmask[:, None],
+    )
+
+
+def hash_map_record(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    routing_table: torch.Tensor,
+    record_enabled: torch.Tensor,
+    num_valid_tokens: torch.Tensor,
+    expert_load_view: torch.Tensor,
+    local_expert_start: int,
+    local_expert_count: int,
+    k: int,
+    routed_scaling_factor: float,
+    eps: float = 1e-20,
+    num_warps: int = 4,
+    tokens_per_program: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DeepSeek V4 hash route: ids from tid2eid, weights from sigmoid(logits)."""
+    num_tokens, num_experts = router_logits.shape
+    if tokens_per_program is None:
+        ts = max(2, min(16, num_tokens // 96))
+        tokens_per_program = 2 ** (ts.bit_length() - 1)
+    weights = torch.empty((num_tokens, k), dtype=torch.float32, device=router_logits.device)
+    ids = torch.empty((num_tokens, k), dtype=torch.int32, device=router_logits.device)
+    hash_map_record_kernel[(triton.cdiv(num_tokens, tokens_per_program),)](
+        router_logits,
+        routing_table,
+        input_ids,
+        tid2eid,
+        record_enabled,
+        num_valid_tokens,
+        expert_load_view,
+        weights,
+        ids,
+        num_tokens,
+        num_experts,
+        local_expert_start,
+        eps,
+        routed_scaling_factor,
+        expert_load_view.numel(),
+        K=k,
+        LOCAL_COUNT=local_expert_count,
+        LOCAL_COUNT_POW2=triton.next_power_of_2(max(local_expert_count, 1)),
+        TABLE_ROWS=routing_table.shape[0],
+        E_ALIGN=triton.next_power_of_2(num_experts),
+        TOKENS_PER_PROGRAM=tokens_per_program,
+        num_warps=num_warps,
+    )
+    return weights, ids

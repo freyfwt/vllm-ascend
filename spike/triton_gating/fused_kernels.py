@@ -155,16 +155,6 @@ def build_expert_replica_routing_table(
 
 
 @triton.jit
-def _pack_f32_desc(x, inv_idx, BITS: tl.constexpr):
-    """Map fp32 to an order-preserving unsigned value and pack the inverted
-    index in the low bits, so a descending sort orders equal keys by the
-    lowest index first (matching the CANN kernel's left tie-break)."""
-    u = x.to(tl.int32, bitcast=True)
-    mapped = tl.where(u < 0, ~u, u ^ (1 << 31))
-    return (mapped.to(tl.int64) & 0xFFFFFFFF) << BITS | inv_idx.to(tl.int64)
-
-
-@triton.jit
 def gating_map_record_kernel(
     x_ptr,  # [num_tokens, num_experts] router logits (fp32/bf16, cast in-kernel)
     bias_ptr,  # [num_experts] e_score_correction_bias
@@ -208,63 +198,61 @@ def gating_map_record_kernel(
 
     g_idx = offs // GROUP_SIZE
     garange = tl.arange(0, GROUP_COUNT)
-    gs_cols = tl.arange(0, GROUP_SIZE)
+
+    # Group score: sum of the top-2 keys per group. The group-max element is
+    # removed by index (not value) so duplicated values are handled; axis=1
+    # reductions batch TOKENS_PER_PROGRAM tokens per block op.
+    gs = tl.zeros((TOKENS_PER_PROGRAM, GROUP_COUNT), dtype=tl.float32)
+    for g in tl.static_range(GROUP_COUNT):
+        gm = g_idx[None, :] == g
+        k1 = tl.max(tl.where(gm, key, _NEG_INF), axis=1)
+        i1 = tl.min(tl.where(gm & (key == k1[:, None]), offs[None, :], _BIG), axis=1)
+        k2 = tl.max(tl.where(gm & (offs[None, :] != i1[:, None]), key, _NEG_INF), axis=1)
+        gs = tl.where(garange[None, :] == g, k1[:, None] + k2[:, None], gs)
+
+    # Select the top K_GROUP groups per token; record the winning expert mask.
+    sel = tl.zeros((TOKENS_PER_PROGRAM, E_ALIGN), dtype=tl.int32)
+    for _ in tl.static_range(K_GROUP):
+        gv = tl.max(gs, axis=1)
+        gi = tl.min(tl.where(gs == gv[:, None], garange[None, :], GROUP_COUNT), axis=1)
+        sel = sel | (g_idx[None, :] == gi[:, None]).to(tl.int32)
+        gs = tl.where(garange[None, :] == gi[:, None], _NEG_INF, gs)
+
+    # Top-K experts per token among the selected groups, then map + record.
+    cand = tl.where((sel > 0) & lmask, key, _NEG_INF)
     karange = tl.arange(0, K)
+    lc = tl.arange(0, LOCAL_COUNT_POW2)
+    hits = tl.zeros((TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2), dtype=tl.int32)
+    sc = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.float32)
     rec_on = tl.load(record_enabled_ptr) != 0
     tok_valid = trows < tl.load(num_valid_ptr)
     active = rec_on & tok_valid & tmask
 
-    # Group score: top-2 sum per group via one sort over the
-    # (TOKENS_PER_PROGRAM * GROUP_COUNT, GROUP_SIZE) view.
-    key3 = tl.reshape(key, (TOKENS_PER_PROGRAM * GROUP_COUNT, GROUP_SIZE))
-    sorted_g = tl.sort(key3, descending=True)
-    top2 = tl.sum(tl.where(gs_cols[None, :] < 2, sorted_g, 0.0), axis=1)
-    gs = tl.reshape(top2, (TOKENS_PER_PROGRAM, GROUP_COUNT))
-
-    # Group selection: pack score+inverted index, sort, unpack the winning ids.
-    packed_g = _pack_f32_desc(gs, GROUP_COUNT - 1 - garange, 3)
-    sorted_gp = tl.sort(packed_g, descending=True)
-    sel = tl.zeros((TOKENS_PER_PROGRAM, E_ALIGN), dtype=tl.int32)
-    for j in tl.static_range(K_GROUP):
-        g_j = tl.sum(tl.where(garange[None, :] == j, sorted_gp, 0), axis=1)
-        g_j = GROUP_COUNT - 1 - (g_j & (GROUP_COUNT - 1)).to(tl.int32)
-        sel = sel | (g_idx[None, :] == g_j[:, None]).to(tl.int32)
-
-    # Expert selection: pack key+inverted index, sort, unpack expert ids.
-    mkey = tl.where((sel > 0) & lmask, key, _NEG_INF)
-    packed_e = _pack_f32_desc(mkey, 511 - offs, 9)
-    sorted_e = tl.sort(packed_e, descending=True)
-    e_all = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.int32)
     for j in tl.static_range(K):
-        e_j = tl.sum(tl.where(offs[None, :] == j, sorted_e, 0), axis=1)
-        e_j = (511 - (e_j & 511)).to(tl.int32)
-        e_all = tl.where(karange[None, :] == j, e_j[:, None], e_all)
-
-    # Map all winners through the replica table with one gather load.
-    phys_all = tl.load(
-        table_ptr + (trows % TABLE_ROWS)[:, None] * num_experts + e_all,
-        mask=tmask[:, None],
-        other=-1,
-    )
-    tl.store(ids_ptr + trows[:, None] * K + karange[None, :], phys_all, mask=tmask[:, None])
-
-    # Record the local-expert hits with one 2D vector atomic.
-    local_all = phys_all - local_expert_start
-    hit = active[:, None] & (local_all >= 0) & (local_all < LOCAL_COUNT)
-    tl.atomic_add(load_ptr + local_expert_start + local_all, 1, mask=hit)
-
-    # Weights gather the exact pre-bias scores of the winners, then renormalize.
-    sc = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.float32)
-    for j in tl.static_range(K):
-        e_j = tl.sum(tl.where(karange[None, :] == j, e_all, 0), axis=1)
-        s_j = tl.sum(tl.where(offs[None, :] == e_j[:, None], score, 0.0), axis=1)
-        sc = tl.where(karange[None, :] == j, s_j[:, None], sc)
+        v = tl.max(cand, axis=1)
+        e = tl.min(tl.where(cand == v[:, None], offs[None, :], _BIG), axis=1)
+        s = tl.sum(tl.where(offs[None, :] == e[:, None], score, 0.0), axis=1)
+        phys = tl.load(table_ptr + (trows % TABLE_ROWS) * num_experts + e, mask=tmask, other=-1)
+        tl.store(ids_ptr + trows * K + j, phys, mask=tmask)
+        local = phys - local_expert_start
+        hits += ((lc[None, :] == local[:, None]) & active[:, None]).to(tl.int32)
+        cand = tl.where(offs[None, :] == e[:, None], _NEG_INF, cand)
+        sc = tl.where(karange[None, :] == j, s[:, None], sc)
 
     ysum = tl.sum(sc, axis=1)
     tl.store(
         y_ptr + trows[:, None] * K + karange[None, :],
         sc / (ysum[:, None] + eps) * scaling,
         mask=tmask[:, None],
+    )
+
+    # One vector atomic per program instead of K scalar atomics per token.
+    lc_ok = (lc < LOCAL_COUNT) & (lc < num_physical - local_expert_start)
+    row_lc = tl.broadcast_to(lc[None, :], (TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2))
+    tl.atomic_add(
+        load_ptr + local_expert_start + row_lc,
+        hits,
+        mask=tl.broadcast_to(lc_ok[None, :], (TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2)) & active[:, None],
     )
 
 
@@ -331,9 +319,8 @@ def gating_map_record(
     group_size = num_experts // group_count
     if tokens_per_program is None:
         # Keep enough programs in flight for occupancy while amortizing the
-        # serial per-program reduction chain. TS=1 and TS>16 hit shape quirks
-        # in the triton-ascend 3.2 backend (parseSelect assertion).
-        tokens_per_program = min(16, max(2, num_tokens // 96))
+        # serial per-program reduction chain.
+        tokens_per_program = min(32, max(1, num_tokens // 96))
     weights = torch.empty((num_tokens, k), dtype=torch.float32, device=logits.device)
     ids = torch.empty((num_tokens, k), dtype=torch.int32, device=logits.device)
     gating_map_record_kernel[(triton.cdiv(num_tokens, tokens_per_program),)](

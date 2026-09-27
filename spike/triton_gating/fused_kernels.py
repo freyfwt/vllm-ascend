@@ -257,6 +257,7 @@ def map_record_kernel(
     local_expert_start,
     LOCAL_COUNT: tl.constexpr,
     LOCAL_COUNT_POW2: tl.constexpr,
+    LOCAL_CHUNK: tl.constexpr,
     TABLE_ROWS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -275,16 +276,19 @@ def map_record_kernel(
     rec_on = tl.load(record_enabled_ptr) != 0
     tok_valid = tok < tl.load(num_valid_ptr)
     active = rec_on & tok_valid & valid
-
-    lc = tl.arange(0, LOCAL_COUNT_POW2)
-    local = phys.to(tl.int64) - local_expert_start
-    hits = tl.sum(((lc[None, :] == local[:, None]) & active[:, None]).to(tl.int32), axis=0)
     any_active = tl.sum(active.to(tl.int32)) > 0
-    tl.atomic_add(
-        load_ptr + local_expert_start + lc,
-        hits,
-        mask=(lc < LOCAL_COUNT) & any_active,
-    )
+
+    # Chunked histogram: a full (BLOCK_SIZE, LOCAL_COUNT_POW2) broadcast blows
+    # the 196KB UB budget on A3, so accumulate LOCAL_CHUNK experts at a time.
+    local = phys.to(tl.int64) - local_expert_start
+    for c in tl.static_range(LOCAL_COUNT_POW2 // LOCAL_CHUNK):
+        lc = c * LOCAL_CHUNK + tl.arange(0, LOCAL_CHUNK)
+        hits = tl.sum(((lc[None, :] == local[:, None]) & active[:, None]).to(tl.int32), axis=0)
+        tl.atomic_add(
+            load_ptr + local_expert_start + lc,
+            hits,
+            mask=(lc < LOCAL_COUNT) & any_active,
+        )
 
 
 def gating_map_record(
@@ -362,6 +366,7 @@ def map_record(
         local_expert_start,
         LOCAL_COUNT=local_expert_count,
         LOCAL_COUNT_POW2=triton.next_power_of_2(max(local_expert_count, 1)),
+        LOCAL_CHUNK=16,
         TABLE_ROWS=routing_table.shape[0],
         BLOCK_SIZE=block_size,
     )

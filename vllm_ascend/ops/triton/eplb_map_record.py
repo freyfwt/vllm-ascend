@@ -102,6 +102,7 @@ def gating_map_record_kernel(
     # kernel) so duplicated values are handled. NOTE: a 3D one-shot
     # reduction and iterative tl.argmax both miscompile on triton-ascend
     # 3.2.x, so this stays an explicit per-group loop of 2D reductions.
+    gs = tl.zeros((TOKENS_PER_PROGRAM, GROUP_COUNT), dtype=tl.float32)
     for g in tl.static_range(GROUP_COUNT):
         gm = g_idx[None, :] == g
         k1 = tl.max(tl.where(gm, key, _NEG_INF), axis=1)

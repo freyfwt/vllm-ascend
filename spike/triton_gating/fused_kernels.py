@@ -312,11 +312,15 @@ def gating_map_record(
     routed_scaling_factor: float,
     eps: float = 1e-20,
     num_warps: int = 4,
-    tokens_per_program: int = 8,
+    tokens_per_program: int | None = None,
 ):
     """Full-fusion variant C. Returns (weights [T,K] fp32, physical ids [T,K] int32)."""
     num_tokens, num_experts = logits.shape
     group_size = num_experts // group_count
+    if tokens_per_program is None:
+        # Keep enough programs in flight for occupancy while amortizing the
+        # serial per-program reduction chain.
+        tokens_per_program = min(32, max(1, num_tokens // 96))
     weights = torch.empty((num_tokens, k), dtype=torch.float32, device=logits.device)
     ids = torch.empty((num_tokens, k), dtype=torch.int32, device=logits.device)
     gating_map_record_kernel[(triton.cdiv(num_tokens, tokens_per_program),)](

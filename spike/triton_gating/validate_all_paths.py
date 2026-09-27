@@ -6,6 +6,8 @@ bias, and the DeepSeek V4 hash route. Every route checks ids (exact),
 weights (max abs diff) and the recorded load (integer-equal).
 """
 
+import os
+
 import torch
 import torch_npu  # noqa: F401
 
@@ -136,6 +138,7 @@ def main():
         logits, bias, table, record_on, num_valid, load_c, local_start, local_count,
         k=K, k_group=K_GROUP, group_count=GROUP_COUNT, routed_scaling_factor=SCALING,
         norm_type=1, renorm=True,
+        tokens_per_program=int(os.getenv("TS_OVERRIDE") or 0) or None,
     )
     torch.npu.synchronize()
     ok &= check("sigmoid+bias renorm1", phys_a, w_a, ids_c, w_c,

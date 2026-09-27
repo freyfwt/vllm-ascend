@@ -124,6 +124,8 @@ def gating_map_record_kernel(
     # per-step loop below is the validated form.
     cand = tl.where((sel > 0) & lmask, key, _NEG_INF)
     karange = tl.arange(0, K)
+    lc = tl.arange(0, LOCAL_COUNT_POW2)
+    hits = tl.zeros((TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2), dtype=tl.int32)
     sc = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.float32)
 
     for j in tl.static_range(K):
@@ -132,11 +134,8 @@ def gating_map_record_kernel(
         s = tl.sum(tl.where(offs[None, :] == e[:, None], score, 0.0), axis=1)
         phys = tl.load(table_ptr + (trows % TABLE_ROWS) * num_experts + e, mask=tmask, other=-1)
         tl.store(ids_ptr + trows * K + j, phys, mask=tmask)
-        # Per-column 1D atomic: 2D broadcast atomic masks are unreliable on
-        # this backend (same class as the 2D gather bug).
         local = phys - local_expert_start
-        hit = active & (local >= 0) & (local < LOCAL_COUNT)
-        tl.atomic_add(load_ptr + local_expert_start + local, 1, mask=hit)
+        hits += ((lc[None, :] == local[:, None]) & active[:, None]).to(tl.int32)
         cand = tl.where(offs[None, :] == e[:, None], _NEG_INF, cand)
         sc = tl.where(karange[None, :] == j, s[:, None], sc)
 
@@ -151,6 +150,15 @@ def gating_map_record_kernel(
         y_ptr + trows[:, None] * K + karange[None, :],
         sc * scaling,
         mask=tmask[:, None],
+    )
+
+    # One vector atomic per program instead of K scalar atomics per token.
+    lc_ok = (lc < LOCAL_COUNT) & (lc < num_physical - local_expert_start)
+    row_lc = tl.broadcast_to(lc[None, :], (TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2))
+    tl.atomic_add(
+        load_ptr + local_expert_start + row_lc,
+        hits,
+        mask=tl.broadcast_to(lc_ok[None, :], (TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2)) & active[:, None],
     )
 
 
@@ -181,7 +189,7 @@ def gating_map_record(
         # serial per-program reduction chain. The backend only tolerates
         # power-of-two tile heights (TS=5 aborted in parseSelect) and TS=1
         # or TS>16 hit other shape quirks.
-        ts = max(2, min(16, num_tokens // 96))
+        ts = max(2, min(4, num_tokens // 96))
         tokens_per_program = 2 ** (ts.bit_length() - 1)
     weights = torch.empty((num_tokens, k), dtype=torch.float32, device=logits.device)
     ids = torch.empty((num_tokens, k), dtype=torch.int32, device=logits.device)
@@ -345,7 +353,7 @@ def hash_map_record(
     """DeepSeek V4 hash route: ids from tid2eid, weights from sigmoid(logits)."""
     num_tokens, num_experts = router_logits.shape
     if tokens_per_program is None:
-        ts = max(2, min(16, num_tokens // 96))
+        ts = max(2, min(4, num_tokens // 96))
         tokens_per_program = 2 ** (ts.bit_length() - 1)
     weights = torch.empty((num_tokens, k), dtype=torch.float32, device=router_logits.device)
     ids = torch.empty((num_tokens, k), dtype=torch.int32, device=router_logits.device)

@@ -29,7 +29,8 @@ import torch_npu  # noqa: F401
 
 from vllm.triton_utils import tl, triton  # noqa: F401  (env probe needs tl/triton)
 
-import vllm_ascend  # noqa: F401  (loads the native extension / _C_ascend ops)
+import vllm_ascend  # noqa: F401
+import vllm_ascend.vllm_ascend_C  # noqa: F401  (lazy native ext; registers _C_ascend ops)
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.fused_moe.eplb import build_expert_replica_routing_table
 from vllm_ascend.ops.triton.eplb import (

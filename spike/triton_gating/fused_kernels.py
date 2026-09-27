@@ -164,6 +164,7 @@ def gating_map_record_kernel(
     load_ptr,  # [num_physical] int32 expert load view, atomically accumulated
     y_ptr,  # [num_tokens, K] fp32 topk weights
     ids_ptr,  # [num_tokens, K] int32 physical expert ids
+    num_tokens,
     num_experts,
     local_expert_start,
     eps,
@@ -178,66 +179,82 @@ def gating_map_record_kernel(
     TABLE_ROWS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     E_ALIGN: tl.constexpr,
+    TOKENS_PER_PROGRAM: tl.constexpr,
 ):
-    tok = tl.program_id(0)
+    tok0 = tl.program_id(0) * TOKENS_PER_PROGRAM
+    trows = tok0 + tl.arange(0, TOKENS_PER_PROGRAM)  # (TS,)
+    tmask = trows < num_tokens
     offs = tl.arange(0, E_ALIGN)
     emask = offs < num_experts
+    lmask = tmask[:, None] & emask[None, :]
 
-    x = tl.load(x_ptr + tok * num_experts + offs, mask=emask, other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + trows[:, None] * num_experts + offs[None, :], mask=lmask, other=0.0).to(tl.float32)
     score = tl.sigmoid(x)
     if HAS_BIAS:
         bias = tl.load(bias_ptr + offs, mask=emask, other=0.0).to(tl.float32)
-        key = tl.where(emask, score + bias, _NEG_INF)
+        key = tl.where(lmask, score + bias[None, :], _NEG_INF)
     else:
-        key = tl.where(emask, score, _NEG_INF)
+        key = tl.where(lmask, score, _NEG_INF)
 
     g_idx = offs // GROUP_SIZE
     garange = tl.arange(0, GROUP_COUNT)
 
-    # Group score: sum of the top-2 keys per group, via one (GROUP_COUNT,
-    # GROUP_SIZE) sort instead of GROUP_COUNT serial block reductions.
-    key2 = tl.reshape(key, (GROUP_COUNT, GROUP_SIZE))
-    sorted_g = tl.sort(key2, descending=True)
-    top2 = tl.sum(tl.where(tl.arange(0, GROUP_SIZE)[None, :] < 2, sorted_g, 0.0), axis=1)
+    # Group score: sum of the top-2 keys per group. The group-max element is
+    # removed by index (not value) so duplicated values are handled; axis=1
+    # reductions batch TOKENS_PER_PROGRAM tokens per block op.
+    gs = tl.zeros((TOKENS_PER_PROGRAM, GROUP_COUNT), dtype=tl.float32)
+    for g in tl.static_range(GROUP_COUNT):
+        gm = g_idx[None, :] == g
+        k1 = tl.max(tl.where(gm, key, _NEG_INF), axis=1)
+        i1 = tl.min(tl.where(gm & (key == k1[:, None]), offs[None, :], _BIG), axis=1)
+        k2 = tl.max(tl.where(gm & (offs[None, :] != i1[:, None]), key, _NEG_INF), axis=1)
+        gs = tl.where(garange[None, :] == g, k1[:, None] + k2[:, None], gs)
 
-    # Select the top K_GROUP groups via an 8-element argsort, then build the
-    # per-expert selection mask in one (E_ALIGN, GROUP_COUNT) compare.
-    group_rank = tl.argsort(top2, descending=True)
-    gsel = tl.arange(0, GROUP_COUNT) < K_GROUP
-    sel = tl.sum(
-        (g_idx[:, None] == group_rank[None, :]).to(tl.int32) * gsel[None, :].to(tl.int32),
-        axis=1,
-    )
+    # Select the top K_GROUP groups per token; record the winning expert mask.
+    sel = tl.zeros((TOKENS_PER_PROGRAM, E_ALIGN), dtype=tl.int32)
+    for _ in tl.static_range(K_GROUP):
+        gv = tl.max(gs, axis=1)
+        gi = tl.min(tl.where(gs == gv[:, None], garange[None, :], GROUP_COUNT), axis=1)
+        sel = sel | (g_idx[None, :] == gi[:, None]).to(tl.int32)
+        gs = tl.where(garange[None, :] == gi[:, None], _NEG_INF, gs)
 
-    # Top-K experts among the selected groups: one masked descending argsort,
-    # then map + record per winner.
-    mkey = tl.where((sel > 0) & emask, key, _NEG_INF)
-    order = tl.argsort(mkey, descending=True)
-    arank = tl.arange(0, E_ALIGN)
+    # Top-K experts per token among the selected groups, then map + record.
+    cand = tl.where((sel > 0) & lmask, key, _NEG_INF)
     karange = tl.arange(0, K)
     lc = tl.arange(0, LOCAL_COUNT_POW2)
-    hits = tl.zeros((LOCAL_COUNT_POW2,), dtype=tl.int32)
-    sc = tl.zeros((K,), dtype=tl.float32)
+    hits = tl.zeros((TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2), dtype=tl.int32)
+    sc = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.float32)
     rec_on = tl.load(record_enabled_ptr) != 0
-    tok_valid = tok < tl.load(num_valid_ptr)
-    active = rec_on & tok_valid
+    tok_valid = trows < tl.load(num_valid_ptr)
+    active = rec_on & tok_valid & tmask
 
     for j in tl.static_range(K):
-        e = tl.sum(tl.where(arank == j, order, 0)).to(tl.int32)
-        s = tl.sum(tl.where(offs == e, score, 0.0))
-        phys = tl.load(table_ptr + (tok % TABLE_ROWS) * num_experts + e)
-        tl.store(ids_ptr + tok * K + j, phys)
+        v = tl.max(cand, axis=1)
+        e = tl.min(tl.where(cand == v[:, None], offs[None, :], _BIG), axis=1)
+        s = tl.sum(tl.where(offs[None, :] == e[:, None], score, 0.0), axis=1)
+        phys = tl.load(
+            table_ptr + (trows % TABLE_ROWS)[:, None] * num_experts + e[:, None],
+            mask=tmask[:, None],
+            other=-1,
+        )
+        tl.store(ids_ptr + trows[:, None] * K + j, phys[:, None], mask=tmask[:, None])
         local = phys - local_expert_start
-        hits += ((lc == local) & active).to(tl.int32)
-        sc = tl.where(karange == j, s, sc)
+        hits += ((lc[None, :] == local[:, None]) & active[:, None]).to(tl.int32)
+        cand = tl.where(offs[None, :] == e[:, None], _NEG_INF, cand)
+        sc = tl.where(karange[None, :] == j, s[:, None], sc)
 
-    tl.store(y_ptr + tok * K + karange, sc / (tl.sum(sc) + eps) * scaling)
+    ysum = tl.sum(sc, axis=1)
+    tl.store(
+        y_ptr + trows[:, None] * K + karange[None, :],
+        sc / (ysum[:, None] + eps) * scaling,
+        mask=tmask[:, None],
+    )
 
     # One vector atomic per program instead of K scalar atomics per token.
     tl.atomic_add(
-        load_ptr + local_expert_start + lc,
+        load_ptr + local_expert_start + lc[None, :],
         hits,
-        mask=(lc < LOCAL_COUNT) & active & (lc < num_physical - local_expert_start),
+        mask=(lc[None, :] < LOCAL_COUNT) & active[:, None] & (lc[None, :] < num_physical - local_expert_start),
     )
 
 
@@ -297,13 +314,14 @@ def gating_map_record(
     routed_scaling_factor: float,
     eps: float = 1e-20,
     num_warps: int = 4,
+    tokens_per_program: int = 8,
 ):
     """Full-fusion variant C. Returns (weights [T,K] fp32, physical ids [T,K] int32)."""
     num_tokens, num_experts = logits.shape
     group_size = num_experts // group_count
     weights = torch.empty((num_tokens, k), dtype=torch.float32, device=logits.device)
     ids = torch.empty((num_tokens, k), dtype=torch.int32, device=logits.device)
-    gating_map_record_kernel[(num_tokens,)](
+    gating_map_record_kernel[(triton.cdiv(num_tokens, tokens_per_program),)](
         logits,
         bias if bias is not None else logits,  # dummy pointer when unused
         routing_table,
@@ -312,6 +330,7 @@ def gating_map_record(
         expert_load_view,
         weights,
         ids,
+        num_tokens,
         num_experts,
         local_expert_start,
         eps,
@@ -326,6 +345,7 @@ def gating_map_record(
         TABLE_ROWS=routing_table.shape[0],
         HAS_BIAS=bias is not None,
         E_ALIGN=triton.next_power_of_2(num_experts),
+        TOKENS_PER_PROGRAM=tokens_per_program,
         num_warps=num_warps,
     )
     return weights, ids

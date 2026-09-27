@@ -274,7 +274,8 @@ def main() -> None:
         # Parity: one untimed run per route, then compare.
         w_a, ids_a = route_a(s)
         counts = synthesize_counts(ids_a, s)
-        w_b, ids_b = route_b(s, ids_a)
+        ids_logical = run_baseline_gating(s)[1]
+        w_b, ids_b = route_b(s, ids_logical)
         w_c, ids_c = route_c(s, args.num_warps)
         torch.npu.synchronize()
         case["parity_a_vs_c"] = parity(s, w_a, ids_a, w_c, ids_c)

@@ -194,26 +194,26 @@ def gating_map_record_kernel(
     g_idx = offs // GROUP_SIZE
     garange = tl.arange(0, GROUP_COUNT)
 
-    # Group score: sum of the top-2 keys per group. The group-max element is
-    # removed by index (not value) so duplicated values are handled.
-    gs = tl.full((GROUP_COUNT,), _NEG_INF, tl.float32)
-    for g in tl.static_range(GROUP_COUNT):
-        gm = g_idx == g
-        k1 = tl.max(tl.where(gm, key, _NEG_INF))
-        i1 = tl.min(tl.where(gm & (key == k1), offs, _BIG))
-        k2 = tl.max(tl.where(gm & (offs != i1), key, _NEG_INF))
-        gs = tl.where(garange == g, k1 + k2, gs)
+    # Group score: sum of the top-2 keys per group, via one (GROUP_COUNT,
+    # GROUP_SIZE) sort instead of GROUP_COUNT serial block reductions.
+    key2 = tl.reshape(key, (GROUP_COUNT, GROUP_SIZE))
+    sorted_g = tl.sort(key2, descending=True)
+    top2 = tl.sum(tl.where(tl.arange(0, GROUP_SIZE)[None, :] < 2, sorted_g, 0.0), axis=1)
 
-    # Select the top K_GROUP groups; record the winning expert mask.
-    sel = tl.zeros((E_ALIGN,), dtype=tl.int32)
-    for _ in tl.static_range(K_GROUP):
-        gv = tl.max(gs)
-        gi = tl.min(tl.where(gs == gv, garange, GROUP_COUNT))
-        sel = sel | (g_idx == gi).to(tl.int32)
-        gs = tl.where(garange == gi, _NEG_INF, gs)
+    # Select the top K_GROUP groups via an 8-element argsort, then build the
+    # per-expert selection mask in one (E_ALIGN, GROUP_COUNT) compare.
+    group_rank = tl.argsort(top2, descending=True)
+    gsel = tl.arange(0, GROUP_COUNT) < K_GROUP
+    sel = tl.sum(
+        (g_idx[:, None] == group_rank[None, :]).to(tl.int32) * gsel[None, :].to(tl.int32),
+        axis=1,
+    )
 
-    # Top-K experts among the selected groups, then map + record per winner.
-    cand = tl.where(sel > 0, key, _NEG_INF)
+    # Top-K experts among the selected groups: one masked descending argsort,
+    # then map + record per winner.
+    mkey = tl.where((sel > 0) & emask, key, _NEG_INF)
+    order = tl.argsort(mkey, descending=True)
+    arank = tl.arange(0, E_ALIGN)
     karange = tl.arange(0, K)
     lc = tl.arange(0, LOCAL_COUNT_POW2)
     hits = tl.zeros((LOCAL_COUNT_POW2,), dtype=tl.int32)
@@ -223,14 +223,12 @@ def gating_map_record_kernel(
     active = rec_on & tok_valid
 
     for j in tl.static_range(K):
-        v = tl.max(cand)
-        e = tl.min(tl.where(cand == v, offs, _BIG)).to(tl.int32)
+        e = tl.sum(tl.where(arank == j, order, 0)).to(tl.int32)
         s = tl.sum(tl.where(offs == e, score, 0.0))
         phys = tl.load(table_ptr + (tok % TABLE_ROWS) * num_experts + e)
         tl.store(ids_ptr + tok * K + j, phys)
         local = phys - local_expert_start
         hits += ((lc == local) & active).to(tl.int32)
-        cand = tl.where(offs == e, _NEG_INF, cand)
         sc = tl.where(karange == j, s, sc)
 
     tl.store(y_ptr + tok * K + karange, sc / (tl.sum(sc) + eps) * scaling)
@@ -276,19 +274,12 @@ def map_record_kernel(
     rec_on = tl.load(record_enabled_ptr) != 0
     tok_valid = tok < tl.load(num_valid_ptr)
     active = rec_on & tok_valid & valid
-    any_active = tl.sum(active.to(tl.int32)) > 0
 
-    # Chunked histogram: a full (BLOCK_SIZE, LOCAL_COUNT_POW2) broadcast blows
-    # the 196KB UB budget on A3, so accumulate LOCAL_CHUNK experts at a time.
-    local = phys.to(tl.int64) - local_expert_start
-    for c in tl.static_range(LOCAL_COUNT_POW2 // LOCAL_CHUNK):
-        lc = c * LOCAL_CHUNK + tl.arange(0, LOCAL_CHUNK)
-        hits = tl.sum(((lc[None, :] == local[:, None]) & active[:, None]).to(tl.int32), axis=0)
-        tl.atomic_add(
-            load_ptr + local_expert_start + lc,
-            hits,
-            mask=(lc < LOCAL_COUNT) & any_active,
-        )
+    # Per-element vector atomic: no (BLOCK, LOCAL_COUNT) broadcast, which
+    # would exceed the A3 UB budget.
+    local = phys - local_expert_start
+    hit = active & (local >= 0) & (local < LOCAL_COUNT)
+    tl.atomic_add(load_ptr + local_expert_start + local, 1, mask=hit)
 
 
 def gating_map_record(

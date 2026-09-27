@@ -25,6 +25,7 @@ index; the CANN ``Sort32`` tie order is unspecified, so the parity
 harness measures the mismatch rate instead of assuming it is zero.
 """
 
+import torch
 from vllm.triton_utils import tl, triton
 
 _BIG = 1 << 30

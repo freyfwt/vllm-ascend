@@ -248,10 +248,11 @@ def gating_map_record_kernel(
 
     # One vector atomic per program instead of K scalar atomics per token.
     lc_ok = (lc < LOCAL_COUNT) & (lc < num_physical - local_expert_start)
+    row_lc = tl.broadcast_to(lc[None, :], (TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2))
     tl.atomic_add(
-        load_ptr + local_expert_start + lc[None, :],
+        load_ptr + local_expert_start + row_lc,
         hits,
-        mask=lc_ok[None, :] & active[:, None],
+        mask=tl.broadcast_to(lc_ok[None, :], (TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2)) & active[:, None],
     )
 
 

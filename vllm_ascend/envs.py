@@ -76,6 +76,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
     # Whether to anbale dynamic EPLB
     "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
+    # Fuse EPLB replica mapping and load recording into the gating top-k Triton
+    # kernel for small batches. Bit-exact vs the unfused route; batches above
+    # EPLB_FUSED_MAP_RECORD_MAX_TOKENS keep the unfused CANN route.
+    "VLLM_ASCEND_EPLB_FUSED_MAP_RECORD": lambda: _strict_binary_env(
+        "VLLM_ASCEND_EPLB_FUSED_MAP_RECORD", "1"
+    ),
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),

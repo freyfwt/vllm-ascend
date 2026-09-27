@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+
+"""Fused EPLB gating, replica mapping and load recording for small batches.
+
+One Triton kernel replaces the three-launch route
+``moe_gating_top_k`` -> ``ascend_eplb_map_to_physical`` ->
+``ascend_eplb_record_expert_tokens``:
+
+  score = sigmoid(logits); key = score + bias
+  group score = sum of the top-2 keys inside each group
+  select the top ``k_group`` groups, then the top ``k`` experts among them
+  weight = score / (sum(score) + eps) * routed_scaling_factor
+
+matching the CANN ``moe_gating_top_k`` sigmoid semantics (the
+``e_k_fullload`` variant) bit for bit, including left tie-breaks. The
+winning physical experts are gathered through the graph-stable replica
+routing table and their token counts are accumulated into the local
+slice of ``expert_load_view``; tokens at or beyond ``num_valid_tokens``
+are padding and never counted.
+
+The serial selection chain only beats the CANN stack below a few hundred
+tokens, so callers route by batch bucket (see
+``EPLB_FUSED_MAP_RECORD_MAX_TOKENS``) and keep the unfused path above it.
+"""
+
+import torch
+from vllm.triton_utils import tl, triton
+
+_BIG = tl.constexpr(1 << 30)
+_NEG_INF = tl.constexpr(float("-inf"))
+
+# Batch buckets above this token count keep the unfused CANN route; the
+# crossover was measured on Ascend 910C (T=512: parity, T<=256: up to 1.7x).
+EPLB_FUSED_MAP_RECORD_MAX_TOKENS = 512
+
+
+@triton.jit
+def gating_map_record_kernel(
+    x_ptr,  # [num_tokens, num_experts] router logits (fp32/bf16, cast in-kernel)
+    bias_ptr,  # [num_experts] e_score_correction_bias
+    table_ptr,  # [TABLE_ROWS, num_experts] int32 replica routing table
+    record_enabled_ptr,  # 0-D device int, non-zero enables recording
+    num_valid_ptr,  # 0-D device int, tokens beyond this are padding
+    load_ptr,  # [num_physical] int32 expert load view, atomically accumulated
+    y_ptr,  # [num_tokens, K] fp32 topk weights
+    ids_ptr,  # [num_tokens, K] int32 physical expert ids
+    num_tokens,
+    num_experts,
+    local_expert_start,
+    eps,
+    scaling,
+    num_physical,
+    K: tl.constexpr,
+    GROUP_COUNT: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    K_GROUP: tl.constexpr,
+    LOCAL_COUNT: tl.constexpr,
+    LOCAL_COUNT_POW2: tl.constexpr,
+    TABLE_ROWS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    E_ALIGN: tl.constexpr,
+    TOKENS_PER_PROGRAM: tl.constexpr,
+):
+    tok0 = tl.program_id(0) * TOKENS_PER_PROGRAM
+    trows = tok0 + tl.arange(0, TOKENS_PER_PROGRAM)  # (TS,)
+    tmask = trows < num_tokens
+    offs = tl.arange(0, E_ALIGN)
+    emask = offs < num_experts
+    lmask = tmask[:, None] & emask[None, :]
+
+    x = tl.load(x_ptr + trows[:, None] * num_experts + offs[None, :], mask=lmask, other=0.0).to(tl.float32)
+    score = tl.sigmoid(x)
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs, mask=emask, other=0.0).to(tl.float32)
+        key = tl.where(lmask, score + bias[None, :], _NEG_INF)
+    else:
+        key = tl.where(lmask, score, _NEG_INF)
+
+    g_idx = offs // GROUP_SIZE
+    garange = tl.arange(0, GROUP_COUNT)
+
+    # Group score: sum of the top-2 keys per group. The group-max element is
+    # removed by index (not value) so duplicated values are handled; axis=1
+    # reductions batch TOKENS_PER_PROGRAM tokens per block op.
+    gs = tl.zeros((TOKENS_PER_PROGRAM, GROUP_COUNT), dtype=tl.float32)
+    for g in tl.static_range(GROUP_COUNT):
+        gm = g_idx[None, :] == g
+        k1 = tl.max(tl.where(gm, key, _NEG_INF), axis=1)
+        i1 = tl.min(tl.where(gm & (key == k1[:, None]), offs[None, :], _BIG), axis=1)
+        k2 = tl.max(tl.where(gm & (offs[None, :] != i1[:, None]), key, _NEG_INF), axis=1)
+        gs = tl.where(garange[None, :] == g, k1[:, None] + k2[:, None], gs)
+
+    # Select the top K_GROUP groups per token; record the winning expert mask.
+    sel = tl.zeros((TOKENS_PER_PROGRAM, E_ALIGN), dtype=tl.int32)
+    for _ in tl.static_range(K_GROUP):
+        gv = tl.max(gs, axis=1)
+        gi = tl.min(tl.where(gs == gv[:, None], garange[None, :], GROUP_COUNT), axis=1)
+        sel = sel | (g_idx[None, :] == gi[:, None]).to(tl.int32)
+        gs = tl.where(garange[None, :] == gi[:, None], _NEG_INF, gs)
+
+    # Top-K experts per token among the selected groups, then map + record.
+    cand = tl.where((sel > 0) & lmask, key, _NEG_INF)
+    karange = tl.arange(0, K)
+    lc = tl.arange(0, LOCAL_COUNT_POW2)
+    hits = tl.zeros((TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2), dtype=tl.int32)
+    sc = tl.zeros((TOKENS_PER_PROGRAM, K), dtype=tl.float32)
+    rec_on = tl.load(record_enabled_ptr) != 0
+    tok_valid = trows < tl.load(num_valid_ptr)
+    active = rec_on & tok_valid & tmask
+
+    for j in tl.static_range(K):
+        v = tl.max(cand, axis=1)
+        e = tl.min(tl.where(cand == v[:, None], offs[None, :], _BIG), axis=1)
+        s = tl.sum(tl.where(offs[None, :] == e[:, None], score, 0.0), axis=1)
+        phys = tl.load(table_ptr + (trows % TABLE_ROWS) * num_experts + e, mask=tmask, other=-1)
+        tl.store(ids_ptr + trows * K + j, phys, mask=tmask)
+        local = phys - local_expert_start
+        hits += ((lc[None, :] == local[:, None]) & active[:, None]).to(tl.int32)
+        cand = tl.where(offs[None, :] == e[:, None], _NEG_INF, cand)
+        sc = tl.where(karange[None, :] == j, s[:, None], sc)
+
+    ysum = tl.sum(sc, axis=1)
+    tl.store(
+        y_ptr + trows[:, None] * K + karange[None, :],
+        sc / (ysum[:, None] + eps) * scaling,
+        mask=tmask[:, None],
+    )
+
+    # One vector atomic per program instead of K scalar atomics per token.
+    lc_ok = (lc < LOCAL_COUNT) & (lc < num_physical - local_expert_start)
+    row_lc = tl.broadcast_to(lc[None, :], (TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2))
+    tl.atomic_add(
+        load_ptr + local_expert_start + row_lc,
+        hits,
+        mask=tl.broadcast_to(lc_ok[None, :], (TOKENS_PER_PROGRAM, LOCAL_COUNT_POW2)) & active[:, None],
+    )
+
+
+def gating_map_record(
+    logits: torch.Tensor,
+    bias: torch.Tensor | None,
+    routing_table: torch.Tensor,
+    record_enabled: torch.Tensor,
+    num_valid_tokens: torch.Tensor,
+    expert_load_view: torch.Tensor,
+    local_expert_start: int,
+    local_expert_count: int,
+    k: int,
+    k_group: int,
+    group_count: int,
+    routed_scaling_factor: float,
+    eps: float = 1e-20,
+    num_warps: int = 4,
+    tokens_per_program: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (weights [T, K] fp32, physical ids [T, K] int32)."""
+    num_tokens, num_experts = logits.shape
+    group_size = num_experts // group_count
+    if tokens_per_program is None:
+        # Keep enough programs in flight for occupancy while amortizing the
+        # serial per-program reduction chain. The backend only tolerates
+        # power-of-two tile heights (TS=5 aborted in parseSelect) and TS=1
+        # or TS>16 hit other shape quirks.
+        ts = max(2, min(16, num_tokens // 96))
+        tokens_per_program = 2 ** (ts.bit_length() - 1)
+    weights = torch.empty((num_tokens, k), dtype=torch.float32, device=logits.device)
+    ids = torch.empty((num_tokens, k), dtype=torch.int32, device=logits.device)
+    gating_map_record_kernel[(triton.cdiv(num_tokens, tokens_per_program),)](
+        logits,
+        bias if bias is not None else logits,  # dummy pointer when unused
+        routing_table,
+        record_enabled,
+        num_valid_tokens,
+        expert_load_view,
+        weights,
+        ids,
+        num_tokens,
+        num_experts,
+        local_expert_start,
+        eps,
+        routed_scaling_factor,
+        expert_load_view.numel(),
+        K=k,
+        GROUP_COUNT=group_count,
+        GROUP_SIZE=group_size,
+        K_GROUP=k_group,
+        LOCAL_COUNT=local_expert_count,
+        LOCAL_COUNT_POW2=triton.next_power_of_2(max(local_expert_count, 1)),
+        TABLE_ROWS=routing_table.shape[0],
+        HAS_BIAS=bias is not None,
+        E_ALIGN=triton.next_power_of_2(num_experts),
+        TOKENS_PER_PROGRAM=tokens_per_program,
+        num_warps=num_warps,
+    )
+    return weights, ids
+
+
+def map_to_physical_and_record(
+    router_logits: torch.Tensor,
+    bias: torch.Tensor | None,
+    expert_replica_routing_table: torch.Tensor,
+    record_enabled: torch.Tensor,
+    num_valid_tokens: torch.Tensor,
+    expert_load_view: torch.Tensor,
+    local_expert_start: int,
+    local_expert_count: int,
+    k: int,
+    k_group: int,
+    group_count: int,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Triton gating + replica mapping + load recording in a single launch.
+
+    ``router_logits`` may contain padding rows; ``num_valid_tokens`` (a 0-D
+    device tensor) splits real rows from padding so the load recording stays
+    clean. Returns ``(topk_weights fp32, topk_ids int32 physical experts)``;
+    callers must skip their own mapping and recording passes when they take
+    this path. All per-step mutable inputs must be device tensors with
+    stable addresses (ACL-graph safe).
+    """
+    if num_valid_tokens.device != router_logits.device or num_valid_tokens.dim() != 0:
+        raise ValueError("num_valid_tokens must be a 0-D device tensor")
+    return gating_map_record(
+        router_logits,
+        bias,
+        expert_replica_routing_table,
+        record_enabled,
+        num_valid_tokens,
+        expert_load_view,
+        local_expert_start,
+        local_expert_count,
+        k,
+        k_group,
+        group_count,
+        routed_scaling_factor,
+    )

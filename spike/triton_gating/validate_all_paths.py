@@ -178,7 +178,6 @@ def main():
     input_ids = torch.randint(0, num_ids, (T,), dtype=torch.int64, generator=gen).to(device)
     load_a = torch.zeros(num_physical, dtype=torch.int32, device=device)
     load_c = torch.zeros(num_physical, dtype=torch.int32, device=device)
-    import os
     hash_bias = None if os.getenv("HASH_NO_BIAS") else bias
     w_a, ids_a = cann_hash(logits, input_ids, tid2eid, hash_bias)
     # cann hash already returns final expert ids (logical == table domain here:
